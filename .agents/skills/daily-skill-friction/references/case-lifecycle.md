@@ -47,6 +47,11 @@ its top-level integer revision and `currentness_checked_at`. Always obtain it fr
 8. install the selected repair and begin effectiveness observation;
 9. mark the case effective, dormant, superseded, or no longer applicable.
 
+Every case absent from the selected control state must enter at `watching` or
+`proposed`, including a record labelled `legacy-migration`. The helper has no
+separate authorized migration-import mode, so `source_kind` cannot grant
+lifecycle authority or skip publication and repair decisions.
+
 The selection receipt, pending commit, manifest, publication approval, and PR
 workflow state belong to host-local control state, not the ledger case schema.
 Selection approval authorizes only local preparation; publication approval

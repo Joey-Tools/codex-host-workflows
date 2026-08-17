@@ -235,6 +235,11 @@ class LoadedLaunchAgent:
     standard_error_path: str
     environment_variables: dict[str, str]
     calendar_intervals: tuple[tuple[tuple[str, int], ...], ...]
+    minimum_runtime: int
+    base_minimum_runtime: int | None
+    exit_timeout: int
+    spawn_type: str
+    properties: frozenset[str]
 
 
 class CommandRunner:
@@ -2248,35 +2253,162 @@ def _known_launchctl_not_found(result: subprocess.CompletedProcess[str]) -> bool
     )
 
 
-def _launchctl_scalar(lines: Sequence[str], key: str) -> str:
-    prefix = f"\t{key} = "
-    values = [line.removeprefix(prefix) for line in lines if line.startswith(prefix)]
-    if len(values) != 1 or not values[0] or values[0] == "{":
+_LAUNCHCTL_REQUIRED_SCALARS = frozenset(
+    {
+        "path",
+        "type",
+        "program",
+        "working directory",
+        "stdout path",
+        "stderr path",
+    }
+)
+_LAUNCHCTL_BEHAVIOR_SCALARS = frozenset(
+    {"minimum runtime", "base minimum runtime", "exit timeout", "spawn type", "properties"}
+)
+_LAUNCHCTL_REQUIRED_BEHAVIOR_SCALARS = frozenset(
+    {"minimum runtime", "exit timeout", "spawn type", "properties"}
+)
+_LAUNCHCTL_RUNTIME_SCALARS = frozenset(
+    {
+        "active count",
+        "state",
+        "domain",
+        "asid",
+        "runs",
+        "pid",
+        "immediate reason",
+        "forks",
+        "execs",
+        "initialized",
+        "trampolined",
+        "started suspended",
+        "proxy started suspended",
+        "checked allocations",
+        "checked allocations reason",
+        "checked allocations flags",
+        "last exit code",
+        "job state",
+        "jetsam priority",
+        "jetsam memory limit (active, soft)",
+        "jetsam memory limit (inactive, soft)",
+        "jetsam memory limit (active)",
+        "jetsam memory limit (inactive)",
+        "jetsamproperties category",
+        "jetsam thread limit",
+        "cpumon",
+        "exponential throttling grace limit",
+    }
+)
+_LAUNCHCTL_REQUIRED_BLOCKS = frozenset(
+    {"arguments", "environment", "event triggers", "event channels"}
+)
+_LAUNCHCTL_RUNTIME_BLOCKS = frozenset(
+    {
+        "inherited environment",
+        "default environment",
+        "dynamic endpoints",
+        "pid-local endpoints",
+        "resource coalition",
+        "jetsam coalition",
+    }
+)
+_LAUNCHCTL_RUNTIME_FLAGS = frozenset({"submitted job. ignore execute allowed"})
+_LAUNCHCTL_NEUTRAL_PROPERTIES = frozenset(
+    {"inferred program", "needs LWCR update", "managed LWCR", "has LWCR"}
+)
+_LAUNCHCTL_DEFAULT_MINIMUM_RUNTIME = 10
+_LAUNCHCTL_DEFAULT_EXIT_TIMEOUT = 5
+_LAUNCHCTL_DEFAULT_SPAWN_TYPE = "daemon (3)"
+_LAUNCH_AGENT_PLIST_KEYS = frozenset(
+    {
+        "Label",
+        "ProgramArguments",
+        "WorkingDirectory",
+        "StartCalendarInterval",
+        "StandardOutPath",
+        "StandardErrorPath",
+        "EnvironmentVariables",
+    }
+)
+
+
+def _launchctl_opens_block(line: str) -> bool:
+    stripped = line.lstrip("\t")
+    return stripped.endswith(" = {") or stripped.endswith(" => {")
+
+
+def _launchctl_top_level_fields(
+    lines: Sequence[str],
+) -> tuple[dict[str, str], dict[str, tuple[str, ...]]]:
+    scalars: dict[str, str] = {}
+    blocks: dict[str, tuple[str, ...]] = {}
+    index = 1
+    while index < len(lines) - 1:
+        line = lines[index]
+        if not line:
+            index += 1
+            continue
+        if not line.startswith("\t") or line.startswith("\t\t"):
+            raise SetupError("launchctl print has an invalid top-level field")
+        field = line.removeprefix("\t")
+        key, separator, value = field.partition(" = ")
+        if not separator:
+            if field not in _LAUNCHCTL_RUNTIME_FLAGS:
+                raise SetupError(f"launchctl print has an unsupported top-level field: {field}")
+            index += 1
+            continue
+        if not key or not value or key in scalars or key in blocks:
+            raise SetupError("launchctl print has a duplicate or invalid top-level field")
+        if value != "{":
+            scalars[key] = value
+            index += 1
+            continue
+
+        depth = 1
+        end = index + 1
+        while end < len(lines) - 1:
+            nested = lines[end].lstrip("\t")
+            if _launchctl_opens_block(lines[end]):
+                depth += 1
+            elif nested == "}":
+                depth -= 1
+                if depth == 0:
+                    break
+            end += 1
+        if depth != 0:
+            raise SetupError(f"launchctl print has an unterminated {key} block")
+        blocks[key] = tuple(lines[index + 1 : end])
+        index = end + 1
+
+    allowed_scalars = (
+        _LAUNCHCTL_REQUIRED_SCALARS | _LAUNCHCTL_BEHAVIOR_SCALARS | _LAUNCHCTL_RUNTIME_SCALARS
+    )
+    unknown_scalars = sorted(set(scalars) - allowed_scalars)
+    unknown_blocks = sorted(set(blocks) - _LAUNCHCTL_REQUIRED_BLOCKS - _LAUNCHCTL_RUNTIME_BLOCKS)
+    if unknown_scalars or unknown_blocks:
+        fields = ",".join(unknown_scalars + unknown_blocks)
+        raise SetupError(f"launchctl print has unsupported fields: {fields}")
+    missing_scalars = sorted(
+        (_LAUNCHCTL_REQUIRED_SCALARS | _LAUNCHCTL_REQUIRED_BEHAVIOR_SCALARS) - set(scalars)
+    )
+    missing_blocks = sorted(_LAUNCHCTL_REQUIRED_BLOCKS - set(blocks))
+    if missing_scalars or missing_blocks:
+        fields = ",".join(missing_scalars + missing_blocks)
+        raise SetupError(f"launchctl print is missing required fields: {fields}")
+    return scalars, blocks
+
+
+def _launchctl_scalar(scalars: Mapping[str, str], key: str) -> str:
+    value = scalars.get(key)
+    if value is None or not value or value == "{":
         raise SetupError(f"launchctl print has an invalid {key} field")
-    return values[0]
-
-
-def _launchctl_top_level_block(lines: Sequence[str], key: str) -> list[str]:
-    opening = f"\t{key} = {{"
-    starts = [index for index, line in enumerate(lines) if line == opening]
-    if len(starts) != 1:
-        raise SetupError(f"launchctl print has an invalid {key} block")
-    start = starts[0]
-    depth = 1
-    for index in range(start + 1, len(lines)):
-        stripped = lines[index].lstrip("\t")
-        if stripped.endswith(" = {"):
-            depth += 1
-        elif stripped == "}":
-            depth -= 1
-            if depth == 0:
-                return list(lines[start + 1 : index])
-    raise SetupError(f"launchctl print has an unterminated {key} block")
+    return value
 
 
 def _parse_launchctl_arguments(lines: Sequence[str]) -> tuple[str, ...]:
     arguments: list[str] = []
-    for line in _launchctl_top_level_block(lines, "arguments"):
+    for line in lines:
         if not line.startswith("\t\t") or line.startswith("\t\t\t"):
             raise SetupError("launchctl print has an invalid arguments entry")
         value = line.removeprefix("\t\t")
@@ -2290,7 +2422,7 @@ def _parse_launchctl_arguments(lines: Sequence[str]) -> tuple[str, ...]:
 
 def _parse_launchctl_environment(lines: Sequence[str]) -> dict[str, str]:
     environment: dict[str, str] = {}
-    for line in _launchctl_top_level_block(lines, "environment"):
+    for line in lines:
         if not line.startswith("\t\t") or line.startswith("\t\t\t"):
             raise SetupError("launchctl print has an invalid environment entry")
         key, separator, value = line.removeprefix("\t\t").partition(" => ")
@@ -2300,37 +2432,171 @@ def _parse_launchctl_environment(lines: Sequence[str]) -> dict[str, str]:
     return environment
 
 
-def _parse_launchctl_calendar_intervals(
+def _launchctl_direct_fields(
     lines: Sequence[str],
+    *,
+    indent: int,
+    context: str,
+) -> tuple[dict[str, str], dict[str, tuple[str, ...]]]:
+    prefix = "\t" * indent
+    scalars: dict[str, str] = {}
+    blocks: dict[str, tuple[str, ...]] = {}
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        if not line:
+            index += 1
+            continue
+        if not line.startswith(prefix) or line.startswith(prefix + "\t"):
+            raise SetupError(f"launchctl print has an invalid {context} field")
+        field = line.removeprefix(prefix)
+        key, separator, value = field.partition(" = ")
+        if not separator or not key or not value or key in scalars or key in blocks:
+            raise SetupError(f"launchctl print has an invalid {context} field")
+        if value != "{":
+            scalars[key] = value
+            index += 1
+            continue
+        depth = 1
+        end = index + 1
+        while end < len(lines):
+            nested = lines[end].lstrip("\t")
+            if _launchctl_opens_block(lines[end]):
+                depth += 1
+            elif nested == "}":
+                depth -= 1
+                if depth == 0:
+                    break
+            end += 1
+        if depth != 0:
+            raise SetupError(f"launchctl print has an unterminated {context} field")
+        blocks[key] = tuple(lines[index + 1 : end])
+        index = end + 1
+    return scalars, blocks
+
+
+def _parse_launchctl_event_channels(channels: Sequence[str]) -> None:
+    index = 0
+    seen = False
+    while index < len(channels):
+        line = channels[index]
+        if not line:
+            index += 1
+            continue
+        if seen or line != '\t\t"com.apple.launchd.calendarinterval" = {':
+            raise SetupError("launchctl print has an unexpected event channel")
+        seen = True
+        depth = 1
+        end = index + 1
+        while end < len(channels):
+            nested = channels[end].lstrip("\t")
+            if _launchctl_opens_block(channels[end]):
+                depth += 1
+            elif nested == "}":
+                depth -= 1
+                if depth == 0:
+                    break
+            end += 1
+        if depth != 0:
+            raise SetupError("launchctl print has an unterminated event channel")
+        scalars, blocks = _launchctl_direct_fields(
+            channels[index + 1 : end],
+            indent=3,
+            context="event channel",
+        )
+        expected_fields = {"port", "active", "managed", "reset", "hide", "watching"}
+        if set(scalars) != expected_fields or blocks:
+            fields = sorted(set(scalars) ^ expected_fields)
+            fields.extend(sorted(blocks))
+            raise SetupError(
+                "launchctl print has unsupported event channel fields: " + ",".join(fields)
+            )
+        if re.fullmatch(r"0x[0-9a-f]+", scalars["port"]) is None:
+            raise SetupError("launchctl print has an invalid event channel port")
+        if scalars["active"] not in {"0", "1"}:
+            raise SetupError("launchctl print has an invalid event channel active state")
+        if (
+            scalars["managed"] != "1"
+            or scalars["reset"] != "0"
+            or scalars["hide"] != "0"
+            or scalars["watching"] != "1"
+        ):
+            raise SetupError("launchctl print has an unexpected event channel behavior")
+        index = end + 1
+    if not seen:
+        raise SetupError("launchctl print has no calendar event channel")
+
+
+def _parse_launchctl_calendar_intervals(
+    triggers: Sequence[str],
+    *,
+    expected_service: str,
 ) -> tuple[tuple[tuple[str, int], ...], ...]:
-    triggers = _launchctl_top_level_block(lines, "event triggers")
     intervals: list[tuple[tuple[str, int], ...]] = []
+    trigger_names: set[str] = set()
     index = 0
     while index < len(triggers):
         line = triggers[index]
-        if line.lstrip("\t") != "descriptor = {":
+        if not line:
             index += 1
             continue
-        indent = len(line) - len(line.lstrip("\t"))
-        if indent < 2:
-            raise SetupError("launchctl print has an invalid calendar descriptor")
-        closing = "\t" * indent + "}"
-        entry_prefix = "\t" * (indent + 1)
+        match = re.fullmatch(r"\t\t(.+) => \{", line)
+        if (
+            match is None
+            or re.fullmatch(rf"{re.escape(expected_service)}\.[0-9]+", match.group(1)) is None
+            or match.group(1) in trigger_names
+        ):
+            raise SetupError("launchctl print has an invalid event trigger")
+        trigger_names.add(match.group(1))
+        depth = 1
+        end = index + 1
+        while end < len(triggers):
+            nested = triggers[end].lstrip("\t")
+            if _launchctl_opens_block(triggers[end]):
+                depth += 1
+            elif nested == "}":
+                depth -= 1
+                if depth == 0:
+                    break
+            end += 1
+        if depth != 0:
+            raise SetupError("launchctl print has an unterminated event trigger")
+        scalars, blocks = _launchctl_direct_fields(
+            triggers[index + 1 : end],
+            indent=3,
+            context="event trigger",
+        )
+        expected_scalars = {"service", "stream", "monitor", "keepalive"}
+        expected_blocks = {"descriptor"}
+        scalar_delta = sorted(set(scalars) ^ expected_scalars)
+        block_delta = sorted(set(blocks) ^ expected_blocks)
+        if scalar_delta or block_delta:
+            fields = ",".join(scalar_delta + block_delta)
+            raise SetupError(f"launchctl print has unsupported event trigger fields: {fields}")
+        if scalars.get("service") != expected_service:
+            raise SetupError("launchctl print event trigger targets an unexpected service")
+        if scalars.get("stream") != "com.apple.launchd.calendarinterval":
+            raise SetupError("launchctl print has an unexpected event trigger kind")
+        if scalars["monitor"] != "com.apple.UserEventAgent-Aqua":
+            raise SetupError("launchctl print has an unexpected event trigger monitor")
+        if scalars["keepalive"] != "0":
+            raise SetupError("launchctl print event trigger enables unexpected KeepAlive behavior")
+        descriptor_lines = blocks["descriptor"]
         descriptor: dict[str, int] = {}
-        index += 1
-        while index < len(triggers) and triggers[index] != closing:
-            entry = triggers[index]
-            if not entry.startswith(entry_prefix) or entry.startswith(entry_prefix + "\t"):
+        for entry in descriptor_lines:
+            if not entry.startswith("\t\t\t\t") or entry.startswith("\t\t\t\t\t"):
                 raise SetupError("launchctl print has an invalid calendar descriptor entry")
-            match = re.fullmatch(r'"([A-Za-z]+)" => (-?[0-9]+)', entry.removeprefix(entry_prefix))
+            match = re.fullmatch(
+                r'"([A-Za-z]+)" => (-?[0-9]+)',
+                entry.removeprefix("\t\t\t\t"),
+            )
             if match is None or match.group(1) in descriptor:
                 raise SetupError("launchctl print has an invalid calendar descriptor entry")
             descriptor[match.group(1)] = int(match.group(2))
-            index += 1
-        if index == len(triggers) or not descriptor:
-            raise SetupError("launchctl print has an unterminated calendar descriptor")
+        if not descriptor:
+            raise SetupError("launchctl print has an empty calendar descriptor")
         intervals.append(tuple(sorted(descriptor.items())))
-        index += 1
+        index = end + 1
     if not intervals:
         raise SetupError("launchctl print has no calendar interval")
     return tuple(sorted(intervals))
@@ -2345,17 +2611,68 @@ def _parse_launchctl_definition(
     lines = output.splitlines()
     if not lines or lines[0] != f"{service} = {{" or lines[-1] != "}":
         raise SetupError("launchctl print does not describe the requested service")
-    if _launchctl_scalar(lines, "type") != "LaunchAgent":
+    scalars, blocks = _launchctl_top_level_fields(lines)
+    if _launchctl_scalar(scalars, "type") != "LaunchAgent":
         raise SetupError("launchctl print does not describe a LaunchAgent")
+
+    minimum_runtime = scalars.get("minimum runtime")
+    base_minimum_runtime = scalars.get("base minimum runtime")
+    for key, value in (
+        ("minimum runtime", minimum_runtime),
+        ("base minimum runtime", base_minimum_runtime),
+        ("exit timeout", scalars.get("exit timeout")),
+    ):
+        if value is not None and re.fullmatch(r"[0-9]+", value) is None:
+            raise SetupError(f"launchctl print has an invalid {key} field")
+
+    properties_value = scalars.get("properties")
+    properties: frozenset[str]
+    if properties_value is None:
+        properties = frozenset()
+    else:
+        values = properties_value.split(" | ")
+        if any(not value for value in values) or len(values) != len(set(values)):
+            raise SetupError("launchctl print has an invalid properties field")
+        properties = frozenset(values)
+        configured_behavior = sorted(properties & {"keepalive", "runatload"})
+        if configured_behavior:
+            names = [
+                {"keepalive": "KeepAlive", "runatload": "RunAtLoad"}[value]
+                for value in configured_behavior
+            ]
+            raise SetupError(
+                "launchctl print enables unsupported behavior properties: " + ",".join(names)
+            )
+        unsupported = sorted(properties - _LAUNCHCTL_NEUTRAL_PROPERTIES)
+        if unsupported:
+            raise SetupError(
+                "launchctl print has unsupported behavior properties: " + ",".join(unsupported)
+            )
+        if "inferred program" not in properties:
+            raise SetupError("launchctl print properties do not bind the inferred program")
+    _parse_launchctl_event_channels(blocks["event channels"])
+    assert minimum_runtime is not None
+    exit_timeout = scalars["exit timeout"]
+    spawn_type = scalars["spawn type"]
     return LoadedLaunchAgent(
-        source_path=_launchctl_scalar(lines, "path"),
-        program=_launchctl_scalar(lines, "program"),
-        program_arguments=_parse_launchctl_arguments(lines),
-        working_directory=_launchctl_scalar(lines, "working directory"),
-        standard_out_path=_launchctl_scalar(lines, "stdout path"),
-        standard_error_path=_launchctl_scalar(lines, "stderr path"),
-        environment_variables=_parse_launchctl_environment(lines),
-        calendar_intervals=_parse_launchctl_calendar_intervals(lines),
+        source_path=_launchctl_scalar(scalars, "path"),
+        program=_launchctl_scalar(scalars, "program"),
+        program_arguments=_parse_launchctl_arguments(blocks["arguments"]),
+        working_directory=_launchctl_scalar(scalars, "working directory"),
+        standard_out_path=_launchctl_scalar(scalars, "stdout path"),
+        standard_error_path=_launchctl_scalar(scalars, "stderr path"),
+        environment_variables=_parse_launchctl_environment(blocks["environment"]),
+        calendar_intervals=_parse_launchctl_calendar_intervals(
+            blocks["event triggers"],
+            expected_service=service.rsplit("/", 1)[-1],
+        ),
+        minimum_runtime=int(minimum_runtime),
+        base_minimum_runtime=(
+            int(base_minimum_runtime) if base_minimum_runtime is not None else None
+        ),
+        exit_timeout=int(exit_timeout),
+        spawn_type=spawn_type,
+        properties=properties,
     )
 
 
@@ -2393,6 +2710,13 @@ def _loaded_definition_mismatches(
     """
     if definition is None:
         return ("definition",)
+    if set(expected) != _LAUNCH_AGENT_PLIST_KEYS:
+        unsupported = sorted(set(expected) - _LAUNCH_AGENT_PLIST_KEYS)
+        missing = sorted(_LAUNCH_AGENT_PLIST_KEYS - set(expected))
+        fields = ",".join(unsupported + missing)
+        raise SetupError(
+            f"verified {spec.key} LaunchAgent does not use the closed behavior schema: {fields}"
+        )
     label = expected.get("Label")
     arguments = expected.get("ProgramArguments")
     working_directory = expected.get("WorkingDirectory")
@@ -2435,6 +2759,15 @@ def _loaded_definition_mismatches(
         mismatches.append("EnvironmentVariables")
     if definition.calendar_intervals != _expected_calendar_intervals(expected):
         mismatches.append("StartCalendarInterval")
+    if definition.minimum_runtime != _LAUNCHCTL_DEFAULT_MINIMUM_RUNTIME or (
+        definition.base_minimum_runtime is not None
+        and definition.base_minimum_runtime != _LAUNCHCTL_DEFAULT_MINIMUM_RUNTIME
+    ):
+        mismatches.append("ThrottleInterval")
+    if definition.exit_timeout != _LAUNCHCTL_DEFAULT_EXIT_TIMEOUT:
+        mismatches.append("ExitTimeOut")
+    if definition.spawn_type != _LAUNCHCTL_DEFAULT_SPAWN_TYPE:
+        mismatches.append("ProcessType")
     return tuple(mismatches)
 
 

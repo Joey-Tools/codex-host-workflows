@@ -93,6 +93,13 @@ class FakeRunner(hs.CommandRunner):
         self.loaded: dict[str, bool] = {}
         self.loaded_definitions: dict[str, tuple[Path, dict[str, Any]]] = {}
         self.print_error = print_error
+        self.extra_print_scalars: list[str] = []
+        self.extra_event_triggers: list[str] = []
+        self.minimum_runtime = 10
+        self.exit_timeout = 5
+        self.spawn_type = "daemon (3)"
+        self.properties = "inferred program | needs LWCR update | managed LWCR"
+        self.trigger_keepalive = "0"
 
     def load_plist(self, path: Path) -> None:
         parsed = plistlib.loads(path.read_bytes())
@@ -134,21 +141,54 @@ class FakeRunner(hs.CommandRunner):
             f"\t\tXPC_SERVICE_NAME => {label}",
             "\t}",
             "",
+            f"\tminimum runtime = {self.minimum_runtime}",
+            f"\texit timeout = {self.exit_timeout}",
+            *self.extra_print_scalars,
+            "",
             "\tevent triggers = {",
         ]
         for index, interval in enumerate(intervals, start=1):
             lines.extend(
                 [
                     f"\t\t{label}.{index} => {{",
+                    f"\t\t\tkeepalive = {self.trigger_keepalive}",
                     f"\t\t\tservice = {label}",
                     "\t\t\tstream = com.apple.launchd.calendarinterval",
+                    "\t\t\tmonitor = com.apple.UserEventAgent-Aqua",
                     "\t\t\tdescriptor = {",
                     *(f'\t\t\t\t"{key}" => {value}' for key, value in interval.items()),
                     "\t\t\t}",
                     "\t\t}",
                 ]
             )
-        lines.extend(["\t}", "}"])
+        lines.extend(
+            [
+                *self.extra_event_triggers,
+                "\t}",
+                "",
+                "\tevent channels = {",
+                '\t\t"com.apple.launchd.calendarinterval" = {',
+                "\t\t\tport = 0x0",
+                "\t\t\tactive = 0",
+                "\t\t\tmanaged = 1",
+                "\t\t\treset = 0",
+                "\t\t\thide = 0",
+                "\t\t\twatching = 1",
+                "\t\t}",
+                "\t}",
+                "",
+                f"\tspawn type = {self.spawn_type}",
+                "\tjetsam priority = 40",
+                "\tjetsam memory limit (active) = (unlimited)",
+                "\tjetsam memory limit (inactive) = (unlimited)",
+                "\tjetsamproperties category = daemon",
+                "\tjetsam thread limit = 32",
+                "\tcpumon = default",
+                "",
+                f"\tproperties = {self.properties}",
+                "}",
+            ]
+        )
         return "\n".join(lines) + "\n"
 
     def _launch_result(self, args: list[str]) -> subprocess.CompletedProcess[str]:
@@ -1258,12 +1298,167 @@ def test_launchctl_exact_loaded_definition_is_ready(tmp_path: Path) -> None:
     runner = FakeRunner()
     _apply_ready(fixture, runner)
     active = _active(fixture)
+    runner.extra_print_scalars = [
+        "\tbase minimum runtime = 10",
+        "\truns = 8",
+        "\tpid = 1234",
+        "\tlast exit code = 0",
+    ]
 
     report = hs.status_setup(active, fixture.home, runner, no_launchctl=False)
 
     assert report["status"] == "ready"
     assert _check(report, "launchctl-control")["status"] == "ready"
     assert _check(report, "launchctl-weekly")["status"] == "ready"
+
+
+@pytest.mark.parametrize(
+    ("attribute", "value", "expected_field"),
+    [
+        ("properties", "inferred program | keepalive", "KeepAlive"),
+        ("properties", "inferred program | runatload", "RunAtLoad"),
+        ("minimum_runtime", 30, "ThrottleInterval"),
+        ("exit_timeout", 30, "ExitTimeOut"),
+        ("spawn_type", "interactive (4)", "ProcessType"),
+    ],
+)
+def test_launchctl_same_path_and_arguments_with_extra_behavior_is_blocked(
+    tmp_path: Path,
+    attribute: str,
+    value: str | int,
+    expected_field: str,
+) -> None:
+    fixture = _build_host(tmp_path)
+    runner = FakeRunner()
+    _apply_ready(fixture, runner)
+    active = _active(fixture)
+    setattr(runner, attribute, value)
+    calls_before_status = len(runner.calls)
+
+    report = hs.status_setup(active, fixture.home, runner, no_launchctl=False)
+
+    check = _check(report, "launchctl-control")
+    assert report["status"] == "blocked"
+    assert check["status"] == "blocked"
+    assert expected_field in check["detail"]
+    assert not any(
+        args[:2] in (["launchctl", "bootout"], ["launchctl", "bootstrap"])
+        for args, _cwd in runner.calls[calls_before_status:]
+    )
+
+
+def test_launchctl_conditional_keepalive_block_is_blocked(tmp_path: Path) -> None:
+    fixture = _build_host(tmp_path)
+    runner = FakeRunner()
+    _apply_ready(fixture, runner)
+    active = _active(fixture)
+    runner.extra_print_scalars = [
+        "\tsemaphores = {",
+        "\t\tsuccessful exit => 0",
+        "\t}",
+    ]
+
+    report = hs.status_setup(active, fixture.home, runner, no_launchctl=False)
+
+    check = _check(report, "launchctl-control")
+    assert report["status"] == "blocked"
+    assert check["status"] == "blocked"
+    assert "semaphores" in check["detail"]
+
+
+def test_launchctl_calendar_trigger_keepalive_is_blocked(tmp_path: Path) -> None:
+    fixture = _build_host(tmp_path)
+    runner = FakeRunner()
+    _apply_ready(fixture, runner)
+    active = _active(fixture)
+    runner.trigger_keepalive = "1"
+
+    report = hs.status_setup(active, fixture.home, runner, no_launchctl=False)
+
+    check = _check(report, "launchctl-control")
+    assert report["status"] == "blocked"
+    assert check["status"] == "blocked"
+    assert "KeepAlive" in check["detail"]
+
+
+def test_launchctl_foreign_calendar_trigger_name_is_blocked(tmp_path: Path) -> None:
+    fixture = _build_host(tmp_path)
+    runner = FakeRunner()
+    _apply_ready(fixture, runner)
+    active = _active(fixture)
+    runner.extra_event_triggers = [
+        "\t\tforeign.999999999 => {",
+        "\t\t\tkeepalive = 0",
+        f"\t\t\tservice = {active.launch_agent_label}",
+        "\t\t\tstream = com.apple.launchd.calendarinterval",
+        "\t\t\tmonitor = com.apple.UserEventAgent-Aqua",
+        "\t\t\tdescriptor = {",
+        '\t\t\t\t"Hour" => 2',
+        '\t\t\t\t"Minute" => 45',
+        "\t\t\t}",
+        "\t\t}",
+    ]
+
+    report = hs.status_setup(active, fixture.home, runner, no_launchctl=False)
+
+    check = _check(report, "launchctl-control")
+    assert report["status"] == "blocked"
+    assert check["status"] == "blocked"
+    assert "invalid event trigger" in check["detail"]
+
+
+def test_launchctl_additional_unknown_trigger_kind_is_blocked(tmp_path: Path) -> None:
+    fixture = _build_host(tmp_path)
+    runner = FakeRunner()
+    _apply_ready(fixture, runner)
+    active = _active(fixture)
+    runner.extra_event_triggers = [
+        f"\t\t{active.launch_agent_label}.999999999 => {{",
+        "\t\t\tkeepalive = 0",
+        f"\t\t\tservice = {active.launch_agent_label}",
+        "\t\t\tstream = com.apple.launchd.watchpaths",
+        "\t\t\tmonitor = com.apple.UserEventAgent-Aqua",
+        "\t\t\tdescriptor = {",
+        '\t\t\t\t"Path" => 1',
+        "\t\t\t}",
+        "\t\t}",
+    ]
+
+    report = hs.status_setup(active, fixture.home, runner, no_launchctl=False)
+
+    check = _check(report, "launchctl-control")
+    assert report["status"] == "blocked"
+    assert check["status"] == "blocked"
+    assert "unexpected event trigger kind" in check["detail"]
+
+
+def test_launchctl_expected_trigger_with_unknown_behavior_field_is_blocked(
+    tmp_path: Path,
+) -> None:
+    fixture = _build_host(tmp_path)
+    runner = FakeRunner()
+    _apply_ready(fixture, runner)
+    active = _active(fixture)
+    runner.extra_event_triggers = [
+        f"\t\t{active.launch_agent_label}.999999999 => {{",
+        "\t\t\tkeepalive = 0",
+        f"\t\t\tservice = {active.launch_agent_label}",
+        "\t\t\tstream = com.apple.launchd.calendarinterval",
+        "\t\t\tmonitor = com.apple.UserEventAgent-Aqua",
+        "\t\t\twatch path = /tmp/foreign",
+        "\t\t\tdescriptor = {",
+        '\t\t\t\t"Hour" => 2',
+        '\t\t\t\t"Minute" => 45',
+        "\t\t\t}",
+        "\t\t}",
+    ]
+
+    report = hs.status_setup(active, fixture.home, runner, no_launchctl=False)
+
+    check = _check(report, "launchctl-control")
+    assert report["status"] == "blocked"
+    assert check["status"] == "blocked"
+    assert "unsupported event trigger fields" in check["detail"]
 
 
 def test_launchctl_same_label_foreign_definition_is_blocked(tmp_path: Path) -> None:

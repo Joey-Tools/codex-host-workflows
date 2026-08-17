@@ -73,6 +73,7 @@ STATUSES = {
     "superseded",
     "dormant",
 }
+INITIAL_CASE_STATUSES = {"watching", "proposed"}
 SUPPORT_RESULTS = {"novel", "repeated"}
 URGENCIES = {"normal", "high-signal"}
 SCOPES = {"repo-local", "cross-workflow", "global-invariant"}
@@ -2840,6 +2841,12 @@ def stage_candidate(candidate_path: Path, state_root: Path, now: str) -> dict[st
         _validate_automation_origin(state_root, candidate)
         existing_path = _find_case(state_root, summary["case_id"])
         if existing_path is None:
+            if summary["status"] not in INITIAL_CASE_STATUSES:
+                _fail(
+                    "invalid-initial-lifecycle",
+                    "a new case must start at watching or proposed; source_kind does not "
+                    "authorize a lifecycle import",
+                )
             if summary["revision"] != 1:
                 _fail("revision-order", "a new case must start at revision 1")
             destination = state_root / _case_relative_path(candidate)

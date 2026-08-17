@@ -435,39 +435,102 @@ def _wrapper_for_case(case: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _closed_candidate() -> dict[str, Any]:
-    wrapper = _candidate(status="closed", lifecycle_at="2026-06-20T12:00:00Z")
-    case_id = wrapper["case"]["id"]
-    wrapper["case"]["repairs"] = [
+def _repair_lifecycle_candidates() -> list[dict[str, Any]]:
+    proposed = _candidate(status="proposed")
+    case_id = proposed["case"]["id"]
+    proposed["case"]["repairs"] = [
         {
             "id": "R1",
             "repository": "Joey-Tools/example",
             "action": "install",
-            "state": "merged",
+            "state": "planned",
             "problem_statement": "The deterministic workflow omitted an authority boundary check.",
             "change_summary": "Add the missing bounded authority check.",
-            "pull_request_url": "https://github.com/Joey-Tools/example/pull/1",
-            "commit": "a" * 40,
+            "pull_request_url": None,
+            "commit": None,
             "commit_trailer": f"Friction-Case: {case_id}",
-            "installed_on": "2026-06-02",
+            "installed_on": None,
             "removed_on": None,
             "replaces_repair_id": None,
         }
     ]
-    wrapper["case"]["effectiveness"] = {
+    proposed["case"]["effectiveness"] = {
         "method": "deterministic",
-        "state": "passed",
-        "checked_on": "2026-06-10",
-        "summary": "The installed deterministic authority gate passed.",
+        "state": "not-started",
+        "checked_on": None,
+        "summary": None,
+        "deterministic": None,
+        "behavioral": None,
+    }
+    proposed["control"]["semantic_digest"] = fs.semantic_digest(proposed["case"])
+
+    approved = json.loads(json.dumps(proposed))
+    approved["case"]["revision"] = 2
+    approved["case"]["status"] = "approved"
+    approved["case"]["lifecycle_changed_at"] = "2026-06-02T12:00:00Z"
+    approved["case"]["repairs"][0]["state"] = "open"
+    approved["case"]["repairs"][0]["pull_request_url"] = (
+        "https://github.com/Joey-Tools/example/pull/1"
+    )
+    approved["control"]["semantic_digest"] = fs.semantic_digest(approved["case"])
+
+    implemented = json.loads(json.dumps(approved))
+    implemented["case"]["revision"] = 3
+    implemented["case"]["status"] = "implemented"
+    implemented["case"]["lifecycle_changed_at"] = "2026-06-03T12:00:00Z"
+    implemented["case"]["repairs"][0]["state"] = "merged"
+    implemented["case"]["repairs"][0]["commit"] = "a" * 40
+    implemented["case"]["repairs"][0]["installed_on"] = "2026-06-02"
+    implemented["control"]["semantic_digest"] = fs.semantic_digest(implemented["case"])
+
+    observing = json.loads(json.dumps(implemented))
+    observing["case"]["revision"] = 4
+    observing["case"]["status"] = "observing"
+    observing["case"]["lifecycle_changed_at"] = "2026-06-04T12:00:00Z"
+    observing["case"]["effectiveness"] = {
+        "method": "deterministic",
+        "state": "monitoring",
+        "checked_on": "2026-06-04",
+        "summary": "The installed deterministic authority gate is under observation.",
         "deterministic": {
             "test_ref": "tests/test_authority_gate.py",
-            "result": "passed",
+            "result": "pending",
             "commit": "a" * 40,
         },
         "behavioral": None,
     }
-    wrapper["control"]["semantic_digest"] = fs.semantic_digest(wrapper["case"])
-    return wrapper
+    observing["control"]["semantic_digest"] = fs.semantic_digest(observing["case"])
+
+    closed = json.loads(json.dumps(observing))
+    closed["case"]["revision"] = 5
+    closed["case"]["status"] = "closed"
+    closed["case"]["lifecycle_changed_at"] = "2026-06-20T12:00:00Z"
+    closed["case"]["effectiveness"]["state"] = "passed"
+    closed["case"]["effectiveness"]["checked_on"] = "2026-06-10"
+    closed["case"]["effectiveness"]["summary"] = (
+        "The installed deterministic authority gate passed."
+    )
+    closed["case"]["effectiveness"]["deterministic"]["result"] = "passed"
+    closed["control"]["semantic_digest"] = fs.semantic_digest(closed["case"])
+    return [proposed, approved, implemented, observing, closed]
+
+
+def _closed_candidate() -> dict[str, Any]:
+    return _repair_lifecycle_candidates()[-1]
+
+
+def _stage_repair_lifecycle(
+    tmp_path: Path, candidates: list[dict[str, Any]] | None = None
+) -> tuple[Path, dict[str, Any]]:
+    root = tmp_path / "state"
+    candidates = candidates or _repair_lifecycle_candidates()
+    for index, candidate in enumerate(candidates):
+        fs.stage_candidate(
+            _write(tmp_path / f"{candidate['case']['status']}.json", candidate),
+            root,
+            f"2026-07-10T12:0{index}:00Z",
+        )
+    return root, candidates[-1]
 
 
 def _closed_reopen_candidate(
@@ -857,6 +920,130 @@ def test_no_issue_cannot_be_staged(tmp_path: Path) -> None:
     with pytest.raises(fs.StateError, match="not durable cases"):
         fs.stage_candidate(_write(tmp_path / "candidate.json", candidate), tmp_path / "state", T0)
     assert not (tmp_path / "state" / "cases").exists()
+
+
+def test_new_case_rejects_every_structurally_valid_skipped_lifecycle(
+    tmp_path: Path,
+) -> None:
+    repair_lifecycle = {
+        item["case"]["status"]: json.loads(json.dumps(item))
+        for item in _repair_lifecycle_candidates()[1:]
+    }
+    for candidate in repair_lifecycle.values():
+        candidate["case"]["revision"] = 1
+        candidate["control"]["semantic_digest"] = fs.semantic_digest(candidate["case"])
+
+    dormant = _candidate(status="dormant", lifecycle_at="2026-06-02T12:00:00Z")
+    dormant["case"]["lifecycle"]["dormant_since"] = "2026-06-02T12:00:00Z"
+    dormant["case"]["lifecycle"]["dormant_from_status"] = "watching"
+    dormant["control"]["semantic_digest"] = fs.semantic_digest(dormant["case"])
+    repair_lifecycle["dormant"] = dormant
+
+    successor = _candidate(occurrences=[_occurrence(0, root="root:successor")])
+    superseded = _candidate(status="superseded", lifecycle_at="2026-06-02T12:00:00Z")
+    superseded["case"]["lifecycle"]["superseded_by"] = successor["case"]["id"]
+    superseded["control"]["semantic_digest"] = fs.semantic_digest(superseded["case"])
+    repair_lifecycle["superseded"] = superseded
+
+    assert set(repair_lifecycle) == {
+        "approved",
+        "implemented",
+        "observing",
+        "closed",
+        "dormant",
+        "superseded",
+    }
+    for status, candidate in repair_lifecycle.items():
+        assert fs.validate_candidate(candidate)["status"] == status
+        root = tmp_path / status / "state"
+        if status == "superseded":
+            fs.stage_candidate(
+                _write(tmp_path / status / "successor.json", successor),
+                root,
+                "2026-07-10T11:59:00Z",
+            )
+        with pytest.raises(fs.StateError, match="new case must start at watching or proposed"):
+            fs.stage_candidate(
+                _write(tmp_path / status / "candidate.json", candidate),
+                root,
+                "2026-07-10T12:00:00Z",
+            )
+        assert not (root / fs._case_relative_path(candidate)).exists()
+
+
+def test_new_case_allows_watching_and_proposed(tmp_path: Path) -> None:
+    candidates = {
+        "watching": _candidate(),
+        "proposed": _repair_lifecycle_candidates()[0],
+    }
+    for status, candidate in candidates.items():
+        receipt = fs.stage_candidate(
+            _write(tmp_path / status / "candidate.json", candidate),
+            tmp_path / status / "state",
+            "2026-07-10T12:00:00Z",
+        )
+        assert receipt["action"] == "created"
+        assert (
+            fs._load_json(Path(receipt["path"]).parents[2] / receipt["case_path"])["case"]["status"]
+            == status
+        )
+
+
+def test_source_kind_cannot_bypass_initial_lifecycle(tmp_path: Path) -> None:
+    legacy = json.loads(json.dumps(_repair_lifecycle_candidates()[1]))
+    legacy["case"]["revision"] = 1
+    legacy["case"]["source_kind"] = "legacy-migration"
+    legacy["control"]["source_lineage"][0]["source_family"] = "legacy-migration"
+    legacy["control"]["semantic_digest"] = fs.semantic_digest(legacy["case"])
+    assert fs.validate_candidate(legacy)["status"] == "approved"
+    with pytest.raises(fs.StateError, match="source_kind does not authorize"):
+        fs.stage_candidate(
+            _write(tmp_path / "legacy.json", legacy),
+            tmp_path / "legacy-state",
+            "2026-07-10T12:00:00Z",
+        )
+
+    origin = _candidate()
+    root, _ = _stage(tmp_path / "automation", origin)
+    correction = _occurrence(
+        1,
+        root="root:correction",
+        observed_at="2026-06-02T12:00:00Z",
+    )
+    correction["signal_type"] = "explicit-human-correction"
+    derived = _candidate(
+        occurrences=[correction],
+        status="approved",
+        lifecycle_at="2026-06-03T12:00:00Z",
+        source_kind="automation-derived",
+        explicit_human_root="root:correction",
+        origin_case_id=origin["case"]["id"],
+    )
+    derived["case"]["repairs"] = [
+        {
+            "id": "R1",
+            "repository": "Joey-Tools/example",
+            "action": "install",
+            "state": "open",
+            "problem_statement": "The derived workflow omitted an authority boundary check.",
+            "change_summary": "Add the missing bounded authority check.",
+            "pull_request_url": "https://github.com/Joey-Tools/example/pull/2",
+            "commit": None,
+            "commit_trailer": f"Friction-Case: {derived['case']['id']}",
+            "installed_on": None,
+            "removed_on": None,
+            "replaces_repair_id": None,
+        }
+    ]
+    derived["case"]["effectiveness"]["method"] = "deterministic"
+    derived["control"]["semantic_digest"] = fs.semantic_digest(derived["case"])
+    assert fs.validate_candidate(derived)["status"] == "approved"
+    with pytest.raises(fs.StateError, match="source_kind does not authorize"):
+        fs.stage_candidate(
+            _write(tmp_path / "automation" / "derived.json", derived),
+            root,
+            "2026-07-10T13:00:00Z",
+        )
 
 
 def test_same_root_distinct_opportunities_are_real_recurrence(tmp_path: Path) -> None:
@@ -2186,8 +2373,8 @@ def test_evidence_and_lineage_are_exact_prefix_append_only(tmp_path: Path) -> No
 
 
 def test_closed_case_reopens_only_for_a_later_same_cause_recurrence(tmp_path: Path) -> None:
-    closed = _closed_candidate()
-    root, _ = _stage(tmp_path, closed)
+    lifecycle = _repair_lifecycle_candidates()
+    root, closed = _stage_repair_lifecycle(tmp_path, lifecycle)
     reopened = _closed_reopen_candidate(closed)
     receipt = fs.stage_candidate(
         _write(tmp_path / "reopened.json", reopened),
@@ -2197,12 +2384,7 @@ def test_closed_case_reopens_only_for_a_later_same_cause_recurrence(tmp_path: Pa
     assert receipt["action"] == "updated"
     assert fs._load_json(root / receipt["case_path"])["case"]["status"] == "proposed"
 
-    other_root = tmp_path / "invalid-reopen-state"
-    fs.stage_candidate(
-        _write(tmp_path / "closed-again.json", closed),
-        other_root,
-        "2026-07-10T12:00:00Z",
-    )
+    other_root, _ = _stage_repair_lifecycle(tmp_path / "invalid-reopen", lifecycle)
     not_later = _closed_reopen_candidate(closed, observed_at="2026-06-20T12:00:00Z")
     with pytest.raises(fs.StateError, match="strictly follow"):
         fs.stage_candidate(
@@ -2211,12 +2393,7 @@ def test_closed_case_reopens_only_for_a_later_same_cause_recurrence(tmp_path: Pa
             "2026-07-10T13:00:00Z",
         )
 
-    late_root = tmp_path / "late-reopen-state"
-    fs.stage_candidate(
-        _write(tmp_path / "closed-before-late.json", closed),
-        late_root,
-        "2026-07-10T12:00:00Z",
-    )
+    late_root, _ = _stage_repair_lifecycle(tmp_path / "late-reopen", lifecycle)
     lifecycle_too_early = _closed_reopen_candidate(closed, observed_at="2026-06-22T12:00:00Z")
     with pytest.raises(fs.StateError, match="cannot predate recurrence"):
         fs.stage_candidate(
@@ -2225,12 +2402,7 @@ def test_closed_case_reopens_only_for_a_later_same_cause_recurrence(tmp_path: Pa
             "2026-07-10T13:00:00Z",
         )
 
-    method_root = tmp_path / "method-reopen-state"
-    fs.stage_candidate(
-        _write(tmp_path / "closed-before-method-change.json", closed),
-        method_root,
-        "2026-07-10T12:00:00Z",
-    )
+    method_root, _ = _stage_repair_lifecycle(tmp_path / "method-reopen", lifecycle)
     changed_method = _closed_reopen_candidate(closed)
     changed_method["case"]["effectiveness"]["method"] = "behavioral"
     changed_method["control"]["semantic_digest"] = fs.semantic_digest(changed_method["case"])
@@ -2243,19 +2415,33 @@ def test_closed_case_reopens_only_for_a_later_same_cause_recurrence(tmp_path: Pa
 
 
 def test_stage_rejects_missing_or_cyclic_supersession_graph(tmp_path: Path) -> None:
-    missing = _candidate(status="superseded")
+    missing_first = _candidate()
+    missing_root, _ = _stage(tmp_path / "missing", missing_first)
+    missing = json.loads(json.dumps(missing_first))
+    missing["case"]["revision"] = 2
+    missing["case"]["status"] = "superseded"
+    missing["case"]["lifecycle_changed_at"] = "2026-06-02T12:00:00Z"
     missing["case"]["lifecycle"]["superseded_by"] = _candidate()["case"]["id"]
     missing["control"]["semantic_digest"] = fs.semantic_digest(missing["case"])
     with pytest.raises(fs.StateError, match="missing successor"):
         fs.stage_candidate(
             _write(tmp_path / "missing-successor.json", missing),
-            tmp_path / "missing-state",
+            missing_root,
             "2026-07-10T12:00:00Z",
         )
 
     successor = _candidate()
-    root, _ = _stage(tmp_path, successor)
-    predecessor = _candidate(status="superseded")
+    root, _ = _stage(tmp_path / "cycle", successor)
+    predecessor_first = _candidate()
+    fs.stage_candidate(
+        _write(tmp_path / "predecessor-first.json", predecessor_first),
+        root,
+        "2026-07-10T12:30:00Z",
+    )
+    predecessor = json.loads(json.dumps(predecessor_first))
+    predecessor["case"]["revision"] = 2
+    predecessor["case"]["status"] = "superseded"
+    predecessor["case"]["lifecycle_changed_at"] = "2026-06-02T12:00:00Z"
     predecessor["case"]["lifecycle"]["superseded_by"] = successor["case"]["id"]
     predecessor["control"]["semantic_digest"] = fs.semantic_digest(predecessor["case"])
     fs.stage_candidate(
