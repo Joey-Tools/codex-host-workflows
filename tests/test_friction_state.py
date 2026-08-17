@@ -2296,6 +2296,317 @@ def test_external_after_image_loss_after_commit_publication_rolls_back_commit(
     assert output.exists() and (root / commit_relative).exists()
 
 
+@pytest.mark.parametrize(
+    "failure_point",
+    [
+        "publication-directory-fsync",
+        "temporary-cleanup",
+        "cleanup-directory-fsync",
+        "final-reread",
+    ],
+)
+def test_commit_wal_postpublication_failures_roll_back_exact_owned_leaf(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_point: str,
+) -> None:
+    case = _candidate()
+    root, stage = _stage(tmp_path, case)
+    completed = _complete_live(tmp_path, root, [stage])
+    selection = _approved_selection(tmp_path, root, completed["snapshot_digest"], [case])
+    selection_path = _write(tmp_path / f"{failure_point}-selection.json", selection)
+    output = tmp_path / f"{failure_point}-plan.json"
+    intent_relative, commit_relative = fs._wal_paths("weekly-plan", selection["selection_id"])
+    commit_leaf = commit_relative.name
+
+    original_link = os.link
+    original_fsync = os.fsync
+    original_unlink = os.unlink
+    original_read_named = fs.StateStore._read_named
+    published = False
+    injected = False
+    postpublication_fsyncs = 0
+    temporary_cleanup_failures = 0
+
+    def track_commit_link(
+        src: str,
+        dst: str,
+        *,
+        src_dir_fd: int | None = None,
+        dst_dir_fd: int | None = None,
+        follow_symlinks: bool = True,
+    ) -> None:
+        nonlocal published
+        original_link(
+            src,
+            dst,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=dst_dir_fd,
+            follow_symlinks=follow_symlinks,
+        )
+        if dst == commit_leaf:
+            published = True
+
+    def fail_selected_fsync(fd: int) -> None:
+        nonlocal injected, postpublication_fsyncs
+        if published:
+            postpublication_fsyncs += 1
+            selected = (
+                failure_point == "publication-directory-fsync" and postpublication_fsyncs == 1
+            ) or (failure_point == "cleanup-directory-fsync" and postpublication_fsyncs == 2)
+            if selected and not injected:
+                injected = True
+                raise OSError(f"injected {failure_point} failure")
+        original_fsync(fd)
+
+    def fail_selected_unlink(path: str | bytes, *, dir_fd: int | None = None) -> None:
+        nonlocal injected, temporary_cleanup_failures
+        if (
+            failure_point == "temporary-cleanup"
+            and published
+            and temporary_cleanup_failures < 2
+            and os.fsdecode(path).startswith(f".{commit_leaf}.tmp-")
+        ):
+            injected = True
+            temporary_cleanup_failures += 1
+            raise OSError(f"injected {failure_point} failure")
+        original_unlink(path, dir_fd=dir_fd)
+
+    def fail_selected_read(
+        store: Any,
+        parent_fd: int,
+        name: str,
+        relative: Path,
+        *,
+        max_bytes: int | None = None,
+        expected_identity: tuple[int, int] | None = None,
+    ) -> bytes:
+        nonlocal injected
+        if failure_point == "final-reread" and published and not injected and name == commit_leaf:
+            injected = True
+            raise OSError(f"injected {failure_point} failure")
+        return original_read_named(
+            store,
+            parent_fd,
+            name,
+            relative,
+            max_bytes=max_bytes,
+            expected_identity=expected_identity,
+        )
+
+    monkeypatch.setattr(os, "link", track_commit_link)
+    if "fsync" in failure_point:
+        monkeypatch.setattr(os, "fsync", fail_selected_fsync)
+    elif failure_point == "temporary-cleanup":
+        monkeypatch.setattr(os, "unlink", fail_selected_unlink)
+    else:
+        monkeypatch.setattr(fs.StateStore, "_read_named", fail_selected_read)
+
+    with pytest.raises(OSError, match=f"injected {failure_point} failure"):
+        fs.weekly_plan(root, selection_path, output, "2026-07-11T08:01:00Z")
+    assert published and injected
+
+    monkeypatch.setattr(os, "link", original_link)
+    monkeypatch.setattr(os, "fsync", original_fsync)
+    monkeypatch.setattr(os, "unlink", original_unlink)
+    monkeypatch.setattr(fs.StateStore, "_read_named", original_read_named)
+
+    assert (root / intent_relative).exists()
+    assert not (root / commit_relative).exists()
+    assert not any(
+        path.name.startswith(f".{commit_leaf}.tmp-")
+        for path in (root / commit_relative.parent).iterdir()
+    )
+    assert output.exists()
+
+    recovered = fs.weekly_plan(root, selection_path, output, "2026-07-11T09:01:00Z")
+    assert recovered["status"] == "planned"
+    assert (root / commit_relative).exists()
+
+
+def test_commit_wal_does_not_rollback_identical_concurrent_winner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    case = _candidate()
+    root, stage = _stage(tmp_path, case)
+    completed = _complete_live(tmp_path, root, [stage])
+    selection = _approved_selection(tmp_path, root, completed["snapshot_digest"], [case])
+    selection_path = _write(tmp_path / "concurrent-commit-selection.json", selection)
+    output = tmp_path / "concurrent-commit-plan.json"
+    _, commit_relative = fs._wal_paths("weekly-plan", selection["selection_id"])
+    original_link = os.link
+    original_write = fs.StateStore.write_json
+    injected = False
+
+    def publish_identical_competing_leaf(
+        src: str,
+        dst: str,
+        *,
+        src_dir_fd: int | None = None,
+        dst_dir_fd: int | None = None,
+        follow_symlinks: bool = True,
+    ) -> None:
+        nonlocal injected
+        if not injected and dst == commit_relative.name:
+            injected = True
+            source_fd = os.open(src, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=src_dir_fd)
+            destination_fd = os.open(
+                dst,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=dst_dir_fd,
+            )
+            try:
+                while chunk := os.read(source_fd, 64 * 1024):
+                    os.write(destination_fd, chunk)
+                os.fsync(destination_fd)
+            finally:
+                os.close(destination_fd)
+                os.close(source_fd)
+        original_link(
+            src,
+            dst,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=dst_dir_fd,
+            follow_symlinks=follow_symlinks,
+        )
+
+    def remove_after_concurrent_commit(
+        store: Any,
+        relative: Path | str,
+        value: dict[str, Any],
+        *,
+        immutable: bool = False,
+        max_bytes: int | None = None,
+    ) -> str:
+        digest = original_write(
+            store,
+            relative,
+            value,
+            immutable=immutable,
+            max_bytes=max_bytes,
+        )
+        if store.root == root and Path(relative) == commit_relative:
+            output.unlink()
+        return digest
+
+    monkeypatch.setattr(os, "link", publish_identical_competing_leaf)
+    monkeypatch.setattr(fs.StateStore, "write_json", remove_after_concurrent_commit)
+    with pytest.raises(fs.StateError, match="exactly one link"):
+        fs.weekly_plan(root, selection_path, output, "2026-07-11T08:01:00Z")
+    assert injected
+    assert (root / commit_relative).exists()
+    assert not output.exists()
+
+    monkeypatch.setattr(os, "link", original_link)
+    monkeypatch.setattr(fs.StateStore, "write_json", original_write)
+    recovered = fs.weekly_plan(root, selection_path, output, "2026-07-11T09:01:00Z")
+    assert recovered["status"] == "planned"
+    assert output.exists() and (root / commit_relative).exists()
+
+
+def _only_stage_wal_pair(root: Path) -> tuple[Path, Path]:
+    directory = root / "wal" / "stage"
+    intents = sorted(directory.glob("*.intent.json"))
+    commits = sorted(directory.glob("*.commit.json"))
+    assert len(intents) == len(commits) == 1
+    return intents[0], commits[0]
+
+
+@pytest.mark.parametrize(
+    "layout_class",
+    ["orphan-commit", "malformed-name", "directory", "symlink", "fifo", "foreign-entry"],
+)
+def test_global_wal_recovery_rejects_every_noncanonical_layout_class(
+    tmp_path: Path, layout_class: str
+) -> None:
+    root, _ = _stage(tmp_path, _candidate())
+    intent_path, commit_path = _only_stage_wal_pair(root)
+    wal_directory = intent_path.parent
+    bad_path: Path
+
+    if layout_class == "orphan-commit":
+        intent_path.unlink()
+        bad_path = commit_path
+    elif layout_class == "malformed-name":
+        bad_path = wal_directory / f"{'a' * 63}.intent.json"
+        bad_path.write_bytes(b"{}\n")
+        bad_path.chmod(0o600)
+    elif layout_class == "foreign-entry":
+        bad_path = wal_directory / "README"
+        bad_path.write_bytes(b"foreign\n")
+        bad_path.chmod(0o600)
+    else:
+        intent_path.unlink()
+        bad_path = intent_path
+        if layout_class == "directory":
+            bad_path.mkdir(mode=0o700)
+        elif layout_class == "symlink":
+            bad_path.symlink_to(commit_path.name)
+        else:
+            os.mkfifo(bad_path, 0o600)
+
+    with fs._state_lock(root, create=False) as store:
+        with pytest.raises(fs.StateError):
+            fs._recover_pending_wal(store)
+    assert bad_path.exists() or bad_path.is_symlink()
+
+
+def test_global_wal_recovery_exactly_validates_commit_binding(tmp_path: Path) -> None:
+    root, _ = _stage(tmp_path, _candidate())
+    _, commit_path = _only_stage_wal_pair(root)
+    commit = fs._load_json(commit_path)
+    commit["natural_key"] = "different-transaction"
+    body = {key: value for key, value in commit.items() if key != "commit_digest"}
+    commit["commit_digest"] = fs._digest(body)
+    commit_path.write_bytes(fs._canonical_bytes(commit))
+
+    with fs._state_lock(root, create=False) as store:
+        with pytest.raises(fs.StateError, match="exact intent") as raised:
+            fs._recover_pending_wal(store)
+    assert raised.value.code == "invalid-wal"
+
+
+def test_global_wal_layout_preflight_precedes_pending_replay(tmp_path: Path) -> None:
+    root, _ = _stage(tmp_path, _candidate())
+    second = _candidate(occurrences=[_occurrence(0, root="root:blocked-pending-wal")])
+    _stage(tmp_path, second, now="2026-07-10T12:01:00Z")
+    wal_directory = root / "wal" / "stage"
+    pending_commit = sorted(wal_directory.glob("*.commit.json"))[-1]
+    pending_commit.unlink()
+    foreign = wal_directory / "foreign-entry"
+    foreign.write_bytes(b"foreign\n")
+    foreign.chmod(0o600)
+
+    with fs._state_lock(root, create=False) as store:
+        with pytest.raises(fs.StateError, match="unexpected WAL entry"):
+            fs._recover_pending_wal(store)
+
+    assert not pending_commit.exists()
+
+
+def test_global_wal_recovery_accepts_committed_and_pending_pairs(tmp_path: Path) -> None:
+    first = _candidate()
+    root, _ = _stage(tmp_path, first)
+    second = _candidate(occurrences=[_occurrence(0, root="root:mixed-wal")])
+    _stage(tmp_path, second, now="2026-07-10T12:01:00Z")
+    wal_directory = root / "wal" / "stage"
+    commits = sorted(wal_directory.glob("*.commit.json"))
+    assert len(commits) == 2
+    pending_commit = commits[-1]
+    pending_intent = pending_commit.with_name(
+        pending_commit.name.replace(".commit.json", ".intent.json")
+    )
+    pending_commit.unlink()
+
+    with fs._state_lock(root, create=False) as store:
+        fs._recover_pending_wal(store)
+
+    assert pending_intent.exists() and pending_commit.exists()
+    assert len(list(wal_directory.glob("*.intent.json"))) == 2
+    assert len(list(wal_directory.glob("*.commit.json"))) == 2
+
+
 def _rewrite_external_wal_as_legacy(
     root: Path, operation: str, natural_key: str
 ) -> tuple[Path, Path]:

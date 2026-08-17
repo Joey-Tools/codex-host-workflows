@@ -22,15 +22,18 @@ import datetime as dt
 import errno
 import hashlib
 import json
+import locale
 import os
 import plistlib
 import pwd
 import re
 import secrets
+import selectors
 import signal
 import stat
 import subprocess
 import sys
+import time
 import tomllib
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
@@ -54,6 +57,8 @@ LAUNCH_AGENT_LABEL_PATTERN = re.compile(
 MAX_CONFIG_BYTES = 1024 * 1024
 MAX_STAMP_BYTES = 1024 * 1024
 MAX_COMMAND_DETAIL = 2000
+MAX_COMMAND_OUTPUT_BYTES = 1024 * 1024
+COMMAND_OUTPUT_READ_BYTES = 64 * 1024
 GIT_TIMEOUT_SECONDS = 20
 COMMAND_TIMEOUT_SECONDS = 120
 COMMAND_TERM_GRACE_SECONDS = 2
@@ -91,6 +96,49 @@ PRESERVED_PROCESS_ENVIRONMENT = (
     "TEMP",
     "TMP",
 )
+
+
+def _bounded_command_output_diagnostic(stdout: bytearray, stderr: bytearray) -> str:
+    """Decode one useful output stream without retaining another large copy."""
+
+    stream_name, source = ("stderr", stderr) if stderr else ("stdout", stdout)
+    if not source:
+        return ""
+    raw = bytes(source[:MAX_COMMAND_DETAIL])
+    decoded = raw.decode(locale.getpreferredencoding(False), errors="replace")
+    return f"{stream_name}={decoded.strip()[:MAX_COMMAND_DETAIL]}"
+
+
+class CommandOutputLimitError(SetupError):
+    """Raised after bounded output capture terminates and reaps the command group."""
+
+    def __init__(
+        self,
+        executable: str,
+        output_limit_bytes: int,
+        stdout: bytearray,
+        stderr: bytearray,
+    ) -> None:
+        self.output_limit_bytes = output_limit_bytes
+        self.captured_stdout_bytes = len(stdout)
+        self.captured_stderr_bytes = len(stderr)
+        self.captured_total_bytes = len(stdout) + len(stderr)
+        self.diagnostic = _bounded_command_output_diagnostic(stdout, stderr)
+        message = (
+            f"command output limit exceeded: {executable}; "
+            f"limit={output_limit_bytes}; captured={self.captured_total_bytes}"
+        )
+        if self.diagnostic:
+            message = f"{message}; {self.diagnostic}"
+        super().__init__(message)
+
+
+class _CommandOutputExceeded(Exception):
+    """Carry the already bounded raw capture into process-group cleanup."""
+
+    def __init__(self, stdout: bytearray, stderr: bytearray) -> None:
+        self.stdout = stdout
+        self.stderr = stderr
 
 
 def _trusted_account_home() -> str:
@@ -312,7 +360,13 @@ class LoadedLaunchAgent:
 
 
 class CommandRunner:
-    """Injectable subprocess boundary for helper and launchctl operations."""
+    """Injectable, byte-bounded subprocess boundary for delegated operations.
+
+    The protected property is that retained stdout and stderr payload bytes share
+    one deterministic ``output_limit_bytes`` ceiling. A timeout or the first byte
+    beyond that ceiling enters the same TERM/KILL process-group cleanup path, and
+    the direct child is reaped before control returns to the caller.
+    """
 
     def __init__(
         self,
@@ -320,10 +374,16 @@ class CommandRunner:
         timeout_seconds: float = COMMAND_TIMEOUT_SECONDS,
         term_grace_seconds: float = COMMAND_TERM_GRACE_SECONDS,
         kill_grace_seconds: float = COMMAND_KILL_GRACE_SECONDS,
+        output_limit_bytes: int = MAX_COMMAND_OUTPUT_BYTES,
     ) -> None:
+        if not 1 <= output_limit_bytes <= MAX_COMMAND_OUTPUT_BYTES:
+            raise ValueError(
+                f"command output limit must be between 1 and {MAX_COMMAND_OUTPUT_BYTES} bytes"
+            )
         self.timeout_seconds = timeout_seconds
         self.term_grace_seconds = term_grace_seconds
         self.kill_grace_seconds = kill_grace_seconds
+        self.output_limit_bytes = output_limit_bytes
 
     def run(
         self,
@@ -332,62 +392,189 @@ class CommandRunner:
         cwd: Path | None = None,
         env: Mapping[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
-        process: subprocess.Popen[str] | None = None
         try:
             process = subprocess.Popen(
                 list(argv),
                 cwd=cwd,
-                text=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
+                bufsize=0,
                 env=(dict(env) if env is not None else _trusted_process_environment()),
                 start_new_session=True,
             )
-            stdout, stderr = process.communicate(timeout=self.timeout_seconds)
-            return subprocess.CompletedProcess(list(argv), process.returncode, stdout, stderr)
-        except subprocess.TimeoutExpired as error:
-            assert process is not None
-            self._terminate_process_group(process)
-            raise SetupError(f"command timed out: {argv[0]}") from error
         except OSError as error:
             raise SetupError(
                 f"could not start {argv[0]}: {error.strerror or type(error).__name__}"
             ) from error
+        try:
+            stdout, stderr = self._capture_output(process)
+            assert process.returncode is not None
+            return subprocess.CompletedProcess(list(argv), process.returncode, stdout, stderr)
+        except _CommandOutputExceeded as error:
+            self._terminate_process_group(process)
+            limit_error = CommandOutputLimitError(
+                str(argv[0]),
+                self.output_limit_bytes,
+                error.stdout,
+                error.stderr,
+            )
+            error.stdout.clear()
+            error.stderr.clear()
+            raise limit_error from None
+        except subprocess.TimeoutExpired as error:
+            self._terminate_process_group(process)
+            raise SetupError(f"command timed out: {argv[0]}") from error
+        except OSError as error:
+            self._terminate_process_group(process)
+            raise SetupError(
+                f"command output capture failed: {argv[0]}: "
+                f"{error.strerror or type(error).__name__}"
+            ) from error
 
-    def _terminate_process_group(self, process: subprocess.Popen[str]) -> None:
+    def _capture_output(self, process: subprocess.Popen[bytes]) -> tuple[str, str]:
+        """Stream both pipes through one retained-byte budget until exit."""
+
+        stdout = bytearray()
+        stderr = bytearray()
+        captured_bytes = 0
+        deadline = time.monotonic() + self.timeout_seconds
+        streams = (
+            ("stdout", process.stdout),
+            ("stderr", process.stderr),
+        )
+        selector = selectors.DefaultSelector()
+        open_streams: dict[int, Any] = {}
+        for stream_name, stream in streams:
+            assert stream is not None
+            descriptor = stream.fileno()
+            os.set_blocking(descriptor, False)
+            open_streams[descriptor] = stream
+            selector.register(descriptor, selectors.EVENT_READ, stream_name)
+        try:
+            while selector.get_map():
+                remaining_seconds = deadline - time.monotonic()
+                if remaining_seconds <= 0:
+                    raise subprocess.TimeoutExpired(process.args, self.timeout_seconds)
+                events = selector.select(remaining_seconds)
+                if not events:
+                    raise subprocess.TimeoutExpired(process.args, self.timeout_seconds)
+                for key, _mask in events:
+                    remaining_bytes = self.output_limit_bytes - captured_bytes
+                    read_bytes = min(COMMAND_OUTPUT_READ_BYTES, remaining_bytes + 1)
+                    try:
+                        chunk = os.read(key.fd, read_bytes)
+                    except BlockingIOError:
+                        continue
+                    if not chunk:
+                        selector.unregister(key.fd)
+                        open_streams.pop(key.fd).close()
+                        continue
+                    retained = chunk if len(chunk) <= remaining_bytes else chunk[:remaining_bytes]
+                    target = stdout if key.data == "stdout" else stderr
+                    target.extend(retained)
+                    captured_bytes += len(retained)
+                    if len(chunk) > len(retained):
+                        raise _CommandOutputExceeded(stdout, stderr)
+        finally:
+            selector.close()
+
+        remaining_seconds = deadline - time.monotonic()
+        process.wait(timeout=max(0.0, remaining_seconds))
+        encoding = locale.getpreferredencoding(False)
+        return stdout.decode(encoding), stderr.decode(encoding)
+
+    @staticmethod
+    def _drain_process_pipes(process: subprocess.Popen[bytes], timeout_seconds: float) -> bool:
+        """Discard pipe data with fixed per-read memory until EOF or deadline."""
+
+        deadline = time.monotonic() + max(0.0, timeout_seconds)
+        selector = selectors.DefaultSelector()
+        open_streams: dict[int, Any] = {}
+        for stream in (process.stdout, process.stderr):
+            if stream is None or stream.closed:
+                continue
+            descriptor = stream.fileno()
+            os.set_blocking(descriptor, False)
+            open_streams[descriptor] = stream
+            selector.register(descriptor, selectors.EVENT_READ)
+        try:
+            while selector.get_map():
+                remaining_seconds = deadline - time.monotonic()
+                if remaining_seconds <= 0:
+                    return False
+                events = selector.select(remaining_seconds)
+                if not events:
+                    return False
+                for key, _mask in events:
+                    try:
+                        chunk = os.read(key.fd, COMMAND_OUTPUT_READ_BYTES)
+                    except BlockingIOError:
+                        continue
+                    if not chunk:
+                        selector.unregister(key.fd)
+                        open_streams.pop(key.fd).close()
+            return True
+        finally:
+            selector.close()
+
+    @staticmethod
+    def _close_process_pipes(process: subprocess.Popen[bytes]) -> OSError | None:
+        """Close every still-owned pipe while retaining the first close failure."""
+
+        first_error: OSError | None = None
+        for stream in (process.stdout, process.stderr):
+            if stream is None or stream.closed:
+                continue
+            try:
+                stream.close()
+            except OSError as error:
+                if first_error is None:
+                    first_error = error
+        return first_error
+
+    def _terminate_process_group(self, process: subprocess.Popen[bytes]) -> None:
         """Terminate the complete command process group and bound pipe draining."""
 
         process_group = process.pid
+        cleanup_error: OSError | None = None
+        cleanup_message = "command process pipes could not be drained"
         try:
             os.killpg(process_group, signal.SIGTERM)
         except ProcessLookupError:
             pass
+        except OSError as error:
+            cleanup_error = error
+            cleanup_message = "command process group could not be terminated"
         try:
-            process.communicate(timeout=self.term_grace_seconds)
-            try:
-                os.killpg(process_group, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            return
-        except subprocess.TimeoutExpired:
-            pass
+            self._drain_process_pipes(process, self.term_grace_seconds)
+        except OSError as error:
+            if cleanup_error is None:
+                cleanup_error = error
         try:
             os.killpg(process_group, signal.SIGKILL)
         except ProcessLookupError:
             pass
+        except OSError as error:
+            if cleanup_error is None:
+                cleanup_error = error
+                cleanup_message = "command process group could not be terminated"
         try:
-            process.communicate(timeout=self.kill_grace_seconds)
+            drained = self._drain_process_pipes(process, self.kill_grace_seconds)
+        except OSError as error:
+            drained = False
+            if cleanup_error is None:
+                cleanup_error = error
+        close_error = self._close_process_pipes(process)
+        if cleanup_error is None:
+            cleanup_error = close_error
+        try:
+            process.wait(timeout=self.kill_grace_seconds)
         except subprocess.TimeoutExpired as error:
-            for stream in (process.stdout, process.stderr):
-                if stream is not None:
-                    stream.close()
-            try:
-                process.wait(timeout=self.kill_grace_seconds)
-            except subprocess.TimeoutExpired as wait_error:
-                raise SetupError(
-                    "timed-out command process group could not be reaped"
-                ) from wait_error
-            raise SetupError("timed-out command pipes could not be drained") from error
+            raise SetupError("command process group could not be reaped") from error
+        if cleanup_error is not None:
+            raise SetupError(cleanup_message) from cleanup_error
+        if not drained:
+            raise SetupError("command process pipes could not be drained")
 
 
 def _binding_tuple(metadata: os.stat_result) -> tuple[int, int, int, int, int, int]:

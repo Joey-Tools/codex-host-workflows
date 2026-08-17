@@ -11,7 +11,7 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -2231,6 +2231,124 @@ def test_ensure_semantic_precheck_allows_clean_behind_mirror(tmp_path: Path) -> 
     assert "ahead=0 behind=1" in check.detail
 
 
+@pytest.mark.parametrize("returncode", [0, 17])
+def test_command_runner_captures_split_output_under_limit(returncode: int) -> None:
+    runner = hs.CommandRunner(timeout_seconds=2, output_limit_bytes=128)
+
+    result = runner.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import os, sys; "
+                "os.write(1, b'stdout-one\\n'); "
+                "os.write(2, b'stderr-two\\n'); "
+                f"sys.exit({returncode})"
+            ),
+        ]
+    )
+
+    assert result.returncode == returncode
+    assert result.stdout == "stdout-one\n"
+    assert result.stderr == "stderr-two\n"
+
+
+def test_command_runner_output_limit_kills_group_and_bounds_diagnostic(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_limit = 4096
+    late_write = tmp_path / "output-limit-late-stamp.json"
+    grandchild_ready = tmp_path / "output-limit-grandchild-ready.json"
+    grandchild = tmp_path / "output-limit-grandchild.py"
+    grandchild.write_text(
+        """import json, os, pathlib, signal, sys, time
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+ready = pathlib.Path(sys.argv[2])
+temporary = ready.with_suffix('.tmp')
+temporary.write_text(json.dumps({'pid': os.getpid(), 'pgid': os.getpgrp()}), encoding='utf-8')
+temporary.replace(ready)
+os.write(1, b'stdout-marker\\n')
+os.write(2, b'stderr-marker\\n')
+for _ in range(128):
+    os.write(1, b'o' * 1024)
+    os.write(2, b'e' * 1024)
+time.sleep(0.6)
+pathlib.Path(sys.argv[1]).write_text('late', encoding='utf-8')
+""",
+        encoding="utf-8",
+    )
+    parent = tmp_path / "output-limit-parent.py"
+    parent.write_text(
+        """import signal, subprocess, sys, time
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+subprocess.Popen([sys.executable, sys.argv[1], sys.argv[2], sys.argv[3]])
+time.sleep(5)
+""",
+        encoding="utf-8",
+    )
+    runner = hs.CommandRunner(
+        timeout_seconds=5,
+        term_grace_seconds=0.1,
+        kill_grace_seconds=1,
+        output_limit_bytes=output_limit,
+    )
+    real_popen = hs.subprocess.Popen
+    started: dict[str, int] = {}
+
+    def wait_for_grandchild_ready(*args: Any, **kwargs: Any) -> subprocess.Popen[bytes]:
+        process = cast("subprocess.Popen[bytes]", real_popen(*args, **kwargs))
+        started["leader_pid"] = process.pid
+        deadline = time.monotonic() + 5
+        while not grandchild_ready.is_file():
+            if process.poll() is not None:
+                pytest.fail("output-limit fixture leader exited before grandchild readiness")
+            if time.monotonic() >= deadline:
+                runner._terminate_process_group(process)
+                pytest.fail("output-limit fixture grandchild did not publish readiness")
+            time.sleep(0.01)
+        return process
+
+    monkeypatch.setattr(hs.subprocess, "Popen", wait_for_grandchild_ready)
+    with pytest.raises(hs.CommandOutputLimitError) as captured:
+        runner.run(
+            [sys.executable, str(parent), str(grandchild), str(late_write), str(grandchild_ready)]
+        )
+
+    error = captured.value
+    assert str(error).startswith("command output limit exceeded:")
+    assert error.output_limit_bytes == output_limit
+    assert error.captured_total_bytes == output_limit
+    assert error.captured_stdout_bytes + error.captured_stderr_bytes == output_limit
+    assert "marker" in error.diagnostic
+    assert len(error.diagnostic) <= hs.MAX_COMMAND_DETAIL + len("stderr=")
+    readiness = json.loads(grandchild_ready.read_text(encoding="utf-8"))
+    pid = readiness["pid"]
+    assert isinstance(pid, int)
+    assert readiness == {"pid": pid, "pgid": started["leader_pid"]}
+    assert pid != started["leader_pid"]
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.01)
+    else:
+        pytest.fail(f"output-limit grandchild {pid} survived cleanup")
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline:
+        try:
+            os.killpg(started["leader_pid"], 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.01)
+    else:
+        pytest.fail(f"output-limit process group {started['leader_pid']} survived cleanup")
+    time.sleep(0.65)
+    assert not late_write.exists()
+
+
 def test_command_runner_timeout_kills_descendant_tree_and_prevents_late_write(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2267,8 +2385,8 @@ time.sleep(5)
     real_popen = hs.subprocess.Popen
     started: dict[str, int] = {}
 
-    def wait_for_grandchild_ready(*args: Any, **kwargs: Any) -> subprocess.Popen[str]:
-        process = real_popen(*args, **kwargs)
+    def wait_for_grandchild_ready(*args: Any, **kwargs: Any) -> subprocess.Popen[bytes]:
+        process = cast("subprocess.Popen[bytes]", real_popen(*args, **kwargs))
         started["leader_pid"] = process.pid
         deadline = time.monotonic() + 5
         while not grandchild_ready.is_file():
@@ -2281,10 +2399,11 @@ time.sleep(5)
         return process
 
     monkeypatch.setattr(hs.subprocess, "Popen", wait_for_grandchild_ready)
-    with pytest.raises(hs.SetupError, match="command timed out"):
+    with pytest.raises(hs.SetupError, match="command timed out") as captured:
         runner.run(
             [sys.executable, str(parent), str(grandchild), str(late_write), str(grandchild_ready)]
         )
+    assert type(captured.value) is hs.SetupError
     readiness = json.loads(grandchild_ready.read_text(encoding="utf-8"))
     pid = readiness["pid"]
     assert isinstance(pid, int)

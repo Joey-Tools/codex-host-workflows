@@ -1431,6 +1431,16 @@ def _json_limit_for_parts(parts: Sequence[str]) -> int:
     return MAX_JSON_BYTES
 
 
+class _ImmutablePublicationCapture:
+    """Record proof that one write linked a new immutable final leaf."""
+
+    def __init__(self, relative: Path, expected_digest: str) -> None:
+        self.relative = relative
+        self.expected_digest = expected_digest
+        self.published_digest: str | None = None
+        self.identity: tuple[int, int] | None = None
+
+
 class StateStore:
     """Descriptor-rooted owner-private state storage.
 
@@ -1455,6 +1465,7 @@ class StateStore:
         self.root_fd = -1
         self.lock_fd = -1
         self.lock_identity: tuple[int, int, int] | None = None
+        self._immutable_publication_capture: _ImmutablePublicationCapture | None = None
         try:
             self._open_root(create=create)
         except Exception:
@@ -1719,7 +1730,7 @@ class StateStore:
                 parent_fd = context.__enter__()
             except FileNotFoundError:
                 _fail("missing-file", f"required state file is missing: {Path(*parts)}")
-        flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
+        flags = os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC
         try:
             try:
                 fd = os.open(parts[-1], flags, dir_fd=parent_fd)
@@ -1741,8 +1752,21 @@ class StateStore:
             if context is not None:
                 context.__exit__(None, None, None)
 
-    def unlink_exact(self, relative: Path | str, expected_digest: str) -> None:
-        """Remove one exact helper-owned leaf without following a rebound name."""
+    def unlink_exact(
+        self,
+        relative: Path | str,
+        expected_digest: str,
+        *,
+        expected_identity: tuple[int, int] | None = None,
+    ) -> None:
+        """Remove one exact helper-owned leaf without following a rebound name.
+
+        Device/inode equality protects object identity, the digest protects the
+        expected immutable content, and the ordinary stable private-file read
+        protects type and access policy.  Timestamps are deliberately excluded;
+        the one recoverable helper temp alias is cleaned before the required
+        single-link check because it is publication churn, not object mutation.
+        """
 
         parts = _safe_relative_parts(relative)
         if len(parts) == 1:
@@ -1760,12 +1784,20 @@ class StateStore:
                 parts[-1],
                 Path(*parts),
                 max_bytes=_json_limit_for_parts(parts),
+                expected_identity=expected_identity,
             )
             if hashlib.sha256(current).hexdigest() != expected_digest:
                 _fail("rollback-target-drift", f"rollback target changed: {Path(*parts)}")
             self._bind_state_chain("before exact rollback")
             if self.lock_fd >= 0:
                 self._bind_lock("before exact rollback")
+            try:
+                named = os.stat(parts[-1], dir_fd=parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                _fail("rollback-target-missing", f"rollback target is missing: {Path(*parts)}")
+            _validate_private_stat(named, self.root / Path(*parts), directory=False)
+            if expected_identity is not None and (named.st_dev, named.st_ino) != expected_identity:
+                _fail("rollback-target-replaced", f"rollback target was rebound: {Path(*parts)}")
             os.unlink(parts[-1], dir_fd=parent_fd)
             os.fsync(parent_fd)
             self._bind_state_chain("after exact rollback")
@@ -1792,11 +1824,18 @@ class StateStore:
         relative: Path,
         *,
         max_bytes: int | None = None,
+        expected_identity: tuple[int, int] | None = None,
     ) -> bytes:
-        flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
+        flags = os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC
         fd = os.open(name, flags, dir_fd=parent_fd)
         try:
             self._recover_link_publication(parent_fd, name, fd)
+            opened = os.fstat(fd)
+            if (
+                expected_identity is not None
+                and (opened.st_dev, opened.st_ino) != expected_identity
+            ):
+                _fail("rollback-target-replaced", f"rollback target was rebound: {relative}")
             return _read_fd_stable(
                 fd,
                 str(self.root / relative),
@@ -1854,7 +1893,17 @@ class StateStore:
             for name in sorted(os.listdir(directory_fd), key=os.fsencode):
                 if WAL_LEAF_RE.fullmatch(name) is None:
                     continue
-                fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=directory_fd)
+                try:
+                    fd = os.open(
+                        name,
+                        os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC,
+                        dir_fd=directory_fd,
+                    )
+                except OSError as exc:
+                    _fail(
+                        "invalid-wal-layout",
+                        f"WAL leaf is not a readable private regular file: {name}: {exc}",
+                    )
                 try:
                     self._recover_link_publication(directory_fd, name, fd)
                     _read_fd_stable(
@@ -1897,6 +1946,24 @@ class StateStore:
                     "unsafe-helper-temp",
                     f"WAL temporary remains beside an existing final leaf: {leaf}",
                 )
+
+    @contextmanager
+    def capture_immutable_publication(
+        self, relative: Path | str, expected_digest: str
+    ) -> Iterator[_ImmutablePublicationCapture]:
+        """Capture only a new final link published by the enclosed write."""
+
+        path = Path(*_safe_relative_parts(relative))
+        if HEX64_RE.fullmatch(expected_digest) is None:
+            _fail("invalid-publication-capture", "publication digest must be raw SHA-256")
+        if self._immutable_publication_capture is not None:
+            _fail("invalid-publication-capture", "immutable publication capture is nested")
+        capture = _ImmutablePublicationCapture(path, expected_digest)
+        self._immutable_publication_capture = capture
+        try:
+            yield capture
+        finally:
+            self._immutable_publication_capture = None
 
     def write_json(
         self,
@@ -1968,6 +2035,11 @@ class StateStore:
                                 "immutable-output-exists",
                                 "another writer won immutable publication with different content",
                             )
+                    else:
+                        capture = self._immutable_publication_capture
+                        if capture is not None and capture.relative == Path(*parts):
+                            capture.published_digest = digest
+                            capture.identity = (temp_info.st_dev, temp_info.st_ino)
                     os.fsync(parent_fd)
                 else:
                     os.replace(temporary, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
@@ -2630,22 +2702,40 @@ def _commit_wal(store: StateStore, intent: Mapping[str, Any]) -> None:
         "intent_digest": intent["intent_digest"],
     }
     commit = {**body, "commit_digest": _digest(body)}
-    commit_digest: str | None = None
-    try:
-        with _external_after_image_custody(intent):
-            store._bind_state_chain("before transaction commit")
-            commit_digest = store.write_json(commit_path, commit, immutable=True)
-    except Exception:
-        if commit_digest is not None and store.exists(commit_path):
+    expected_file_digest = _digest(commit)
+    with store.capture_immutable_publication(commit_path, expected_file_digest) as publication:
+        try:
+            with _external_after_image_custody(intent):
+                store._bind_state_chain("before transaction commit")
+                stored_digest = store.write_json(commit_path, commit, immutable=True)
+                if stored_digest != expected_file_digest:
+                    _fail("wal-commit-write-failed", "WAL commit write returned the wrong digest")
+        except Exception:
+            # Roll back only when this exact write won the no-replace link.  An
+            # identical pre-existing or concurrent winner has no capture and is
+            # therefore never mistaken for an object owned by this invocation.
+            if publication.identity is None:
+                raise
+            if publication.published_digest != publication.expected_digest:
+                _fail(
+                    "wal-commit-rollback-failed",
+                    "the newly published WAL commit has an unexpected captured digest",
+                )
             try:
-                store.unlink_exact(commit_path, commit_digest)
+                store.unlink_exact(
+                    commit_path,
+                    publication.expected_digest,
+                    expected_identity=publication.identity,
+                )
+            except FileNotFoundError:
+                pass
             except Exception as rollback_exc:
                 raise StateError(
                     "wal-commit-rollback-failed",
-                    "external after-image revalidation failed and the new WAL commit "
-                    "could not be removed safely",
+                    "the failed transaction's newly published WAL commit could not "
+                    "be removed safely",
                 ) from rollback_exc
-        raise
+            raise
 
 
 def _run_transaction(
@@ -2728,24 +2818,52 @@ def _run_transaction(
 
 
 def _recover_pending_wal(store: StateStore) -> None:
-    for operation in store.list_names(Path("wal")):
+    validated: list[tuple[str, Path, Path | None, str, str | None, bool]] = []
+    try:
+        operations = store.list_names(Path("wal"))
+    except OSError as exc:
+        _fail("invalid-wal-layout", f"WAL root is not a private directory: {exc}")
+    for operation in operations:
         if (
             SAFE_OBJECT_ID_RE.fullmatch(operation) is None
             or operation not in TRANSACTION_OPERATIONS
         ):
             _fail("invalid-wal-layout", f"unsafe WAL operation directory: {operation}")
         directory = Path("wal") / operation
-        store.recover_wal_temporaries(directory)
-        names = store.list_names(directory)
+        try:
+            store.recover_wal_temporaries(directory)
+            names = store.list_names(directory)
+        except OSError as exc:
+            _fail(
+                "invalid-wal-layout",
+                f"WAL operation entry is not a private directory: {operation}: {exc}",
+            )
+
+        intent_paths: dict[str, Path] = {}
+        commit_paths: dict[str, Path] = {}
         for name in names:
-            if not name.endswith(".intent.json"):
-                if not name.endswith(".commit.json"):
-                    _fail("invalid-wal-layout", f"unexpected WAL entry: {name}")
-                continue
-            intent_path = directory / name
-            intent, _ = store.read_json(intent_path)
-            candidate_commit = directory / name.replace(".intent.json", ".commit.json")
-            candidate_committed = store.exists(candidate_commit)
+            if WAL_LEAF_RE.fullmatch(name) is None:
+                _fail("invalid-wal-layout", f"unexpected WAL entry: {name}")
+            key = name[:64]
+            target = intent_paths if name.endswith(".intent.json") else commit_paths
+            target[key] = directory / name
+        orphan_commits = sorted(commit_paths.keys() - intent_paths.keys())
+        if orphan_commits:
+            _fail(
+                "invalid-wal-layout",
+                f"WAL commit exists without its intent: {commit_paths[orphan_commits[0]]}",
+            )
+
+        for key, intent_path in sorted(intent_paths.items()):
+            try:
+                intent, intent_file_digest = store.read_json(intent_path)
+            except OSError as exc:
+                _fail(
+                    "invalid-wal-layout",
+                    f"WAL intent is not a private regular JSON file: {intent_path}: {exc}",
+                )
+            candidate_commit = commit_paths.get(key)
+            candidate_committed = candidate_commit is not None
             legacy_external = _validate_wal_intent(
                 intent,
                 operation,
@@ -2754,19 +2872,63 @@ def _recover_pending_wal(store: StateStore) -> None:
             expected_intent, commit_path = _wal_paths(operation, intent["natural_key"])
             if expected_intent != intent_path:
                 _fail("invalid-wal-layout", "WAL filename does not bind its natural key")
-            if candidate_commit != commit_path:
+            if candidate_commit is not None and candidate_commit != commit_path:
                 _fail("invalid-wal-layout", "WAL commit filename does not bind its intent")
-            if store.exists(commit_path):
-                commit, _ = store.read_json(commit_path)
+            commit_file_digest: str | None = None
+            if candidate_commit is not None:
+                try:
+                    commit, commit_file_digest = store.read_json(candidate_commit)
+                except OSError as exc:
+                    _fail(
+                        "invalid-wal-layout",
+                        f"WAL commit is not a private regular JSON file: {candidate_commit}: {exc}",
+                    )
                 _validate_wal_commit(commit, intent)
-                if legacy_external:
-                    _verify_committed_legacy_external_after_images(intent)
-                else:
-                    _repair_committed_external_after_images(intent)
-                    _preflight_external_writes(intent, require_after=True)
-                continue
-            _apply_wal_intent(store, intent)
-            _commit_wal(store, intent)
+            validated.append(
+                (
+                    operation,
+                    intent_path,
+                    candidate_commit,
+                    intent_file_digest,
+                    commit_file_digest,
+                    legacy_external,
+                )
+            )
+
+    # Only replay or repair after the complete WAL namespace and every existing
+    # pair have passed canonical-name, private-file, JSON, and exact-binding
+    # validation.  Re-read each leaf and compare its content digest so the
+    # validation-to-use boundary does not rely on timestamp metadata.
+    for (
+        operation,
+        intent_path,
+        commit_path,
+        intent_file_digest,
+        commit_file_digest,
+        legacy_external,
+    ) in validated:
+        current_intent, current_intent_digest = store.read_json(intent_path)
+        if current_intent_digest != intent_file_digest:
+            _fail("wal-layout-changed", f"WAL intent changed during recovery: {intent_path}")
+        intent = current_intent
+        _validate_wal_intent(
+            intent,
+            operation,
+            allow_committed_legacy_external=commit_path is not None,
+        )
+        if commit_path is not None:
+            commit, current_commit_digest = store.read_json(commit_path)
+            if current_commit_digest != commit_file_digest:
+                _fail("wal-layout-changed", f"WAL commit changed during recovery: {commit_path}")
+            _validate_wal_commit(commit, intent)
+            if legacy_external:
+                _verify_committed_legacy_external_after_images(intent)
+            else:
+                _repair_committed_external_after_images(intent)
+                _preflight_external_writes(intent, require_after=True)
+            continue
+        _apply_wal_intent(store, intent)
+        _commit_wal(store, intent)
 
 
 def _require_committed_transaction(
