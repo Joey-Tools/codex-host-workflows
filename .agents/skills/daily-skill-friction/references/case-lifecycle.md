@@ -62,7 +62,7 @@ Never let an automation infer steps 2, 4, or 6.
 The later interactive publisher records a verified published outcome through:
 
 ```text
-/Users/hoteng/.local/share/uv/python/cpython-3.14.2-macos-aarch64-none/bin/python3.14 /Users/hoteng/Program/GitHub/Joey-Tools/codex-workspace/.codex-local/daily-skill-friction/repos/codex-host-workflows/.agents/skills/daily-skill-friction/scripts/friction_state.py close-publication --state-root <DIR> --receipt <FILE> --publish-receipt <FILE> --now <ISO>
+/Users/hoteng/.local/share/uv/python/cpython-3.14.2-macos-aarch64-none/bin/python3.14 -I -B -S /Users/hoteng/Program/GitHub/Joey-Tools/codex-workspace/.codex-local/daily-skill-friction/repos/codex-host-workflows/.agents/skills/daily-skill-friction/scripts/friction_state.py close-publication --state-root <DIR> --receipt <FILE> --publish-receipt <FILE> --now <ISO>
 ```
 
 The separate `publication-approval` receipt must record Joey's interactive

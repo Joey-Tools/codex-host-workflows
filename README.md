@@ -13,13 +13,13 @@ The evidence repository is also separate. This repository owns control code, pro
 The bootstrap is explicit, inspectable, and idempotent:
 
 ```bash
-/Users/hoteng/.local/share/uv/python/cpython-3.14.2-macos-aarch64-none/bin/python3.14 scripts/host_setup.py plan --no-launchctl
-/Users/hoteng/.local/share/uv/python/cpython-3.14.2-macos-aarch64-none/bin/python3.14 scripts/host_setup.py apply --ensure
-/Users/hoteng/.local/share/uv/python/cpython-3.14.2-macos-aarch64-none/bin/python3.14 scripts/host_setup.py status
-/Users/hoteng/.local/share/uv/python/cpython-3.14.2-macos-aarch64-none/bin/python3.14 scripts/host_setup.py doctor
+/Users/hoteng/.local/share/uv/python/cpython-3.14.2-macos-aarch64-none/bin/python3.14 -I -B -S scripts/host_setup.py plan --no-launchctl
+/Users/hoteng/.local/share/uv/python/cpython-3.14.2-macos-aarch64-none/bin/python3.14 -I -B -S scripts/host_setup.py apply --ensure
+/Users/hoteng/.local/share/uv/python/cpython-3.14.2-macos-aarch64-none/bin/python3.14 -I -B -S scripts/host_setup.py status
+/Users/hoteng/.local/share/uv/python/cpython-3.14.2-macos-aarch64-none/bin/python3.14 -I -B -S scripts/host_setup.py doctor
 ```
 
-`apply --ensure` is the only bootstrap path that may invoke the workspace helper's `ensure` command. It is intended for a first, explicitly authorized installation. Before `ensure`, bootstrap validates every existing workspace, cache, locator, Git-info, and LaunchAgents ancestor that the helper or installer may touch. It then performs the initial control and main prefetch pair, which may safely fast-forward a clean-behind mirror, proves the resulting manifests and mirrors with strict helper status, installs host state, and runs `doctor`; a successful first bootstrap is immediately ready. Plain `apply` never clones. Scheduled wrappers invoke only the helper's `prefetch` command and fail closed when a mirror is missing or unsafe.
+`apply --ensure` is the only bootstrap path that may invoke the workspace helper's `ensure` command. It is intended for a first, explicitly authorized installation. Before `ensure`, bootstrap validates every existing workspace, cache, locator, Git-info, and LaunchAgents ancestor that the helper or installer may touch. It then performs the initial control and main prefetch pair, which may safely fast-forward a clean-behind mirror, proves the resulting manifests and mirrors with strict helper status, installs host state, and runs `doctor`; a successful first bootstrap is immediately ready. Plain `apply` never clones. Scheduled wrappers invoke only the helper's `prefetch` command and fail closed when a mirror is missing or unsafe. The manifest-bound `host_setup.account_home` must match the operating account home. Managed LaunchAgents clear the inherited environment and launch with only the fixed system `PATH`, that bound `HOME`, `LANG`, `TMPDIR`, and an optional `SSH_AUTH_SOCK`; use `plan` or `doctor` to diagnose drift before applying recovery.
 
 The bootstrap manages the following host-local state:
 
@@ -37,13 +37,13 @@ For a non-interactive validation environment, pass `--no-launchctl`. This skips 
 The Daily automation is `automations/daily-skill-friction/automation.toml` with ID `daily-skill-friction`. It calls the stable mirror path:
 
 ```bash
-/Users/hoteng/.local/share/uv/python/cpython-3.14.2-macos-aarch64-none/bin/python3.14 /Users/hoteng/Program/GitHub/Joey-Tools/codex-workspace/.codex-local/daily-skill-friction/repos/codex-host-workflows/scripts/host_setup.py doctor --no-launchctl
+/Users/hoteng/.local/share/uv/python/cpython-3.14.2-macos-aarch64-none/bin/python3.14 -I -B -S /Users/hoteng/Program/GitHub/Joey-Tools/codex-workspace/.codex-local/daily-skill-friction/repos/codex-host-workflows/scripts/host_setup.py doctor --no-launchctl
 ```
 
 The Weekly automation is `automations/weekly-skill-friction-publication/automation.toml` with ID `weekly-skill-friction-publication`. Its Friday 07:00 gate additionally binds the two current stamps to the receipt written by the 06:30 pair prefetch:
 
 ```bash
-/Users/hoteng/.local/share/uv/python/cpython-3.14.2-macos-aarch64-none/bin/python3.14 /Users/hoteng/Program/GitHub/Joey-Tools/codex-workspace/.codex-local/daily-skill-friction/repos/codex-host-workflows/scripts/host_setup.py doctor --weekly --no-launchctl
+/Users/hoteng/.local/share/uv/python/cpython-3.14.2-macos-aarch64-none/bin/python3.14 -I -B -S /Users/hoteng/Program/GitHub/Joey-Tools/codex-workspace/.codex-local/daily-skill-friction/repos/codex-host-workflows/scripts/host_setup.py doctor --weekly --no-launchctl
 ```
 
 `doctor --weekly` requires `weekly-pair-receipt` to match the exact SHA-256, `ended_at`, manifest SHA-256, and repository set of both current stamps, and requires the receipt to be within the same 60-minute window. Each scheduled helper call writes to an unpredictable one-shot stamp name. The wrapper validates that exact output, publishes the two canonical stamps transactionally, writes the receipt only after both publications validate, and retires one-shot files on both success and failure. Production freshness age is sampled again after the final evidence rebind, so a slow validation cannot cross the 60-minute boundary and still report ready. A partial, failed, concurrent, or later single-stamp refresh therefore cannot receive an old pair's endorsement.

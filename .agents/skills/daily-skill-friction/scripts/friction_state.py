@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import contextvars
 import datetime as dt
+import errno
 import fcntl
 import hashlib
 import json
@@ -20,13 +21,31 @@ import stat
 import sys
 import uuid
 from collections.abc import Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from typing import Any, Literal, NoReturn, overload
 
 VERSION = 1
 MAX_JSON_BYTES = 4 * 1024 * 1024
+MAX_CASE_JSON_BYTES = 256 * 1024
+MAX_PUBLICATION_JSON_BYTES = 32 * 1024 * 1024
 MAX_WAL_JSON_BYTES = 64 * 1024 * 1024
+MAX_PREPARED_COMMANDS = 8
+MAX_PREPARED_COMMAND_CHARS = 512
+MAX_PREPARED_SIGNER_CHARS = 256
+# Publication v1 bounds every non-case plan/active field (UUID, safe ID,
+# revision, digest, timestamp, repository, branch, and derived case path).  The
+# per-case reservations exceed their maximum canonical encodings, while the
+# fixed reservations cover top-level objects, the fixed automation output path,
+# the external parent binding, and WAL framing.  Weekly planning and finalization
+# still measure their actual artifacts and intents against the approved
+# projections before writing, so a future schema expansion cannot silently
+# consume this headroom.
+PUBLICATION_FIXED_BUDGET_BYTES = 1 * 1024 * 1024
+PUBLICATION_PER_CASE_OVERHEAD_BYTES = 32 * 1024
+WEEKLY_WAL_FIXED_BUDGET_BYTES = 2 * 1024 * 1024
+WEEKLY_WAL_PER_CASE_OVERHEAD_BYTES = 8 * 1024
+FINALIZE_WAL_FIXED_BUDGET_BYTES = 4 * 1024 * 1024
 STATE_MARKER = ".state-root.json"
 LOCK_FILE = ".state.lock"
 LIVE_POINTER = "last-completed-daily.json"
@@ -36,6 +55,7 @@ TRANSACTION_OPERATIONS = {
     "stage",
     "dormancy",
     "complete-audit",
+    "selection-preflight",
     "weekly-plan",
     "finalize-publication",
     "close-publication",
@@ -314,7 +334,7 @@ def _read_fd_stable(
     return second, hashlib.sha256(second).hexdigest()
 
 
-def _open_external_stable(path: Path) -> tuple[bytes, str]:
+def _open_external_stable(path: Path, *, max_bytes: int = MAX_JSON_BYTES) -> tuple[bytes, str]:
     flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
     try:
         fd = os.open(path, flags)
@@ -323,7 +343,7 @@ def _open_external_stable(path: Path) -> tuple[bytes, str]:
     except OSError as exc:
         _fail("unsafe-file", f"cannot open JSON input {path}: {exc}")
     try:
-        return _read_fd_stable(fd, str(path), private=False)
+        return _read_fd_stable(fd, str(path), private=False, max_bytes=max_bytes)
     finally:
         os.close(fd)
 
@@ -339,21 +359,23 @@ def _file_digest(path: Path) -> str:
     return _open_external_stable(path)[1]
 
 
-def _load_json(path: Path) -> dict[str, Any]:
+def _load_json(path: Path, *, max_bytes: int = MAX_JSON_BYTES) -> dict[str, Any]:
     store = _active_store_for_path(path)
     if store is not None:
         raw, _ = store.read_bytes(store.relative(path))
     else:
-        raw, _ = _open_external_stable(path)
+        raw, _ = _open_external_stable(path, max_bytes=max_bytes)
     return _json_from_bytes(raw, str(path))
 
 
-def _load_json_with_digest(path: Path) -> tuple[dict[str, Any], str]:
+def _load_json_with_digest(
+    path: Path, *, max_bytes: int = MAX_JSON_BYTES
+) -> tuple[dict[str, Any], str]:
     store = _active_store_for_path(path)
     if store is not None:
         raw, digest = store.read_bytes(store.relative(path))
     else:
-        raw, digest = _open_external_stable(path)
+        raw, digest = _open_external_stable(path, max_bytes=max_bytes)
     return _json_from_bytes(raw, str(path)), digest
 
 
@@ -1166,8 +1188,11 @@ def validate_candidate(candidate: Mapping[str, Any]) -> dict[str, Any]:
         "effectiveness",
     }
     _exact_fields(case, "case", top_fields)
-    if len(_canonical_bytes(case)) > 256 * 1024:
-        _fail("case-too-large", "canonical ledger case exceeds 256 KiB")
+    if len(_canonical_bytes(case)) > MAX_CASE_JSON_BYTES:
+        _fail(
+            "case-too-large",
+            f"canonical ledger case exceeds {MAX_CASE_JSON_BYTES} bytes",
+        )
     if type(case["schema_version"]) is not int or case["schema_version"] != 1:
         _fail("unsupported-case-version", "case.schema_version must be 1")
     revision = _require_int(case["revision"], "case.revision", minimum=1)
@@ -1399,7 +1424,11 @@ def _safe_relative_parts(relative: Path | str) -> tuple[str, ...]:
 
 
 def _json_limit_for_parts(parts: Sequence[str]) -> int:
-    return MAX_WAL_JSON_BYTES if parts and parts[0] == "wal" else MAX_JSON_BYTES
+    if parts and parts[0] == "wal":
+        return MAX_WAL_JSON_BYTES
+    if parts and parts[0] == "publication":
+        return MAX_PUBLICATION_JSON_BYTES
+    return MAX_JSON_BYTES
 
 
 class StateStore:
@@ -1492,13 +1521,19 @@ class StateStore:
 
         if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
             _fail("unsafe-state-chain", f"state path component is not a directory: {path}")
+        permissions = stat.S_IMODE(info.st_mode)
+        group_bits = (permissions & stat.S_IRWXG) >> 3
+        other_bits = permissions & stat.S_IRWXO
+        # Group identity changes no mode-based access when the group and other
+        # permission classes are identical, so normalize that non-policy signal.
+        policy_group = info.st_gid if group_bits != other_bits else -1
         return (
             info.st_dev,
             info.st_ino,
             stat.S_IFMT(info.st_mode),
             info.st_uid,
-            info.st_gid,
-            stat.S_IMODE(info.st_mode),
+            policy_group,
+            permissions,
         )
 
     def _bind_state_chain(self, phase: str) -> None:
@@ -1671,7 +1706,9 @@ class StateStore:
             if context is not None:
                 context.__exit__(None, None, None)
 
-    def read_bytes(self, relative: Path | str) -> tuple[bytes, str]:
+    def read_bytes(
+        self, relative: Path | str, *, max_bytes: int | None = None
+    ) -> tuple[bytes, str]:
         parts = _safe_relative_parts(relative)
         if len(parts) == 1:
             parent_fd = self.root_fd
@@ -1694,12 +1731,44 @@ class StateStore:
                     fd,
                     str(self.root / Path(*parts)),
                     private=True,
-                    max_bytes=_json_limit_for_parts(parts),
+                    max_bytes=(_json_limit_for_parts(parts) if max_bytes is None else max_bytes),
                     expected_parent_fd=parent_fd,
                     expected_name=parts[-1],
                 )
             finally:
                 os.close(fd)
+        finally:
+            if context is not None:
+                context.__exit__(None, None, None)
+
+    def unlink_exact(self, relative: Path | str, expected_digest: str) -> None:
+        """Remove one exact helper-owned leaf without following a rebound name."""
+
+        parts = _safe_relative_parts(relative)
+        if len(parts) == 1:
+            parent_fd = self.root_fd
+            context = None
+        else:
+            context = self.open_dir(Path(*parts[:-1]), create=False)
+            try:
+                parent_fd = context.__enter__()
+            except FileNotFoundError:
+                _fail("rollback-target-missing", f"rollback parent is missing: {Path(*parts)}")
+        try:
+            current = self._read_named(
+                parent_fd,
+                parts[-1],
+                Path(*parts),
+                max_bytes=_json_limit_for_parts(parts),
+            )
+            if hashlib.sha256(current).hexdigest() != expected_digest:
+                _fail("rollback-target-drift", f"rollback target changed: {Path(*parts)}")
+            self._bind_state_chain("before exact rollback")
+            if self.lock_fd >= 0:
+                self._bind_lock("before exact rollback")
+            os.unlink(parts[-1], dir_fd=parent_fd)
+            os.fsync(parent_fd)
+            self._bind_state_chain("after exact rollback")
         finally:
             if context is not None:
                 context.__exit__(None, None, None)
@@ -1716,7 +1785,14 @@ class StateStore:
             return []
         return sorted(names, key=os.fsencode)
 
-    def _read_named(self, parent_fd: int, name: str, relative: Path) -> bytes:
+    def _read_named(
+        self,
+        parent_fd: int,
+        name: str,
+        relative: Path,
+        *,
+        max_bytes: int | None = None,
+    ) -> bytes:
         flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
         fd = os.open(name, flags, dir_fd=parent_fd)
         try:
@@ -1725,7 +1801,9 @@ class StateStore:
                 fd,
                 str(self.root / relative),
                 private=True,
-                max_bytes=_json_limit_for_parts(relative.parts),
+                max_bytes=(
+                    _json_limit_for_parts(relative.parts) if max_bytes is None else max_bytes
+                ),
                 expected_parent_fd=parent_fd,
                 expected_name=name,
             )[0]
@@ -1821,11 +1899,16 @@ class StateStore:
                 )
 
     def write_json(
-        self, relative: Path | str, value: Mapping[str, Any], *, immutable: bool = False
+        self,
+        relative: Path | str,
+        value: Mapping[str, Any],
+        *,
+        immutable: bool = False,
+        max_bytes: int | None = None,
     ) -> str:
         parts = _safe_relative_parts(relative)
         payload = _canonical_bytes(value)
-        limit = _json_limit_for_parts(parts)
+        limit = _json_limit_for_parts(parts) if max_bytes is None else max_bytes
         if len(payload) > limit:
             _fail("output-too-large", f"JSON output exceeds {limit} bytes: {Path(*parts)}")
         digest = hashlib.sha256(payload).hexdigest()
@@ -1841,7 +1924,7 @@ class StateStore:
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
         try:
             try:
-                existing = self._read_named(parent_fd, name, Path(*parts))
+                existing = self._read_named(parent_fd, name, Path(*parts), max_bytes=limit)
             except FileNotFoundError:
                 existing = None
             if immutable and existing is not None:
@@ -1879,7 +1962,7 @@ class StateStore:
                             follow_symlinks=False,
                         )
                     except FileExistsError:
-                        existing = self._read_named(parent_fd, name, Path(*parts))
+                        existing = self._read_named(parent_fd, name, Path(*parts), max_bytes=limit)
                         if existing != payload:
                             _fail(
                                 "immutable-output-exists",
@@ -1896,7 +1979,7 @@ class StateStore:
             except FileNotFoundError:
                 pass
             os.fsync(parent_fd)
-            final = self._read_named(parent_fd, name, Path(*parts))
+            final = self._read_named(parent_fd, name, Path(*parts), max_bytes=limit)
             if final != payload:
                 _fail("write-verification-failed", f"stored bytes differ: {Path(*parts)}")
             return digest
@@ -2032,28 +2115,189 @@ def _planned_write(
     }
 
 
+def _external_parent_binding(store: StateStore) -> list[dict[str, Any]]:
+    """Serialize the protected name, identity, and POSIX policy chain.
+
+    Device, inode, and file type identify each directory object.  Owner and
+    permission bits define its coarse POSIX access policy.  Group identity is
+    material only when the group and other permission classes differ.  Directory
+    timestamps, sizes, and link counts are intentionally absent because ordinary
+    child-entry churn can change them without replacing a directory or changing
+    the selected access policy.
+    """
+
+    names = [store.root.anchor if name is None else name for name in store._chain_names]
+    result: list[dict[str, Any]] = []
+    for name, signal in zip(names, store._chain_signals, strict=True):
+        device, inode, file_type, owner, group, permissions = signal
+        group_bits = (permissions & stat.S_IRWXG) >> 3
+        other_bits = permissions & stat.S_IRWXO
+        result.append(
+            {
+                "name": name,
+                "device": device,
+                "inode": inode,
+                "file_type": file_type,
+                "owner": owner,
+                "group": group if group_bits != other_bits else None,
+                "permissions": permissions,
+            }
+        )
+    return result
+
+
+def _validate_external_parent_binding(value: Any, path: Path) -> list[dict[str, Any]]:
+    entries = _require_list(value, "wal.external_parent_binding")
+    absolute = Path(os.path.abspath(os.fspath(path)))
+    expected_names = [absolute.parent.anchor, *absolute.parent.parts[1:]]
+    if len(entries) != len(expected_names):
+        _fail("invalid-wal", "external parent binding has the wrong path depth")
+    normalized: list[dict[str, Any]] = []
+    fields = {
+        "name",
+        "device",
+        "inode",
+        "file_type",
+        "owner",
+        "group",
+        "permissions",
+    }
+    for index, (raw, expected_name) in enumerate(zip(entries, expected_names, strict=True)):
+        entry = _require_object(raw, f"wal.external_parent_binding[{index}]")
+        _exact_fields(entry, f"wal.external_parent_binding[{index}]", fields)
+        if entry["name"] != expected_name:
+            _fail("invalid-wal", "external parent binding does not match the output path")
+        device = _require_int(entry["device"], "wal.parent.device")
+        inode = _require_int(entry["inode"], "wal.parent.inode")
+        file_type = _require_int(entry["file_type"], "wal.parent.file_type")
+        owner = _require_int(entry["owner"], "wal.parent.owner")
+        permissions = _require_int(entry["permissions"], "wal.parent.permissions")
+        if file_type != stat.S_IFDIR or permissions > 0o7777:
+            _fail("invalid-wal", "external parent binding has an invalid directory policy")
+        group = entry["group"]
+        group_bits = (permissions & stat.S_IRWXG) >> 3
+        other_bits = permissions & stat.S_IRWXO
+        if group_bits == other_bits:
+            if group is not None:
+                _fail("invalid-wal", "irrelevant parent group identity must be null")
+        else:
+            group = _require_int(group, "wal.parent.group")
+        normalized.append(
+            {
+                "name": expected_name,
+                "device": device,
+                "inode": inode,
+                "file_type": file_type,
+                "owner": owner,
+                "group": group,
+                "permissions": permissions,
+            }
+        )
+    final = normalized[-1]
+    if final["owner"] != os.geteuid() or final["permissions"] & 0o077:
+        _fail("invalid-wal", "external output parent binding is not owner-private")
+    return normalized
+
+
+@contextmanager
+def _bound_external_parent(
+    path: Path, expected_binding: Any | None = None
+) -> Iterator[tuple[StateStore, list[dict[str, Any]]]]:
+    """Open an existing external parent without ever recreating its path."""
+
+    absolute = Path(os.path.abspath(os.fspath(path)))
+    try:
+        store = StateStore(absolute.parent, create=False)
+    except StateError as exc:
+        if exc.code in {"missing-state-root", "missing-state-chain"}:
+            _fail(
+                "external-parent-missing",
+                f"bound external output parent disappeared: {absolute.parent}",
+            )
+        if exc.code in {"unsafe-owner", "unsafe-permissions"}:
+            _fail(
+                "external-parent-policy-changed",
+                f"bound external output parent policy changed: {absolute.parent}",
+            )
+        if exc.code in {"unsafe-path", "unsafe-state-chain"}:
+            _fail(
+                "external-parent-replaced",
+                f"bound external output parent is no longer a directory: {absolute.parent}",
+            )
+        raise
+    except OSError as exc:
+        if exc.errno in {errno.ENOENT}:
+            _fail(
+                "external-parent-missing",
+                f"bound external output parent disappeared: {absolute.parent}",
+            )
+        if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+            _fail(
+                "external-parent-replaced",
+                f"bound external output parent is no longer the directory chain: {absolute.parent}",
+            )
+        if exc.errno in {errno.EACCES, errno.EPERM}:
+            _fail(
+                "external-parent-unreadable",
+                f"bound external output parent became unreadable: {absolute.parent}",
+            )
+        _fail(
+            "external-parent-revalidation-failed",
+            f"could not open bound external output parent {absolute.parent}: {exc}",
+        )
+    try:
+        actual = _external_parent_binding(store)
+        if expected_binding is not None:
+            expected = _validate_external_parent_binding(expected_binding, absolute)
+            for expected_entry, actual_entry in zip(expected, actual, strict=True):
+                if any(
+                    expected_entry[field] != actual_entry[field]
+                    for field in ("name", "device", "inode", "file_type")
+                ):
+                    _fail(
+                        "external-parent-replaced",
+                        f"external output parent identity/name chain changed: {absolute.parent}",
+                    )
+                if any(
+                    expected_entry[field] != actual_entry[field]
+                    for field in ("owner", "group", "permissions")
+                ):
+                    _fail(
+                        "external-parent-policy-changed",
+                        f"external output parent access policy changed: {absolute.parent}",
+                    )
+        yield store, actual
+        store._bind_state_chain("external output completion")
+    finally:
+        store.close()
+
+
+def _read_optional_external(parent: StateStore, target: Path) -> tuple[bytes, str] | None:
+    leaf = Path(target.name)
+    if not parent.exists(leaf):
+        return None
+    return parent.read_bytes(leaf, max_bytes=MAX_PUBLICATION_JSON_BYTES)
+
+
 def _planned_external_write(
     path: Path, value: Mapping[str, Any], *, immutable: bool
 ) -> dict[str, Any]:
     absolute = Path(os.path.abspath(os.fspath(path)))
-    if not absolute.parent.exists():
-        _fail("missing-output-parent", f"output parent does not exist: {absolute.parent}")
-    _validate_private_stat(absolute.parent.lstat(), absolute.parent, directory=True)
-    try:
-        current = _open_external_stable(absolute)
-    except StateError as exc:
-        if exc.code != "missing-file":
-            raise
-        current = None
     payload = _canonical_bytes(value)
-    if len(payload) > MAX_JSON_BYTES:
-        _fail("output-too-large", f"planned external JSON exceeds {MAX_JSON_BYTES} bytes")
+    if len(payload) > MAX_PUBLICATION_JSON_BYTES:
+        _fail(
+            "output-too-large",
+            f"planned external JSON exceeds {MAX_PUBLICATION_JSON_BYTES} bytes",
+        )
     after_digest = hashlib.sha256(payload).hexdigest()
-    if immutable and current is not None and current[1] != after_digest:
-        _fail("immutable-output-exists", f"immutable output already conflicts: {absolute}")
+    with _bound_external_parent(absolute) as (parent, parent_binding):
+        current = _read_optional_external(parent, absolute)
+        if immutable and current is not None and current[1] != after_digest:
+            _fail("immutable-output-exists", f"immutable output already conflicts: {absolute}")
     return {
         "scope": "external",
         "path": str(absolute),
+        "parent_binding": parent_binding,
         "before_sha256": current[1] if current is not None else None,
         "after_sha256": after_digest,
         "after": dict(value),
@@ -2061,7 +2305,19 @@ def _planned_external_write(
     }
 
 
-def _validate_wal_intent(intent: Mapping[str, Any], expected_operation: str) -> None:
+def _validate_wal_intent(
+    intent: Mapping[str, Any],
+    expected_operation: str,
+    *,
+    allow_committed_legacy_external: bool = False,
+) -> bool:
+    """Validate an intent and report whether it has an unbound legacy output.
+
+    The original version-1 external schema did not persist parent identity.
+    Such an intent is safe only after a matching commit already exists, where it
+    can be checked read-only.  It is never eligible for replay.
+    """
+
     _exact_fields(
         intent,
         "wal.intent",
@@ -2090,25 +2346,51 @@ def _validate_wal_intent(intent: Mapping[str, Any], expected_operation: str) -> 
     _timestamp(intent["captured_at"], "wal.captured_at")
     writes = _require_list(intent["writes"], "wal.writes")
     seen: set[str] = set()
+    legacy_external = False
+    bound_external = False
     for index, raw_write in enumerate(writes):
         write = _require_object(raw_write, f"wal.writes[{index}]")
+        scope = write.get("scope")
+        expected_fields = {
+            "scope",
+            "path",
+            "before_sha256",
+            "after_sha256",
+            "after",
+            "immutable",
+        }
+        if scope == "external" and "parent_binding" in write:
+            expected_fields.add("parent_binding")
+            bound_external = True
+        elif scope == "external":
+            if not allow_committed_legacy_external:
+                _fail(
+                    "legacy-external-wal-unbound",
+                    "pending legacy external WAL has no recoverable parent identity binding",
+                )
+            legacy_external = True
         _exact_fields(
             write,
             f"wal.writes[{index}]",
-            {"scope", "path", "before_sha256", "after_sha256", "after", "immutable"},
+            expected_fields,
         )
-        if write["scope"] not in {"state", "external"}:
+        if scope not in {"state", "external"}:
             _fail("invalid-wal", "WAL write scope is invalid")
-        if write["scope"] == "external" and expected_operation not in {
+        if scope == "external" and expected_operation not in {
             "weekly-plan",
             "finalize-publication",
         }:
             _fail("invalid-wal", "this WAL operation cannot write an external output")
         path = _require_string(write["path"], "wal.path")
-        if write["scope"] == "state":
+        if scope == "state":
             _safe_relative_parts(Path(path))
-        elif not Path(path).is_absolute():
-            _fail("invalid-wal", "external WAL path must be absolute")
+        else:
+            absolute = Path(os.path.abspath(os.fspath(path)))
+            if not Path(path).is_absolute() or str(absolute) != path:
+                _fail("invalid-wal", "external WAL path must be canonical and absolute")
+            _safe_relative_parts(Path(absolute.name))
+            if "parent_binding" in write:
+                _validate_external_parent_binding(write["parent_binding"], absolute)
         if path in seen:
             _fail("invalid-wal", f"WAL repeats a target: {path}")
         seen.add(path)
@@ -2128,12 +2410,15 @@ def _validate_wal_intent(intent: Mapping[str, Any], expected_operation: str) -> 
             _fail("invalid-wal", "WAL after-image digest mismatch")
         if not isinstance(write["immutable"], bool):
             _fail("invalid-wal", "WAL immutable flag must be boolean")
-        if write["scope"] == "external" and write["immutable"] is not True:
+        if scope == "external" and write["immutable"] is not True:
             _fail("invalid-wal", "external WAL outputs must be immutable")
+    if legacy_external and bound_external:
+        _fail("invalid-wal", "WAL cannot mix bound and legacy external outputs")
     _require_object(intent["result"], "wal.result")
     body = {key: value for key, value in intent.items() if key != "intent_digest"}
     if intent["intent_digest"] != _digest(body):
         _fail("invalid-wal", "WAL intent digest mismatch")
+    return legacy_external
 
 
 def _validate_wal_commit(commit: Mapping[str, Any], intent: Mapping[str, Any]) -> None:
@@ -2155,37 +2440,184 @@ def _validate_wal_commit(commit: Mapping[str, Any], intent: Mapping[str, Any]) -
         _fail("invalid-wal", "WAL commit does not bind its exact intent")
 
 
+def _preflight_external_writes(intent: Mapping[str, Any], *, require_after: bool = False) -> None:
+    """Reject rebound external destinations before applying any state after-image."""
+
+    for raw_write in intent["writes"]:
+        write = _require_object(raw_write, "wal.write")
+        if write["scope"] != "external":
+            continue
+        target = Path(write["path"])
+        with _bound_external_parent(target, write["parent_binding"]) as (parent, _):
+            current = _read_optional_external(parent, target)
+            current_digest = current[1] if current is not None else None
+            allowed = (
+                {write["after_sha256"]}
+                if require_after
+                else {write["before_sha256"], write["after_sha256"]}
+            )
+            if current_digest not in allowed:
+                _fail(
+                    "wal-target-drift",
+                    (
+                        f"WAL target is not its exact after-image: {target}"
+                        if require_after
+                        else f"WAL target is neither its before nor after image: {target}"
+                    ),
+                )
+
+
+@contextmanager
+def _external_after_image_custody(intent: Mapping[str, Any]) -> Iterator[None]:
+    """Hold each bound parent and exact after-image leaf across commit publication."""
+
+    with ExitStack() as stack:
+        held: list[tuple[StateStore, Path, int, str]] = []
+        for raw_write in intent["writes"]:
+            write = _require_object(raw_write, "wal.write")
+            if write["scope"] != "external":
+                continue
+            if "parent_binding" not in write:
+                _fail(
+                    "legacy-external-wal-unbound",
+                    "legacy external WAL cannot acquire commit custody",
+                )
+            target = Path(write["path"])
+            parent, _ = stack.enter_context(_bound_external_parent(target, write["parent_binding"]))
+            flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
+            try:
+                fd = os.open(target.name, flags, dir_fd=parent.root_fd)
+            except FileNotFoundError:
+                _fail("wal-after-image-missing", f"external after-image is missing: {target}")
+            except OSError as exc:
+                _fail(
+                    "wal-after-image-unreadable",
+                    f"cannot open external after-image {target}: {exc}",
+                )
+            stack.callback(os.close, fd)
+            _, digest = _read_fd_stable(
+                fd,
+                str(target),
+                private=True,
+                max_bytes=MAX_PUBLICATION_JSON_BYTES,
+                expected_parent_fd=parent.root_fd,
+                expected_name=target.name,
+            )
+            if digest != write["after_sha256"]:
+                _fail("wal-target-drift", f"external target is not its after-image: {target}")
+            held.append((parent, target, fd, write["after_sha256"]))
+        yield
+        for parent, target, fd, expected_digest in held:
+            parent._bind_state_chain("after transaction commit")
+            _, digest = _read_fd_stable(
+                fd,
+                str(target),
+                private=True,
+                max_bytes=MAX_PUBLICATION_JSON_BYTES,
+                expected_parent_fd=parent.root_fd,
+                expected_name=target.name,
+            )
+            if digest != expected_digest:
+                _fail(
+                    "wal-target-drift",
+                    f"external after-image changed across transaction commit: {target}",
+                )
+
+
+def _verify_committed_legacy_external_after_images(intent: Mapping[str, Any]) -> None:
+    """Read-only check for committed v1 outputs that predate parent bindings."""
+
+    for raw_write in intent["writes"]:
+        write = _require_object(raw_write, "wal.write")
+        if write["scope"] != "external" or "parent_binding" in write:
+            continue
+        target = Path(write["path"])
+        with _bound_external_parent(target) as (parent, _):
+            current = _read_optional_external(parent, target)
+            if current is None or current[1] != write["after_sha256"]:
+                _fail(
+                    "legacy-external-wal-unbound",
+                    "committed legacy external WAL after-image is missing or changed; "
+                    "automatic replay is unsafe without its original parent identity",
+                )
+
+
 def _apply_wal_intent(store: StateStore, intent: Mapping[str, Any]) -> None:
     if intent["operation"] == "complete-audit":
         _validate_complete_audit_intent_receipts(store, intent)
+    _preflight_external_writes(intent)
     for raw_write in intent["writes"]:
         write = _require_object(raw_write, "wal.write")
         target = Path(write["path"])
         if write["scope"] == "state":
             current = _read_optional_state(store, target)
-        else:
-            try:
-                current = _open_external_stable(target)
-            except StateError as exc:
-                if exc.code != "missing-file":
-                    raise
-                current = None
-        current_digest = current[1] if current is not None else None
-        if current_digest == write["after_sha256"]:
-            continue
-        if current_digest != write["before_sha256"]:
-            _fail(
-                "wal-target-drift",
-                f"WAL target is neither its before nor after image: {target}",
-            )
-        if write["scope"] == "state":
+            current_digest = current[1] if current is not None else None
+            if current_digest == write["after_sha256"]:
+                continue
+            if current_digest != write["before_sha256"]:
+                _fail(
+                    "wal-target-drift",
+                    f"WAL target is neither its before nor after image: {target}",
+                )
             store.write_json(target, write["after"], immutable=write["immutable"])
             final_digest = store.read_bytes(target)[1]
         else:
-            _atomic_write(target, write["after"], immutable=write["immutable"])
-            final_digest = _open_external_stable(target)[1]
+            with _bound_external_parent(target, write["parent_binding"]) as (parent, _):
+                current = _read_optional_external(parent, target)
+                current_digest = current[1] if current is not None else None
+                if current_digest == write["after_sha256"]:
+                    continue
+                if current_digest != write["before_sha256"]:
+                    _fail(
+                        "wal-target-drift",
+                        f"WAL target is neither its before nor after image: {target}",
+                    )
+                parent.write_json(
+                    Path(target.name),
+                    write["after"],
+                    immutable=write["immutable"],
+                    max_bytes=MAX_PUBLICATION_JSON_BYTES,
+                )
+                final_digest = parent.read_bytes(
+                    Path(target.name), max_bytes=MAX_PUBLICATION_JSON_BYTES
+                )[1]
         if final_digest != write["after_sha256"]:
             _fail("wal-write-failed", f"WAL target did not reach after-image: {target}")
+
+
+def _repair_committed_external_after_images(intent: Mapping[str, Any]) -> None:
+    """Repair only immutable external leaves from a committed bound intent.
+
+    State after-images may have advanced through later valid transactions and
+    must never be replayed merely because an older committed WAL is scanned.
+    """
+
+    for raw_write in intent["writes"]:
+        write = _require_object(raw_write, "wal.write")
+        if write["scope"] != "external":
+            continue
+        target = Path(write["path"])
+        with _bound_external_parent(target, write["parent_binding"]) as (parent, _):
+            current = _read_optional_external(parent, target)
+            current_digest = current[1] if current is not None else None
+            if current_digest == write["after_sha256"]:
+                continue
+            if current_digest != write["before_sha256"]:
+                _fail(
+                    "wal-target-drift",
+                    f"committed external target is not repairable: {target}",
+                )
+            parent.write_json(
+                Path(target.name),
+                write["after"],
+                immutable=write["immutable"],
+                max_bytes=MAX_PUBLICATION_JSON_BYTES,
+            )
+            if (
+                parent.read_bytes(Path(target.name), max_bytes=MAX_PUBLICATION_JSON_BYTES)[1]
+                != write["after_sha256"]
+            ):
+                _fail("wal-write-failed", f"external repair did not reach after-image: {target}")
 
 
 def _commit_wal(store: StateStore, intent: Mapping[str, Any]) -> None:
@@ -2198,8 +2630,22 @@ def _commit_wal(store: StateStore, intent: Mapping[str, Any]) -> None:
         "intent_digest": intent["intent_digest"],
     }
     commit = {**body, "commit_digest": _digest(body)}
-    store._bind_state_chain("before transaction commit")
-    store.write_json(commit_path, commit, immutable=True)
+    commit_digest: str | None = None
+    try:
+        with _external_after_image_custody(intent):
+            store._bind_state_chain("before transaction commit")
+            commit_digest = store.write_json(commit_path, commit, immutable=True)
+    except Exception:
+        if commit_digest is not None and store.exists(commit_path):
+            try:
+                store.unlink_exact(commit_path, commit_digest)
+            except Exception as rollback_exc:
+                raise StateError(
+                    "wal-commit-rollback-failed",
+                    "external after-image revalidation failed and the new WAL commit "
+                    "could not be removed safely",
+                ) from rollback_exc
+        raise
 
 
 def _run_transaction(
@@ -2211,18 +2657,27 @@ def _run_transaction(
     captured_at: str,
     writes: list[dict[str, Any]],
     result: Mapping[str, Any],
+    approved_intent_upper_bound: int | None = None,
 ) -> dict[str, Any]:
     """Create or replay a deterministic after-image transaction."""
 
     captured_at = _timestamp(captured_at, "transaction.captured_at")
     request_digest = _digest(request)
     intent_path, commit_path = _wal_paths(operation, natural_key)
+    legacy_external = False
+    committed = store.exists(commit_path)
     if store.exists(intent_path):
         intent, _ = store.read_json(intent_path)
-        _validate_wal_intent(intent, operation)
+        legacy_external = _validate_wal_intent(
+            intent,
+            operation,
+            allow_committed_legacy_external=committed,
+        )
         if intent["natural_key"] != natural_key or intent["request_digest"] != request_digest:
             _fail("wal-request-conflict", "transaction key already binds a different request")
     else:
+        if committed:
+            _fail("invalid-wal-layout", "WAL commit exists without its intent")
         body = {
             "version": VERSION,
             "kind": "state-transaction-intent",
@@ -2235,17 +2690,39 @@ def _run_transaction(
         }
         intent = {**body, "intent_digest": _digest(body)}
         intent_bytes = _canonical_bytes(intent)
+        if (
+            approved_intent_upper_bound is not None
+            and len(intent_bytes) > approved_intent_upper_bound
+        ):
+            _fail(
+                "invalid-selection-preflight",
+                "actual publication WAL exceeds its approved upper bound",
+            )
         if len(intent_bytes) > MAX_WAL_JSON_BYTES:
             _fail(
                 "wal-intent-too-large",
                 f"WAL intent exceeds {MAX_WAL_JSON_BYTES} bytes",
             )
         store.write_json(intent_path, intent, immutable=True)
-    _apply_wal_intent(store, intent)
-    if store.exists(commit_path):
+    if (
+        approved_intent_upper_bound is not None
+        and len(_canonical_bytes(intent)) > approved_intent_upper_bound
+    ):
+        _fail(
+            "invalid-selection-preflight",
+            "persisted publication WAL exceeds its approved upper bound",
+        )
+    if legacy_external:
+        _verify_committed_legacy_external_after_images(intent)
         commit, _ = store.read_json(commit_path)
         _validate_wal_commit(commit, intent)
+    elif committed:
+        commit, _ = store.read_json(commit_path)
+        _validate_wal_commit(commit, intent)
+        _repair_committed_external_after_images(intent)
+        _preflight_external_writes(intent, require_after=True)
     else:
+        _apply_wal_intent(store, intent)
         _commit_wal(store, intent)
     return dict(_require_object(intent["result"], "wal.result"))
 
@@ -2267,13 +2744,26 @@ def _recover_pending_wal(store: StateStore) -> None:
                 continue
             intent_path = directory / name
             intent, _ = store.read_json(intent_path)
-            _validate_wal_intent(intent, operation)
+            candidate_commit = directory / name.replace(".intent.json", ".commit.json")
+            candidate_committed = store.exists(candidate_commit)
+            legacy_external = _validate_wal_intent(
+                intent,
+                operation,
+                allow_committed_legacy_external=candidate_committed,
+            )
             expected_intent, commit_path = _wal_paths(operation, intent["natural_key"])
             if expected_intent != intent_path:
                 _fail("invalid-wal-layout", "WAL filename does not bind its natural key")
+            if candidate_commit != commit_path:
+                _fail("invalid-wal-layout", "WAL commit filename does not bind its intent")
             if store.exists(commit_path):
                 commit, _ = store.read_json(commit_path)
                 _validate_wal_commit(commit, intent)
+                if legacy_external:
+                    _verify_committed_legacy_external_after_images(intent)
+                else:
+                    _repair_committed_external_after_images(intent)
+                    _preflight_external_writes(intent, require_after=True)
                 continue
             _apply_wal_intent(store, intent)
             _commit_wal(store, intent)
@@ -2287,8 +2777,12 @@ def _require_committed_transaction(
         _fail("missing-authority-transaction", f"{operation} has no committed control transaction")
     intent, _ = store.read_json(intent_path)
     commit, _ = store.read_json(commit_path)
-    _validate_wal_intent(intent, operation)
+    legacy_external = _validate_wal_intent(intent, operation, allow_committed_legacy_external=True)
     _validate_wal_commit(commit, intent)
+    if legacy_external:
+        _verify_committed_legacy_external_after_images(intent)
+    else:
+        _preflight_external_writes(intent, require_after=True)
     return intent
 
 
@@ -3676,20 +4170,24 @@ def complete_audit(
         )
 
 
-def _validate_selection(selection: Mapping[str, Any]) -> tuple[str, list[dict[str, Any]]]:
+SELECTION_BASIS_FIELDS = {
+    "version",
+    "kind",
+    "selection_id",
+    "daily_snapshot_digest",
+    "base_intent",
+    "cases",
+}
+
+
+def _validate_selection_basis(
+    selection: Mapping[str, Any],
+) -> tuple[str, list[dict[str, Any]]]:
     _scan_prohibited_content(selection, "selection")
     _exact_fields(
         selection,
         "selection",
-        {
-            "version",
-            "kind",
-            "selection_id",
-            "interaction",
-            "daily_snapshot_digest",
-            "base_intent",
-            "cases",
-        },
+        SELECTION_BASIS_FIELDS,
     )
     if (
         type(selection.get("version")) is not int
@@ -3698,13 +4196,6 @@ def _validate_selection(selection: Mapping[str, Any]) -> tuple[str, list[dict[st
     ):
         _fail("invalid-selection", "selection must be a version 1 publication-selection")
     selection_id = _safe_object_id(selection.get("selection_id"), "selection_id")
-    interaction = _require_object(selection.get("interaction"), "interaction")
-    _exact_fields(interaction, "selection.interaction", {"interactive", "actor", "selected_at"})
-    if interaction.get("interactive") is not True:
-        _fail("untrusted-selection", "selection must be explicitly interactive")
-    if interaction.get("actor") != "Joey":
-        _fail("untrusted-selection", "selection actor must be Joey")
-    _timestamp(interaction.get("selected_at"), "interaction.selected_at")
     snapshot_digest = _require_string(selection["daily_snapshot_digest"], "daily_snapshot_digest")
     if HEX64_RE.fullmatch(snapshot_digest) is None:
         _fail("invalid-digest", "daily_snapshot_digest must be raw SHA-256")
@@ -3728,6 +4219,169 @@ def _validate_selection(selection: Mapping[str, Any]) -> tuple[str, list[dict[st
         digest = _sha_digest(item.get("semantic_digest"), "semantic_digest")
         entries.append({"case_id": case_id, "revision": number, "semantic_digest": digest})
     return selection_id, sorted(entries, key=lambda item: item["case_id"])
+
+
+def _publication_case_bytes_upper_bound(case: Mapping[str, Any]) -> int:
+    """Bound the only semantic-digest-excluded case field at its longest form."""
+
+    candidate = dict(case)
+    candidate["currentness_checked_at"] = "9999-12-31T23:59:59.999999Z"
+    return min(MAX_CASE_JSON_BYTES, len(_canonical_bytes(candidate)))
+
+
+def _selection_resource_preflight(
+    basis: Mapping[str, Any], case_bytes_upper_bound: int
+) -> dict[str, Any]:
+    selected = _require_list(basis.get("cases"), "cases")
+    selected_count = len(selected)
+    basis_bytes = len(_canonical_bytes(basis))
+    publication_upper_bound = (
+        PUBLICATION_FIXED_BUDGET_BYTES
+        + case_bytes_upper_bound
+        + selected_count * PUBLICATION_PER_CASE_OVERHEAD_BYTES
+    )
+    weekly_wal_upper_bound = (
+        WEEKLY_WAL_FIXED_BUDGET_BYTES
+        + basis_bytes
+        + 2 * publication_upper_bound
+        + selected_count * WEEKLY_WAL_PER_CASE_OVERHEAD_BYTES
+    )
+    # Finalization retains the plan and prepared receipt in its request, writes
+    # the prepared receipt once, and writes the case-bearing manifest twice
+    # (control registry plus external output).  Five publication-sized objects
+    # plus fixed WAL/path framing is therefore a conservative full-schema bound.
+    finalize_wal_upper_bound = FINALIZE_WAL_FIXED_BUDGET_BYTES + 5 * publication_upper_bound
+    return {
+        "method": "publication-workflow-upper-bound-v1",
+        "selection_basis_digest": _digest(basis),
+        "selection_basis_bytes": basis_bytes,
+        "selected_count": selected_count,
+        "case_bytes_upper_bound": case_bytes_upper_bound,
+        "publication_fixed_budget_bytes": PUBLICATION_FIXED_BUDGET_BYTES,
+        "publication_per_case_overhead_bytes": PUBLICATION_PER_CASE_OVERHEAD_BYTES,
+        "publication_upper_bound_bytes": publication_upper_bound,
+        "publication_limit_bytes": MAX_PUBLICATION_JSON_BYTES,
+        "weekly_fixed_budget_bytes": WEEKLY_WAL_FIXED_BUDGET_BYTES,
+        "weekly_per_case_overhead_bytes": WEEKLY_WAL_PER_CASE_OVERHEAD_BYTES,
+        "weekly_wal_upper_bound_bytes": weekly_wal_upper_bound,
+        "finalize_fixed_budget_bytes": FINALIZE_WAL_FIXED_BUDGET_BYTES,
+        "finalize_wal_upper_bound_bytes": finalize_wal_upper_bound,
+        "wal_limit_bytes": MAX_WAL_JSON_BYTES,
+    }
+
+
+def _validate_selection_resource(
+    resource: Mapping[str, Any], basis: Mapping[str, Any]
+) -> dict[str, Any]:
+    _exact_fields(
+        resource,
+        "selection.resource_preflight",
+        {
+            "method",
+            "selection_basis_digest",
+            "selection_basis_bytes",
+            "selected_count",
+            "case_bytes_upper_bound",
+            "publication_fixed_budget_bytes",
+            "publication_per_case_overhead_bytes",
+            "publication_upper_bound_bytes",
+            "publication_limit_bytes",
+            "weekly_fixed_budget_bytes",
+            "weekly_per_case_overhead_bytes",
+            "weekly_wal_upper_bound_bytes",
+            "finalize_fixed_budget_bytes",
+            "finalize_wal_upper_bound_bytes",
+            "wal_limit_bytes",
+        },
+    )
+    selected_count = len(_require_list(basis.get("cases"), "cases"))
+    case_bytes_upper_bound = _require_int(
+        resource["case_bytes_upper_bound"],
+        "selection.resource_preflight.case_bytes_upper_bound",
+    )
+    if case_bytes_upper_bound > selected_count * MAX_CASE_JSON_BYTES:
+        _fail("invalid-selection-preflight", "selection case byte bound exceeds schema maximum")
+    expected = _selection_resource_preflight(basis, case_bytes_upper_bound)
+    if resource != expected:
+        _fail(
+            "invalid-selection-preflight",
+            "selection resource preflight does not bind its exact basis and constants",
+        )
+    if expected["publication_upper_bound_bytes"] > MAX_PUBLICATION_JSON_BYTES:
+        _fail(
+            "selection-resource-limit",
+            "selection cannot fit the bounded publication artifact",
+        )
+    if (
+        max(
+            expected["weekly_wal_upper_bound_bytes"],
+            expected["finalize_wal_upper_bound_bytes"],
+        )
+        > MAX_WAL_JSON_BYTES
+    ):
+        _fail(
+            "selection-resource-limit",
+            "selection cannot fit the bounded publication WAL transactions",
+        )
+    return expected
+
+
+def _validate_selection(selection: Mapping[str, Any]) -> tuple[str, list[dict[str, Any]]]:
+    _scan_prohibited_content(selection, "selection")
+    _exact_fields(
+        selection,
+        "selection",
+        {
+            *SELECTION_BASIS_FIELDS,
+            "resource_preflight",
+            "preflight_receipt_id",
+            "preflight_receipt_digest",
+            "interaction",
+        },
+    )
+    basis = {key: selection[key] for key in SELECTION_BASIS_FIELDS}
+    selection_id, entries = _validate_selection_basis(basis)
+    resource = _require_object(selection["resource_preflight"], "selection.resource_preflight")
+    expected = _validate_selection_resource(resource, basis)
+    receipt_id = _require_string(
+        selection["preflight_receipt_id"], "selection.preflight_receipt_id"
+    )
+    expected_receipt_id = str(
+        uuid.uuid5(uuid.NAMESPACE_URL, f"dsf-selection-preflight:{selection_id}")
+    )
+    if receipt_id != expected_receipt_id:
+        _fail("invalid-selection-preflight", "preflight receipt ID does not bind selection ID")
+    receipt_digest = _require_string(
+        selection["preflight_receipt_digest"], "selection.preflight_receipt_digest"
+    )
+    if HEX64_RE.fullmatch(receipt_digest) is None:
+        _fail("invalid-selection-preflight", "preflight receipt digest must be raw SHA-256")
+    interaction = _require_object(selection["interaction"], "selection.interaction")
+    _exact_fields(
+        interaction,
+        "selection.interaction",
+        {
+            "interactive",
+            "actor",
+            "approved_at",
+            "selection_basis_digest",
+            "preflight_receipt_id",
+            "preflight_receipt_digest",
+        },
+    )
+    if interaction["interactive"] is not True or interaction["actor"] != "Joey":
+        _fail("untrusted-selection", "selection approval must be interactive Joey input")
+    _timestamp(interaction["approved_at"], "selection.interaction.approved_at")
+    if (
+        interaction["selection_basis_digest"] != expected["selection_basis_digest"]
+        or interaction["preflight_receipt_id"] != receipt_id
+        or interaction["preflight_receipt_digest"] != receipt_digest
+    ):
+        _fail(
+            "untrusted-selection",
+            "selection approval must bind the exact basis and helper preflight receipt",
+        )
+    return selection_id, entries
 
 
 def _deterministic_branch(case_id: str) -> str:
@@ -3784,24 +4438,230 @@ def _completed_snapshot_by_digest(root: Path, digest: str) -> dict[str, Any] | N
     return next((snapshot for snapshot in chain if snapshot["snapshot_digest"] == digest), None)
 
 
+def _validate_selection_preflight_receipt(
+    receipt: Mapping[str, Any],
+    basis: Mapping[str, Any],
+    resource: Mapping[str, Any],
+) -> str:
+    _exact_fields(
+        receipt,
+        "selection.preflight_receipt",
+        {
+            "version",
+            "kind",
+            "status",
+            "selection_id",
+            "receipt_id",
+            "checked_at",
+            "selection_basis_digest",
+            "resource_preflight",
+            "receipt_digest",
+        },
+    )
+    if (
+        type(receipt["version"]) is not int
+        or receipt["version"] != VERSION
+        or receipt["kind"] != "selection-preflight-receipt"
+        or receipt["status"] != "ready"
+    ):
+        _fail("invalid-selection-preflight", "selection preflight receipt kind/status is invalid")
+    if receipt["selection_id"] != basis["selection_id"]:
+        _fail("invalid-selection-preflight", "selection preflight receipt binds another selection")
+    expected_receipt_id = str(
+        uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            f"dsf-selection-preflight:{basis['selection_id']}",
+        )
+    )
+    if receipt["receipt_id"] != expected_receipt_id:
+        _fail("invalid-selection-preflight", "selection preflight receipt ID is invalid")
+    _timestamp(receipt["checked_at"], "selection.preflight_receipt.checked_at")
+    if (
+        receipt["selection_basis_digest"] != _digest(basis)
+        or receipt["resource_preflight"] != resource
+    ):
+        _fail("invalid-selection-preflight", "selection preflight receipt binding changed")
+    body = {key: value for key, value in receipt.items() if key != "receipt_digest"}
+    digest = _digest(body)
+    if receipt["receipt_digest"] != digest:
+        _fail("invalid-selection-preflight", "selection preflight receipt digest mismatch")
+    return digest
+
+
+def preflight_selection(state_root: Path, selection_draft_path: Path, now: str) -> dict[str, Any]:
+    """Validate and persist an exact preapproval selection resource receipt."""
+
+    now_value = _timestamp(now, "now")
+    basis = _load_json(selection_draft_path, max_bytes=MAX_PUBLICATION_JSON_BYTES)
+    selection_id, selected = _validate_selection_basis(basis)
+    with _state_lock(state_root, create=False) as store:
+        _recover_pending_wal(store)
+        marker = _read_marker(state_root)
+        if marker is None or marker.get("mode") != "live":
+            _fail("not-live-state", "selection preflight requires completed live state")
+        pointer = _load_json(state_root / LIVE_POINTER)
+        _validate_completed_snapshot(pointer)
+        pointer_digest = pointer["snapshot_digest"]
+        if _receipt_files(state_root, "stage", pointer_digest) or _receipt_files(
+            state_root, "dormancy", pointer_digest
+        ):
+            _fail(
+                "daily-incomplete",
+                "selection preflight cannot consume an incomplete Daily audit",
+            )
+        selected_snapshot = _completed_snapshot_by_digest(
+            state_root, basis["daily_snapshot_digest"]
+        )
+        if selected_snapshot is None or selected_snapshot["mode"] != "live":
+            _fail(
+                "unknown-selection-snapshot",
+                "selection snapshot is not a completed live snapshot",
+            )
+        if _parse_time(selected_snapshot["completed_at"], "snapshot.completed_at") > _parse_time(
+            now_value, "preflight.checked_at"
+        ):
+            _fail("clock-order", "selection preflight cannot predate its completed Daily snapshot")
+        selected_snapshot_cases = {
+            item["case_id"]: item for item in selected_snapshot.get("cases", [])
+        }
+        current_by_id = {item["case_id"]: item for item in _snapshot_cases(state_root)}
+        case_bytes_upper_bound = 0
+        for selected_item in selected:
+            case_id = selected_item["case_id"]
+            selected_snapshot_case = selected_snapshot_cases.get(case_id)
+            current = current_by_id.get(case_id)
+            if selected_snapshot_case is None or current is None:
+                _fail(
+                    "selection-preflight-stale",
+                    f"selection preflight cannot bind missing case: {case_id}",
+                )
+            if any(
+                selected_snapshot_case.get(field) != selected_item[field]
+                or current[field] != selected_item[field]
+                for field in ("revision", "semantic_digest")
+            ):
+                _fail(
+                    "selection-preflight-stale",
+                    f"selection preflight tuple is stale: {case_id}",
+                )
+            wrapper, wrapper_sha = _load_json_with_digest(state_root / current["case_path"])
+            validate_candidate(wrapper)
+            if wrapper_sha != current["wrapper_file_sha256"]:
+                _fail("case-drift", f"case bytes changed during preflight: {case_id}")
+            case = _require_object(wrapper["case"], "candidate.case")
+            if case["status"] not in {"watching", "proposed"}:
+                _fail(
+                    "selection-preflight-ineligible",
+                    f"selection preflight case is not publication eligible: {case_id}",
+                )
+            active_relative = Path("publication") / "active" / f"{case_id}.json"
+            if store.exists(active_relative):
+                active, _ = store.read_json(active_relative)
+                _validate_pending_record(active, case_id)
+                if active["status"] == "active":
+                    _fail(
+                        "selection-preflight-ineligible",
+                        f"selection preflight case already has an active publication: {case_id}",
+                    )
+                if (
+                    selected_item["revision"] <= active["revision"]
+                    or selected_item["semantic_digest"] == active["semantic_digest"]
+                ):
+                    _fail(
+                        "selection-preflight-ineligible",
+                        f"selection preflight case cannot reopen its closed tuple: {case_id}",
+                    )
+            case_bytes_upper_bound += _publication_case_bytes_upper_bound(case)
+        resource = _selection_resource_preflight(basis, case_bytes_upper_bound)
+        _validate_selection_resource(resource, basis)
+        receipt_body = {
+            "version": VERSION,
+            "kind": "selection-preflight-receipt",
+            "status": "ready",
+            "selection_id": selection_id,
+            "receipt_id": str(
+                uuid.uuid5(uuid.NAMESPACE_URL, f"dsf-selection-preflight:{selection_id}")
+            ),
+            "checked_at": now_value,
+            "selection_basis_digest": resource["selection_basis_digest"],
+            "resource_preflight": resource,
+        }
+        receipt = {**receipt_body, "receipt_digest": _digest(receipt_body)}
+        receipt_relative = Path("publication") / "preflights" / f"{selection_id}.json"
+        if store.exists(receipt_relative):
+            intent_relative, commit_relative = _wal_paths("selection-preflight", selection_id)
+            if not store.exists(intent_relative) or not store.exists(commit_relative):
+                _fail(
+                    "orphan-selection-preflight",
+                    "preflight receipt exists without its committed helper transaction",
+                )
+            existing, _ = store.read_json(receipt_relative)
+            _validate_selection_preflight_receipt(existing, basis, resource)
+            return _run_transaction(
+                store,
+                operation="selection-preflight",
+                natural_key=selection_id,
+                request={"selection_basis": basis},
+                captured_at=now_value,
+                writes=[],
+                result={},
+            )
+        return _run_transaction(
+            store,
+            operation="selection-preflight",
+            natural_key=selection_id,
+            request={"selection_basis": basis},
+            captured_at=now_value,
+            writes=[_planned_write(store, receipt_relative, receipt, immutable=True)],
+            result=receipt,
+        )
+
+
 def weekly_plan(state_root: Path, selection_path: Path, output: Path, now: str) -> dict[str, Any]:
     now_value = _timestamp(now, "now")
-    selection = _load_json(selection_path)
+    selection = _load_json(selection_path, max_bytes=MAX_PUBLICATION_JSON_BYTES)
     selection_id, selected = _validate_selection(selection)
     snapshot_digest = selection["daily_snapshot_digest"]
     base = selection["base_intent"]
     repository = base["repository"]
     base_branch = base["base_branch"]
     base_sha = base["base_sha"]
-    selected_at = _parse_time(selection["interaction"]["selected_at"], "selected_at")
-    if selected_at > _parse_time(now_value, "now"):
-        _fail("future-state", "selection time cannot be after --now")
+    approved_at = _parse_time(selection["interaction"]["approved_at"], "approved_at")
+    if approved_at > _parse_time(now_value, "now"):
+        _fail("future-state", "selection approval time cannot be after --now")
     request = {
         "selection": selection,
         "output": str(Path(os.path.abspath(os.fspath(output)))),
     }
     with _state_lock(state_root, create=False) as store:
         _recover_pending_wal(store)
+        preflight_intent = _require_committed_transaction(
+            store, "selection-preflight", selection_id
+        )
+        receipt_relative = Path("publication") / "preflights" / f"{selection_id}.json"
+        if not store.exists(receipt_relative):
+            _fail(
+                "missing-selection-preflight",
+                "approved selection has no durable helper preflight receipt",
+            )
+        preflight_receipt, _ = store.read_json(receipt_relative)
+        basis = {key: selection[key] for key in SELECTION_BASIS_FIELDS}
+        receipt_digest = _validate_selection_preflight_receipt(
+            preflight_receipt,
+            basis,
+            selection["resource_preflight"],
+        )
+        if (
+            preflight_intent["result"] != preflight_receipt
+            or preflight_receipt["receipt_id"] != selection["preflight_receipt_id"]
+            or receipt_digest != selection["preflight_receipt_digest"]
+        ):
+            _fail(
+                "invalid-selection-preflight",
+                "approved selection does not bind the durable helper preflight receipt",
+            )
+        if approved_at <= _parse_time(preflight_receipt["checked_at"], "preflight.checked_at"):
+            _fail("clock-order", "selection approval must be after helper preflight")
         intent_path, _ = _wal_paths("weekly-plan", selection_id)
         if store.exists(intent_path):
             return _run_transaction(
@@ -3812,6 +4672,9 @@ def weekly_plan(state_root: Path, selection_path: Path, output: Path, now: str) 
                 captured_at=now_value,
                 writes=[],
                 result={},
+                approved_intent_upper_bound=selection["resource_preflight"][
+                    "weekly_wal_upper_bound_bytes"
+                ],
             )
         marker = _read_marker(state_root)
         if marker is None or marker.get("mode") != "live":
@@ -3830,14 +4693,15 @@ def weekly_plan(state_root: Path, selection_path: Path, output: Path, now: str) 
             )
         if selected_snapshot["mode"] != "live":
             _fail("unknown-selection-snapshot", "selection snapshot is not live")
-        if _parse_time(selected_snapshot["completed_at"], "snapshot.completed_at") > selected_at:
-            _fail("clock-order", "selection cannot predate its completed Daily snapshot")
+        if _parse_time(selected_snapshot["completed_at"], "snapshot.completed_at") >= approved_at:
+            _fail("clock-order", "selection approval must follow its completed Daily snapshot")
         selected_snapshot_cases = {
             item["case_id"]: item for item in selected_snapshot.get("cases", [])
         }
         current_by_id = {item["case_id"]: item for item in _snapshot_cases(state_root)}
         entries: list[dict[str, Any]] = []
         skipped: list[dict[str, str]] = []
+        current_case_bytes_upper_bound = 0
         for selected_item in selected:
             case_id = selected_item["case_id"]
             selected_snapshot_case = selected_snapshot_cases.get(case_id)
@@ -3864,6 +4728,7 @@ def weekly_plan(state_root: Path, selection_path: Path, output: Path, now: str) 
             if case["status"] not in {"watching", "proposed"}:
                 skipped.append({"case_id": case_id, "reason": "ineligible-lifecycle"})
                 continue
+            current_case_bytes_upper_bound += _publication_case_bytes_upper_bound(case)
             ledger_case_path = str(Path("cases") / f"{_case_year(case_id):04d}" / f"{case_id}.json")
             entries.append(
                 {
@@ -3881,12 +4746,23 @@ def weekly_plan(state_root: Path, selection_path: Path, output: Path, now: str) 
             )
         entries.sort(key=lambda item: item["case_id"])
         skipped.sort(key=lambda item: item["case_id"])
+        recorded_case_bound = _require_int(
+            selection["resource_preflight"]["case_bytes_upper_bound"],
+            "selection.resource_preflight.case_bytes_upper_bound",
+        )
+        if current_case_bytes_upper_bound > recorded_case_bound:
+            _fail(
+                "selection-preflight-stale",
+                "current selected cases exceed the approved resource preflight",
+            )
         plan_body = {
             "version": VERSION,
             "kind": "weekly-publication-plan",
             "plan_id": str(uuid.uuid5(uuid.NAMESPACE_URL, f"dsf-plan:{selection_id}")),
             "selection_id": selection_id,
             "selection_digest": _digest(selection),
+            "selection_preflight_receipt_digest": selection["preflight_receipt_digest"],
+            "resource_preflight": selection["resource_preflight"],
             "created_at": now_value,
             "selected_daily_snapshot_digest": snapshot_digest,
             "planned_from_current_snapshot_digest": pointer["snapshot_digest"],
@@ -3901,6 +4777,14 @@ def weekly_plan(state_root: Path, selection_path: Path, output: Path, now: str) 
         plan = dict(plan_body)
         plan["plan_digest"] = _digest(plan_body)
         _validate_plan(plan)
+        if (
+            len(_canonical_bytes(plan))
+            > selection["resource_preflight"]["publication_upper_bound_bytes"]
+        ):
+            _fail(
+                "invalid-selection-preflight",
+                "actual publication plan exceeds its approved upper bound",
+            )
         registry_relative = Path("publication") / "plans" / f"{selection_id}.json"
 
         # Full conflict and output preflight precedes every persistent write.
@@ -3969,7 +4853,76 @@ def weekly_plan(state_root: Path, selection_path: Path, output: Path, now: str) 
             captured_at=now_value,
             writes=writes,
             result=result,
+            approved_intent_upper_bound=selection["resource_preflight"][
+                "weekly_wal_upper_bound_bytes"
+            ],
         )
+
+
+def _validate_plan_resource(resource: Mapping[str, Any]) -> dict[str, Any]:
+    fields = {
+        "method",
+        "selection_basis_digest",
+        "selection_basis_bytes",
+        "selected_count",
+        "case_bytes_upper_bound",
+        "publication_fixed_budget_bytes",
+        "publication_per_case_overhead_bytes",
+        "publication_upper_bound_bytes",
+        "publication_limit_bytes",
+        "weekly_fixed_budget_bytes",
+        "weekly_per_case_overhead_bytes",
+        "weekly_wal_upper_bound_bytes",
+        "finalize_fixed_budget_bytes",
+        "finalize_wal_upper_bound_bytes",
+        "wal_limit_bytes",
+    }
+    _exact_fields(resource, "plan.resource_preflight", fields)
+    if (
+        resource["method"] != "publication-workflow-upper-bound-v1"
+        or HEX64_RE.fullmatch(
+            _require_string(resource["selection_basis_digest"], "resource.selection_basis_digest")
+        )
+        is None
+    ):
+        _fail("invalid-plan", "plan resource preflight method/digest is invalid")
+    selected_count = _require_int(resource["selected_count"], "resource.selected_count")
+    basis_bytes = _require_int(resource["selection_basis_bytes"], "resource.selection_basis_bytes")
+    case_bytes = _require_int(resource["case_bytes_upper_bound"], "resource.case_bytes_upper_bound")
+    if case_bytes > selected_count * MAX_CASE_JSON_BYTES:
+        _fail("invalid-plan", "plan resource case-byte bound exceeds the schema maximum")
+    expected_publication = (
+        PUBLICATION_FIXED_BUDGET_BYTES
+        + case_bytes
+        + selected_count * PUBLICATION_PER_CASE_OVERHEAD_BYTES
+    )
+    expected_weekly = (
+        WEEKLY_WAL_FIXED_BUDGET_BYTES
+        + basis_bytes
+        + 2 * expected_publication
+        + selected_count * WEEKLY_WAL_PER_CASE_OVERHEAD_BYTES
+    )
+    expected_finalize = FINALIZE_WAL_FIXED_BUDGET_BYTES + 5 * expected_publication
+    exact_numbers = {
+        "publication_fixed_budget_bytes": PUBLICATION_FIXED_BUDGET_BYTES,
+        "publication_per_case_overhead_bytes": PUBLICATION_PER_CASE_OVERHEAD_BYTES,
+        "publication_upper_bound_bytes": expected_publication,
+        "publication_limit_bytes": MAX_PUBLICATION_JSON_BYTES,
+        "weekly_fixed_budget_bytes": WEEKLY_WAL_FIXED_BUDGET_BYTES,
+        "weekly_per_case_overhead_bytes": WEEKLY_WAL_PER_CASE_OVERHEAD_BYTES,
+        "weekly_wal_upper_bound_bytes": expected_weekly,
+        "finalize_fixed_budget_bytes": FINALIZE_WAL_FIXED_BUDGET_BYTES,
+        "finalize_wal_upper_bound_bytes": expected_finalize,
+        "wal_limit_bytes": MAX_WAL_JSON_BYTES,
+    }
+    if any(resource[field] != value for field, value in exact_numbers.items()):
+        _fail("invalid-plan", "plan resource preflight constants or arithmetic changed")
+    if (
+        expected_publication > MAX_PUBLICATION_JSON_BYTES
+        or max(expected_weekly, expected_finalize) > MAX_WAL_JSON_BYTES
+    ):
+        _fail("invalid-plan", "plan resource preflight exceeds its declared envelopes")
+    return dict(resource)
 
 
 def _validate_plan(plan: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -3983,6 +4936,8 @@ def _validate_plan(plan: Mapping[str, Any]) -> list[dict[str, Any]]:
             "plan_id",
             "selection_id",
             "selection_digest",
+            "selection_preflight_receipt_digest",
+            "resource_preflight",
             "created_at",
             "selected_daily_snapshot_digest",
             "planned_from_current_snapshot_digest",
@@ -4004,11 +4959,15 @@ def _validate_plan(plan: Mapping[str, Any]) -> list[dict[str, Any]]:
         _fail("invalid-plan", "plan_id does not bind selection_id")
     for field in (
         "selection_digest",
+        "selection_preflight_receipt_digest",
         "selected_daily_snapshot_digest",
         "planned_from_current_snapshot_digest",
     ):
         if HEX64_RE.fullmatch(_require_string(plan[field], f"plan.{field}")) is None:
             _fail("invalid-plan", f"plan.{field} must be raw SHA-256")
+    resource = _validate_plan_resource(
+        _require_object(plan["resource_preflight"], "plan.resource_preflight")
+    )
     _timestamp(plan["created_at"], "plan.created_at")
     base = _require_object(plan["base_intent"], "plan.base_intent")
     _exact_fields(base, "plan.base_intent", {"repository", "base_branch", "base_sha"})
@@ -4077,9 +5036,18 @@ def _validate_plan(plan: Mapping[str, Any]) -> list[dict[str, Any]]:
         }:
             _fail("invalid-plan", "plan skipped entries must be sorted with a closed reason")
         prior = case_id
+    if resource["selected_count"] != len(entries) + len(plan["skipped"]):
+        _fail("invalid-plan", "plan resource preflight selected_count does not match the plan")
+    if (
+        sum(_publication_case_bytes_upper_bound(entry["case"]) for entry in entries)
+        > resource["case_bytes_upper_bound"]
+    ):
+        _fail("invalid-plan", "plan case bodies exceed the approved case-byte bound")
     body = {key: value for key, value in plan.items() if key != "plan_digest"}
     if plan["plan_digest"] != _digest(body):
         _fail("plan-digest-mismatch", "plan content no longer matches plan_digest")
+    if len(_canonical_bytes(plan)) > resource["publication_upper_bound_bytes"]:
+        _fail("invalid-plan", "plan exceeds its approved publication envelope")
     return entries
 
 
@@ -4133,8 +5101,18 @@ def _validate_prepared_entry(
     commands = _require_list(validation.get("commands"), "validation.commands")
     if not commands:
         _fail("validation-missing", f"validation commands are missing for {case_id}")
+    if len(commands) > MAX_PREPARED_COMMANDS:
+        _fail(
+            "validation-too-large",
+            f"validation commands exceed {MAX_PREPARED_COMMANDS} entries for {case_id}",
+        )
     for command in commands:
-        _require_string(command, "validation command")
+        _bounded_string(
+            command,
+            "validation command",
+            1,
+            MAX_PREPARED_COMMAND_CHARS,
+        )
     validated_at = _timestamp(validation.get("validated_at"), "validation.validated_at")
     signature = _require_object(entry.get("signature"), "signature")
     _exact_fields(
@@ -4144,7 +5122,12 @@ def _validate_prepared_entry(
     )
     if signature.get("status") != "verified" or signature.get("commit_sha") != commit_sha:
         _fail("signature-unverified", f"commit signature is not verified for {case_id}")
-    _require_string(signature.get("signer"), "signature.signer")
+    _bounded_string(
+        signature.get("signer"),
+        "signature.signer",
+        1,
+        MAX_PREPARED_SIGNER_CHARS,
+    )
     verified_at = _timestamp(signature.get("verified_at"), "signature.verified_at")
     if not (
         _parse_time(plan_created_at, "plan.created_at")
@@ -4191,6 +5174,11 @@ def _validate_prepared_receipt(
         )
     if set(prepared_by_id) != set(plan_by_id):
         _fail("prepared-set-mismatch", "prepared entries must exactly match every plan entry")
+    resource = _validate_plan_resource(
+        _require_object(plan["resource_preflight"], "plan.resource_preflight")
+    )
+    if len(_canonical_bytes(prepared)) > resource["publication_upper_bound_bytes"]:
+        _fail("invalid-prepared", "prepared receipt exceeds the approved publication envelope")
     return prepared_by_id
 
 
@@ -4294,6 +5282,11 @@ def _validate_manifest(
     body = {key: value for key, value in manifest.items() if key != "manifest_digest"}
     if manifest["manifest_digest"] != _digest(body):
         _fail("manifest-digest-mismatch", "manifest body no longer matches digest")
+    resource = _validate_plan_resource(
+        _require_object(plan["resource_preflight"], "plan.resource_preflight")
+    )
+    if len(_canonical_bytes(manifest)) > resource["publication_upper_bound_bytes"]:
+        _fail("invalid-manifest", "manifest exceeds the approved publication envelope")
     return entries
 
 
@@ -4301,15 +5294,27 @@ def finalize_publication(
     state_root: Path, plan_path: Path, prepared_path: Path, output: Path, now: str
 ) -> dict[str, Any]:
     now_value = _timestamp(now, "now")
-    plan = _load_json(plan_path)
+    plan = _load_json(plan_path, max_bytes=MAX_PUBLICATION_JSON_BYTES)
     plan_entries = _validate_plan(plan)
     plan_by_id = {item["case_id"]: item for item in plan_entries}
 
-    prepared = _load_json(prepared_path)
+    prepared = _load_json(prepared_path, max_bytes=MAX_PUBLICATION_JSON_BYTES)
     prepared_by_id = _validate_prepared_receipt(prepared, plan, now=now_value)
+    resource = _validate_plan_resource(
+        _require_object(plan["resource_preflight"], "plan.resource_preflight")
+    )
+    publication_upper_bound = resource["publication_upper_bound_bytes"]
+    finalize_wal_upper_bound = resource["finalize_wal_upper_bound_bytes"]
+    if len(_canonical_bytes(prepared)) > publication_upper_bound:
+        _fail(
+            "invalid-plan-resource-envelope",
+            "prepared receipt exceeds the preapproved publication envelope",
+        )
+    absolute_output = str(Path(os.path.abspath(os.fspath(output))))
     request = {
         "plan": plan,
         "prepared": prepared,
+        "output": absolute_output,
     }
     natural_key = f"{plan['selection_id']}:{plan['plan_digest']}"
 
@@ -4321,8 +5326,16 @@ def finalize_publication(
             existing_finalize_intent = _require_committed_transaction(
                 store, "finalize-publication", natural_key
             )
+            if len(_canonical_bytes(existing_finalize_intent)) > finalize_wal_upper_bound:
+                _fail(
+                    "invalid-plan-resource-envelope",
+                    "persisted finalize WAL exceeds the selection envelope",
+                )
             if existing_finalize_intent["request_digest"] != _digest(request):
-                _fail("wal-request-conflict", "finalize key binds a different plan/prepared set")
+                _fail(
+                    "wal-request-conflict",
+                    "finalize key binds a different plan/prepared/output request",
+                )
         marker = _read_marker(state_root)
         if marker is None or marker.get("mode") != "live":
             _fail("not-live-state", "publication finalization requires live state")
@@ -4384,11 +5397,12 @@ def finalize_publication(
                 _fail("immutable-manifest-conflict", "stored prepared receipt differs")
             existing_manifest = store.read_json(registry_output)[0]
             _validate_manifest(existing_manifest, plan, prepared)
-            _atomic_write(output, existing_manifest, immutable=True)
+            assert existing_finalize_intent is not None
+            _apply_wal_intent(store, existing_finalize_intent)
             return {
                 "version": VERSION,
                 "status": "finalized",
-                "manifest_path": str(Path(os.path.abspath(os.fspath(output)))),
+                "manifest_path": absolute_output,
                 "manifest_digest": existing_manifest["manifest_digest"],
                 "entry_count": len(existing_manifest["entries"]),
             }
@@ -4409,12 +5423,17 @@ def finalize_publication(
         manifest = dict(manifest_body)
         manifest["manifest_digest"] = _digest(manifest_body)
         _validate_manifest(manifest, plan, prepared)
+        if len(_canonical_bytes(manifest)) > publication_upper_bound:
+            _fail(
+                "invalid-plan-resource-envelope",
+                "manifest exceeds the preapproved publication envelope",
+            )
         output_write = _planned_external_write(output, manifest, immutable=True)
         prepared_relative = Path("publication") / "prepared" / f"{plan['selection_id']}.json"
         result = {
             "version": VERSION,
             "status": "finalized",
-            "manifest_path": str(Path(os.path.abspath(os.fspath(output)))),
+            "manifest_path": absolute_output,
             "manifest_digest": manifest["manifest_digest"],
             "entry_count": len(finalized_entries),
         }
@@ -4430,6 +5449,7 @@ def finalize_publication(
                 output_write,
             ],
             result=result,
+            approved_intent_upper_bound=finalize_wal_upper_bound,
         )
 
 
@@ -4696,7 +5716,23 @@ def close_publication(
                     "finalize-publication",
                     f"{item['selection_id']}:{item['plan_digest']}",
                 )
-                expected_finalize_request = _digest({"plan": plan, "prepared": prepared})
+                external_paths = [
+                    write["path"]
+                    for write in finalize_intent["writes"]
+                    if write["scope"] == "external"
+                ]
+                if len(external_paths) != 1:
+                    _fail(
+                        "missing-authority-transaction",
+                        "finalize transaction does not bind one external manifest",
+                    )
+                expected_finalize_request = _digest(
+                    {
+                        "plan": plan,
+                        "prepared": prepared,
+                        "output": external_paths[0],
+                    }
+                )
                 if (
                     finalize_intent["request_digest"] != expected_finalize_request
                     or finalize_intent["result"].get("manifest_digest")
@@ -4793,6 +5829,14 @@ def _parser() -> argparse.ArgumentParser:
     complete.add_argument("--now", required=True)
     complete.add_argument("--historical-replay", action="store_true")
 
+    selection_preflight = subparsers.add_parser(
+        "selection-preflight",
+        help="validate and persist an exact preapproval Weekly selection receipt",
+    )
+    selection_preflight.add_argument("--state-root", type=Path, required=True)
+    selection_preflight.add_argument("--selection-draft", type=Path, required=True)
+    selection_preflight.add_argument("--now", required=True)
+
     plan = subparsers.add_parser("weekly-plan", help="freeze a trusted weekly selection")
     plan.add_argument("--state-root", type=Path, required=True)
     plan.add_argument("--selection", type=Path, required=True)
@@ -4844,6 +5888,10 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
             args.receipt,
             args.now,
             historical_replay=args.historical_replay,
+        )
+    if args.command == "selection-preflight":
+        return preflight_selection(
+            Path(os.path.abspath(args.state_root)), args.selection_draft, args.now
         )
     if args.command == "weekly-plan":
         return weekly_plan(

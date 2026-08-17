@@ -3,6 +3,7 @@ cache_root = "/Users/hoteng/Program/GitHub/Joey-Tools/codex-workspace/.codex-loc
 
 [host_setup]
 workspace_root = "/Users/hoteng/Program/GitHub/Joey-Tools/codex-workspace"
+account_home = "/Users/hoteng"
 python_executable = "/Users/hoteng/.local/share/uv/python/cpython-3.14.2-macos-aarch64-none/bin/python3.14"
 control_repo = "codex-host-workflows"
 skill_relative_path = ".agents/skills/daily-skill-friction"

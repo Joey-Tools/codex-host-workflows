@@ -49,7 +49,7 @@ Treat the helper's `--help` output and accepted schemas as the field-level
 authority. Invoke the exact mirrored helper only through the pinned interpreter:
 
 ```text
-/Users/hoteng/.local/share/uv/python/cpython-3.14.2-macos-aarch64-none/bin/python3.14 /Users/hoteng/Program/GitHub/Joey-Tools/codex-workspace/.codex-local/daily-skill-friction/repos/codex-host-workflows/.agents/skills/daily-skill-friction/scripts/friction_state.py --help
+/Users/hoteng/.local/share/uv/python/cpython-3.14.2-macos-aarch64-none/bin/python3.14 -I -B -S /Users/hoteng/Program/GitHub/Joey-Tools/codex-workspace/.codex-local/daily-skill-friction/repos/codex-host-workflows/.agents/skills/daily-skill-friction/scripts/friction_state.py --help
 ```
 
 Append each helper mode and its arguments to that same interpreter and script
@@ -61,8 +61,17 @@ until an audited skill and schema update is installed:
 - Daily: `new-id`, `digest`, `validate`, `stage`, and `transition-dormant`.
 - Daily completion: `complete-audit` with a verified audit receipt; pass its
   historical replay option only in the explicit historical mode.
-- Weekly: `weekly-plan` with a trusted selection receipt, followed by
-  `finalize-publication` only after exact prepared-commit receipts exist.
+- Weekly preapproval: `selection-preflight` on an approval-free original draft
+  containing only the selection basis, with no actor or approval time. The helper
+  must persist its immutable ready receipt and committed WAL before Joey reviews
+  the exact basis, receipt ID/digest, and resource preflight.
+- Weekly planning: `weekly-plan` only with a separately approved selection that
+  binds that exact helper receipt and basis. Its `approved_at` must be strictly
+  later than the receipt's `checked_at`; the scheduled run must never add or
+  infer approval fields.
+- Weekly completion: `finalize-publication` only after exact prepared-commit
+  receipts exist. There is no count cap, but the helper's aggregate publication
+  and Weekly/finalization WAL byte envelope must fit before approval.
 - Later interactive publication accounting: `close-publication` only with the
   helper-defined closure receipt for a verified published, cancelled, or stale
   outcome. A published closure additionally requires the separate exact Joey
@@ -80,7 +89,7 @@ report blocked without inventing fields or rewriting existing state.
 Before a scheduled Daily reads evidence or writes state, run:
 
 ```text
-/Users/hoteng/.local/share/uv/python/cpython-3.14.2-macos-aarch64-none/bin/python3.14 /Users/hoteng/Program/GitHub/Joey-Tools/codex-workspace/.codex-local/daily-skill-friction/repos/codex-host-workflows/scripts/host_setup.py doctor --no-launchctl
+/Users/hoteng/.local/share/uv/python/cpython-3.14.2-macos-aarch64-none/bin/python3.14 -I -B -S /Users/hoteng/Program/GitHub/Joey-Tools/codex-workspace/.codex-local/daily-skill-friction/repos/codex-host-workflows/scripts/host_setup.py doctor --no-launchctl
 ```
 
 The weekday 03:10 run depends on the host-owned `prefetch-control` at 02:45; it
@@ -89,7 +98,7 @@ must not invoke or replace that prefetch itself.
 Before a scheduled Weekly, run the exact Weekly variant:
 
 ```text
-/Users/hoteng/.local/share/uv/python/cpython-3.14.2-macos-aarch64-none/bin/python3.14 /Users/hoteng/Program/GitHub/Joey-Tools/codex-workspace/.codex-local/daily-skill-friction/repos/codex-host-workflows/scripts/host_setup.py doctor --weekly --no-launchctl
+/Users/hoteng/.local/share/uv/python/cpython-3.14.2-macos-aarch64-none/bin/python3.14 -I -B -S /Users/hoteng/Program/GitHub/Joey-Tools/codex-workspace/.codex-local/daily-skill-friction/repos/codex-host-workflows/scripts/host_setup.py doctor --weekly --no-launchctl
 ```
 
 Require top-level `status: ready`. Both variants validate each freshness stamp's
@@ -106,7 +115,7 @@ back to the older Daily stamps.
 For an explicitly requested read-only historical Daily pilot replay, use:
 
 ```text
-/Users/hoteng/.local/share/uv/python/cpython-3.14.2-macos-aarch64-none/bin/python3.14 /Users/hoteng/Program/GitHub/Joey-Tools/codex-workspace/.codex-local/daily-skill-friction/repos/codex-host-workflows/scripts/host_setup.py doctor --historical --no-launchctl
+/Users/hoteng/.local/share/uv/python/cpython-3.14.2-macos-aarch64-none/bin/python3.14 -I -B -S /Users/hoteng/Program/GitHub/Joey-Tools/codex-workspace/.codex-local/daily-skill-friction/repos/codex-host-workflows/scripts/host_setup.py doctor --historical --no-launchctl
 ```
 
 Require `freshness_mode: historical-age-only`. This skips only the age check for
@@ -127,9 +136,16 @@ path, and never combine `--historical` with the Weekly variant.
 ### Weekly publication preparation
 
 - Consume the last completed Daily state without waiting for another Daily run.
-- Generate a non-authorizing Weekly plan, prepare at most one local ledger branch
-  and one signed local commit per selected case, then finalize one exact immutable
-  publication manifest.
+- Require a prior interactive handoff to run `selection-preflight` on the exact
+  basis-only draft, which contains no actor or approval time, and persist its
+  immutable helper receipt. Joey must then separately approve that basis,
+  resource preflight, and receipt ID/digest after the receipt's `checked_at`. The
+  scheduled run may only consume the resulting approved selection through
+  `weekly-plan`; it must never create, edit, infer, or impersonate approval.
+- Apply no count cap. Require the helper's exact aggregate byte envelope for the
+  publication artifacts and both Weekly/finalization WAL transactions to fit,
+  then prepare at most one local ledger branch and one signed local commit per
+  selected case and finalize one exact immutable publication manifest.
 - Treat that finalized manifest only as an exact binding and scope receipt. It
   requires a later exact Joey publish approval before any push, pull request, or
   merge.

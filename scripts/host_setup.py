@@ -6,6 +6,11 @@ and access policy (type, owner, group, and mode). Timestamp-only changes are not
 treated as mutation. Managed replacement uses a same-directory kernel exchange
 or no-replace rename, retains the previous object until commit, and fsyncs both
 the file and parent directory.
+
+Subprocess guards protect executable-selection integrity: host commands use
+audited absolute executables, delegated helpers receive a system-only PATH, and
+every child starts from a closed environment allowlist. This does not attest the
+publisher identity of the fixed executables or the behavior of remote services.
 """
 
 from __future__ import annotations
@@ -19,6 +24,7 @@ import hashlib
 import json
 import os
 import plistlib
+import pwd
 import re
 import secrets
 import signal
@@ -52,6 +58,68 @@ GIT_TIMEOUT_SECONDS = 20
 COMMAND_TIMEOUT_SECONDS = 120
 COMMAND_TERM_GRACE_SECONDS = 2
 COMMAND_KILL_GRACE_SECONDS = 2
+GIT_EXECUTABLE = "/usr/bin/git"
+LAUNCHCTL_EXECUTABLE = "/bin/launchctl"
+SSH_EXECUTABLE = "/usr/bin/ssh"
+ENV_EXECUTABLE = "/usr/bin/env"
+SHELL_EXECUTABLE = "/bin/sh"
+SHELL_PRIVILEGED_FLAG = "-p"
+TRUSTED_SYSTEM_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
+TRUSTED_LOCALE = "en_US.UTF-8"
+TRUSTED_TMPDIR = "/tmp"
+PYTHON_ISOLATION_FLAGS = ("-I", "-B", "-S")
+LAUNCH_ENV_ARG0 = "daily-skill-friction-clean-env"
+LAUNCH_ENV_COMMAND = (
+    "account_home=$1; shift; "
+    'if [ -n "${SSH_AUTH_SOCK-}" ]; then '
+    f'exec {ENV_EXECUTABLE} -i PATH={TRUSTED_SYSTEM_PATH} "HOME=$account_home" '
+    f"LANG={TRUSTED_LOCALE} TMPDIR={TRUSTED_TMPDIR} "
+    '"SSH_AUTH_SOCK=$SSH_AUTH_SOCK" "$@"; '
+    "fi; "
+    f'exec {ENV_EXECUTABLE} -i PATH={TRUSTED_SYSTEM_PATH} "HOME=$account_home" '
+    f'LANG={TRUSTED_LOCALE} TMPDIR={TRUSTED_TMPDIR} "$@"'
+)
+PRESERVED_PROCESS_ENVIRONMENT = (
+    "LC_ALL",
+    "LC_COLLATE",
+    "LC_CTYPE",
+    "LC_MESSAGES",
+    "LC_MONETARY",
+    "LC_NUMERIC",
+    "LC_TIME",
+    "SSH_AUTH_SOCK",
+    "TEMP",
+    "TMP",
+)
+
+
+def _trusted_account_home() -> str:
+    """Resolve HOME from the kernel account identity, not ambient input."""
+
+    try:
+        raw = pwd.getpwuid(os.getuid()).pw_dir
+    except KeyError as error:
+        raise SetupError(f"uid {os.getuid()} has no account home") from error
+    home = Path(raw)
+    if not home.is_absolute() or home != Path(os.path.normpath(str(home))):
+        raise SetupError("account home must be a normalized absolute path")
+    return str(home)
+
+
+def _trusted_process_environment() -> dict[str, str]:
+    """Build the minimal inherited environment for every child process."""
+
+    environment = {
+        "PATH": TRUSTED_SYSTEM_PATH,
+        "HOME": _trusted_account_home(),
+        "LANG": os.environ.get("LANG", TRUSTED_LOCALE),
+        "TMPDIR": os.environ.get("TMPDIR", TRUSTED_TMPDIR),
+    }
+    for key in PRESERVED_PROCESS_ENVIRONMENT:
+        value = os.environ.get(key)
+        if value is not None:
+            environment[key] = value
+    return environment
 
 
 @dataclasses.dataclass(frozen=True)
@@ -118,6 +186,7 @@ class HostConfig:
     manifest_snapshot: FileSnapshot
     repo_root: Path
     workspace_root: Path
+    account_home: Path
     cache_root: Path
     python_executable: Path
     control_repo: RepoSpec
@@ -271,7 +340,7 @@ class CommandRunner:
                 text=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                env=dict(env) if env is not None else None,
+                env=(dict(env) if env is not None else _trusted_process_environment()),
                 start_new_session=True,
             )
             stdout, stderr = process.communicate(timeout=self.timeout_seconds)
@@ -676,6 +745,9 @@ def load_config(path: Path) -> HostConfig:
         manifest_snapshot=snapshot,
         repo_root=path.parent.parent,
         workspace_root=workspace_root,
+        account_home=_absolute_path(
+            _require_string(host, "account_home"), field="host_setup.account_home"
+        ),
         cache_root=manifest.cache_root,
         python_executable=_absolute_path(
             _require_string(host, "python_executable"), field="host_setup.python_executable"
@@ -712,6 +784,7 @@ def load_config(path: Path) -> HostConfig:
 def _config_identity(config: HostConfig) -> tuple[Any, ...]:
     return (
         config.workspace_root,
+        config.account_home,
         config.manifest_snapshot.digest,
         config.cache_root,
         config.python_executable,
@@ -1563,11 +1636,7 @@ def _git_admin_path_checks(repository: Path, *, prefix: str) -> list[Check]:
 
 
 def _git_environment(*, disable_hooks: bool = True) -> dict[str, str]:
-    environment = {
-        key: value
-        for key, value in os.environ.items()
-        if not key.startswith("GIT_") and key not in {"SSH_ASKPASS", "GIT_ASKPASS"}
-    }
+    environment = _trusted_process_environment()
     environment.update(
         {
             "GIT_CONFIG_NOSYSTEM": "1",
@@ -1575,9 +1644,14 @@ def _git_environment(*, disable_hooks: bool = True) -> dict[str, str]:
             "GIT_TERMINAL_PROMPT": "0",
             "GIT_OPTIONAL_LOCKS": "0",
             "GIT_NO_LAZY_FETCH": "1",
+            "GIT_SSH": SSH_EXECUTABLE,
+            "GIT_SSH_VARIANT": "ssh",
         }
     )
-    overrides = [("core.fsmonitor", "false")]
+    overrides = [
+        ("core.fsmonitor", "false"),
+        ("core.sshCommand", SSH_EXECUTABLE),
+    ]
     if disable_hooks:
         overrides.append(("core.hooksPath", "/dev/null"))
     environment["GIT_CONFIG_COUNT"] = str(len(overrides))
@@ -1598,7 +1672,7 @@ def _run_git(
     os.close(descriptor)
     try:
         result = subprocess.run(
-            ["git", *arguments],
+            [GIT_EXECUTABLE, *arguments],
             cwd=repository,
             check=False,
             text=True,
@@ -1624,6 +1698,7 @@ def _workspace_status_argv(
 ) -> list[str]:
     argv = [
         str(config.python_executable),
+        *PYTHON_ISOLATION_FLAGS,
         str(config.workspace_helper),
         "--config",
         str(manifest.path),
@@ -1813,7 +1888,10 @@ def _check_python(config: HostConfig, runner: CommandRunner) -> Check:
         )
         if not snapshot.binding.mode & 0o111:
             raise SetupError("Python executable has no executable bit")
-        result = runner.run([str(config.python_executable), "--version"])
+        result = runner.run(
+            [str(config.python_executable), *PYTHON_ISOLATION_FLAGS, "--version"],
+            env=_trusted_process_environment(),
+        )
         version = (result.stdout or result.stderr).strip()
         match = re.fullmatch(r"Python ([0-9]+)\.([0-9]+)(?:\.([0-9]+))?", version)
         if result.returncode != 0 or match is None:
@@ -1873,7 +1951,14 @@ def _desired_control_launch_agent(config: HostConfig) -> dict[str, Any]:
     return {
         "Label": config.launch_agent_label,
         "ProgramArguments": [
+            SHELL_EXECUTABLE,
+            SHELL_PRIVILEGED_FLAG,
+            "-c",
+            LAUNCH_ENV_COMMAND,
+            LAUNCH_ENV_ARG0,
+            str(config.account_home),
             str(config.python_executable),
+            *PYTHON_ISOLATION_FLAGS,
             str(config.control_mirror_script),
             "prefetch-control",
         ],
@@ -1884,9 +1969,7 @@ def _desired_control_launch_agent(config: HostConfig) -> dict[str, Any]:
         },
         "StandardOutPath": str(config.log_root / "daily-skill-friction-control-prefetch.out.log"),
         "StandardErrorPath": str(config.log_root / "daily-skill-friction-control-prefetch.err.log"),
-        "EnvironmentVariables": {
-            "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-        },
+        "EnvironmentVariables": {"PATH": TRUSTED_SYSTEM_PATH},
     }
 
 
@@ -1894,7 +1977,14 @@ def _desired_weekly_launch_agent(config: HostConfig) -> dict[str, Any]:
     return {
         "Label": config.weekly_launch_agent_label,
         "ProgramArguments": [
+            SHELL_EXECUTABLE,
+            SHELL_PRIVILEGED_FLAG,
+            "-c",
+            LAUNCH_ENV_COMMAND,
+            LAUNCH_ENV_ARG0,
+            str(config.account_home),
             str(config.python_executable),
+            *PYTHON_ISOLATION_FLAGS,
             str(config.control_mirror_script),
             "prefetch-weekly",
         ],
@@ -1906,9 +1996,7 @@ def _desired_weekly_launch_agent(config: HostConfig) -> dict[str, Any]:
         },
         "StandardOutPath": str(config.log_root / "daily-skill-friction-weekly-prefetch.out.log"),
         "StandardErrorPath": str(config.log_root / "daily-skill-friction-weekly-prefetch.err.log"),
-        "EnvironmentVariables": {
-            "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-        },
+        "EnvironmentVariables": {"PATH": TRUSTED_SYSTEM_PATH},
     }
 
 
@@ -1921,6 +2009,11 @@ def desired_launch_agent(config: HostConfig, key: str = "control") -> dict[str, 
 
 
 def _launch_agent_specs(config: HostConfig, home: Path) -> tuple[LaunchAgentSpec, ...]:
+    home = _normalized_absolute(home, field="user home")
+    if home != config.account_home:
+        raise SetupError(
+            f"user home does not match host_setup.account_home: {home} != {config.account_home}"
+        )
     launch_agents = _normalized_absolute(
         home / "Library" / "LaunchAgents", field="user LaunchAgents"
     )
@@ -2790,7 +2883,10 @@ def _require_loaded_definition(
 
 def _query_service(label: str, runner: CommandRunner) -> ServiceState:
     service = _launchctl_service(label)
-    result = runner.run(["launchctl", "print", service])
+    result = runner.run(
+        [LAUNCHCTL_EXECUTABLE, "print", service],
+        env=_trusted_process_environment(),
+    )
     if result.returncode == 0:
         definition = _parse_launchctl_definition(service, result.stdout)
         return ServiceState(label=label, loaded=True, definition=definition)
@@ -3221,6 +3317,7 @@ def _run_helper(
 ) -> subprocess.CompletedProcess[str]:
     argv = [
         str(config.python_executable),
+        *PYTHON_ISOLATION_FLAGS,
         str(config.workspace_helper),
         "--config",
         str(manifest),
@@ -4329,7 +4426,7 @@ def _launchctl_command(
     *,
     action: str,
 ) -> None:
-    result = runner.run(argv)
+    result = runner.run(argv, env=_trusted_process_environment())
     if result.returncode != 0:
         detail = (result.stderr or result.stdout).strip()[:MAX_COMMAND_DETAIL]
         raise SetupError(f"{action} failed with exit {result.returncode}: {detail}")
@@ -4351,14 +4448,14 @@ def _reload_services(
             touched.add(spec.label)
             _launchctl_command(
                 runner,
-                ["launchctl", "bootout", _launchctl_service(spec.label)],
+                [LAUNCHCTL_EXECUTABLE, "bootout", _launchctl_service(spec.label)],
                 action=f"launchctl bootout {spec.label}",
             )
         touched.add(spec.label)
         _launchctl_command(
             runner,
             [
-                "launchctl",
+                LAUNCHCTL_EXECUTABLE,
                 "bootstrap",
                 f"gui/{os.getuid()}",
                 str(spec.destination),
@@ -4404,14 +4501,14 @@ def _restore_services(
             if current.loaded:
                 _launchctl_command(
                     runner,
-                    ["launchctl", "bootout", _launchctl_service(spec.label)],
+                    [LAUNCHCTL_EXECUTABLE, "bootout", _launchctl_service(spec.label)],
                     action=f"rollback bootout {spec.label}",
                 )
             if original[spec.label].loaded:
                 _launchctl_command(
                     runner,
                     [
-                        "launchctl",
+                        LAUNCHCTL_EXECUTABLE,
                         "bootstrap",
                         f"gui/{os.getuid()}",
                         str(spec.destination),

@@ -264,17 +264,12 @@ def _selection(
     *,
     actor: str = "Joey",
     interactive: bool = True,
-    selected_at: str = "2026-07-11T08:00:00Z",
+    approved_at: str = "2026-07-11T08:00:00Z",
 ) -> dict[str, Any]:
-    return {
+    basis = {
         "version": 1,
         "kind": "publication-selection",
         "selection_id": str(uuid.uuid4()),
-        "interaction": {
-            "interactive": interactive,
-            "actor": actor,
-            "selected_at": selected_at,
-        },
         "daily_snapshot_digest": snapshot_digest,
         "base_intent": {
             "repository": "Joey-Tools/codex-skill-friction-ledger",
@@ -290,28 +285,80 @@ def _selection(
             for case in cases
         ],
     }
-
-
-def _finalize_one(
-    tmp_path: Path, case: dict[str, Any]
-) -> tuple[Path, dict[str, Any], dict[str, Any]]:
-    root, stage = _stage(tmp_path, case)
-    completed = _complete_live(tmp_path, root, [stage])
-    plan_path = tmp_path / "plan.json"
-    fs.weekly_plan(
-        root,
-        _write(tmp_path / "selection.json", _selection(completed["snapshot_digest"], [case])),
-        plan_path,
-        "2026-07-11T08:01:00Z",
+    case_bytes_upper_bound = sum(
+        fs._publication_case_bytes_upper_bound(case["case"]) for case in cases
     )
-    plan = fs._load_json(plan_path)
-    entry = plan["entries"][0]
-    commit_sha = "b" * 40
-    prepared = {
-        "version": 1,
-        "kind": "prepared-commits",
-        "plan_digest": plan["plan_digest"],
-        "entries": [
+    resource = fs._selection_resource_preflight(basis, case_bytes_upper_bound)
+    receipt_id = str(
+        uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            f"dsf-selection-preflight:{basis['selection_id']}",
+        )
+    )
+    return {
+        **basis,
+        "resource_preflight": resource,
+        "preflight_receipt_id": receipt_id,
+        "preflight_receipt_digest": "b" * 64,
+        "interaction": {
+            "interactive": interactive,
+            "actor": actor,
+            "approved_at": approved_at,
+            "selection_basis_digest": resource["selection_basis_digest"],
+            "preflight_receipt_id": receipt_id,
+            "preflight_receipt_digest": "b" * 64,
+        },
+    }
+
+
+def _approved_selection(
+    tmp_path: Path,
+    root: Path,
+    snapshot_digest: str,
+    cases: list[dict[str, Any]],
+    *,
+    actor: str = "Joey",
+    interactive: bool = True,
+    checked_at: str = "2026-07-11T07:59:00Z",
+    approved_at: str = "2026-07-11T08:00:00Z",
+) -> dict[str, Any]:
+    selection = _selection(
+        snapshot_digest,
+        cases,
+        actor=actor,
+        interactive=interactive,
+        approved_at=approved_at,
+    )
+    basis = {key: selection[key] for key in fs.SELECTION_BASIS_FIELDS}
+    receipt = fs.preflight_selection(
+        root,
+        _write(tmp_path / f"{selection['selection_id']}-draft.json", basis),
+        checked_at,
+    )
+    selection["resource_preflight"] = receipt["resource_preflight"]
+    selection["preflight_receipt_id"] = receipt["receipt_id"]
+    selection["preflight_receipt_digest"] = receipt["receipt_digest"]
+    selection["interaction"] = {
+        "interactive": interactive,
+        "actor": actor,
+        "approved_at": approved_at,
+        "selection_basis_digest": receipt["selection_basis_digest"],
+        "preflight_receipt_id": receipt["receipt_id"],
+        "preflight_receipt_digest": receipt["receipt_digest"],
+    }
+    return selection
+
+
+def _prepared_receipt(
+    plan: dict[str, Any],
+    *,
+    validated_at: str = "2026-07-11T08:30:00Z",
+    verified_at: str = "2026-07-11T08:31:00Z",
+) -> dict[str, Any]:
+    entries: list[dict[str, Any]] = []
+    for index, entry in enumerate(plan["entries"], start=1):
+        commit_sha = f"{index:040x}"[-40:]
+        entries.append(
             {
                 "case_id": entry["case_id"],
                 "revision": entry["revision"],
@@ -324,17 +371,41 @@ def _finalize_one(
                 "validation": {
                     "status": "passed",
                     "commands": ["python3 scripts/validate_ledger.py"],
-                    "validated_at": "2026-07-11T08:30:00Z",
+                    "validated_at": validated_at,
                 },
                 "signature": {
                     "status": "verified",
                     "commit_sha": commit_sha,
                     "signer": "Joey",
-                    "verified_at": "2026-07-11T08:31:00Z",
+                    "verified_at": verified_at,
                 },
             }
-        ],
+        )
+    return {
+        "version": 1,
+        "kind": "prepared-commits",
+        "plan_digest": plan["plan_digest"],
+        "entries": entries,
     }
+
+
+def _finalize_one(
+    tmp_path: Path, case: dict[str, Any]
+) -> tuple[Path, dict[str, Any], dict[str, Any]]:
+    root, stage = _stage(tmp_path, case)
+    completed = _complete_live(tmp_path, root, [stage])
+    plan_path = tmp_path / "plan.json"
+    fs.weekly_plan(
+        root,
+        _write(
+            tmp_path / "selection.json",
+            _approved_selection(tmp_path, root, completed["snapshot_digest"], [case]),
+        ),
+        plan_path,
+        "2026-07-11T08:01:00Z",
+    )
+    plan = fs._load_json(plan_path)
+    prepared = _prepared_receipt(plan)
     manifest_path = tmp_path / "manifest.json"
     fs.finalize_publication(
         root,
@@ -786,7 +857,7 @@ def test_all_control_candidate_shapes_and_weekly_export_are_ledger_clean(tmp_pat
         root,
         _write(
             tmp_path / "compat-selection.json",
-            _selection(completed["snapshot_digest"], [wrappers[0]]),
+            _approved_selection(tmp_path, root, completed["snapshot_digest"], [wrappers[0]]),
         ),
         plan_path,
         "2026-07-11T08:01:00Z",
@@ -1144,7 +1215,7 @@ def test_active_publication_blocks_dormancy_until_audited_closure(tmp_path: Path
     case = _candidate(lifecycle_at="2026-06-01T12:00:00Z")
     root, stage = _stage(tmp_path, case)
     completed = _complete_live(tmp_path, root, [stage])
-    selection = _selection(completed["snapshot_digest"], [case])
+    selection = _approved_selection(tmp_path, root, completed["snapshot_digest"], [case])
     plan_path = tmp_path / "pending-plan.json"
     fs.weekly_plan(
         root,
@@ -1201,7 +1272,7 @@ def test_closed_publication_tuple_allows_only_a_higher_semantic_revision(tmp_pat
         root,
         _write(
             tmp_path / "first-selection.json",
-            _selection(completed["snapshot_digest"], [case]),
+            _approved_selection(tmp_path, root, completed["snapshot_digest"], [case]),
         ),
         first_plan_path,
         "2026-07-11T08:01:00Z",
@@ -1270,10 +1341,13 @@ def test_closed_publication_tuple_allows_only_a_higher_semantic_revision(tmp_pat
         root,
         _write(
             tmp_path / "second-selection.json",
-            _selection(
+            _approved_selection(
+                tmp_path,
+                root,
                 second_completed["snapshot_digest"],
                 [updated],
-                selected_at="2026-07-12T08:32:00Z",
+                checked_at="2026-07-12T08:31:30Z",
+                approved_at="2026-07-12T08:32:00Z",
             ),
         ),
         second_plan_path,
@@ -1452,28 +1526,29 @@ def test_historical_completion_is_isolated_and_never_writes_live_pointer(tmp_pat
     assert Path(completed["snapshot_path"]).exists()
 
 
-def test_selection_must_be_trusted_and_stale_cases_are_skipped(tmp_path: Path) -> None:
+def test_selection_must_bind_durable_preflight_and_trusted_approval(tmp_path: Path) -> None:
     case = _candidate()
     root, stage = _stage(tmp_path, case)
     completed = _complete_live(tmp_path, root, [stage])
-    untrusted = _selection(completed["snapshot_digest"], [case], actor="Automation")
-    with pytest.raises(fs.StateError, match="actor must be Joey"):
+    untrusted = _approved_selection(
+        tmp_path, root, completed["snapshot_digest"], [case], actor="Automation"
+    )
+    with pytest.raises(fs.StateError, match="interactive Joey"):
         fs.weekly_plan(
             root,
             _write(tmp_path / "untrusted.json", untrusted),
             tmp_path / "untrusted-plan.json",
             "2026-07-11T08:01:00Z",
         )
-    stale = _selection(completed["snapshot_digest"], [case])
-    stale["cases"][0]["revision"] += 1
-    result = fs.weekly_plan(
-        root,
-        _write(tmp_path / "stale.json", stale),
-        tmp_path / "stale-plan.json",
-        "2026-07-11T08:01:00Z",
-    )
-    assert result["selected_count"] == 0
-    assert result["skipped"] == [{"case_id": case["case"]["id"], "reason": "stale-selection"}]
+    self_signed = _selection(completed["snapshot_digest"], [case])
+    with pytest.raises(fs.StateError, match="no committed control transaction") as raised:
+        fs.weekly_plan(
+            root,
+            _write(tmp_path / "self-signed.json", self_signed),
+            tmp_path / "self-signed-plan.json",
+            "2026-07-11T08:01:00Z",
+        )
+    assert raised.value.code == "missing-authority-transaction"
 
 
 def test_selection_snapshot_must_belong_to_live_completed_ancestry(tmp_path: Path) -> None:
@@ -1489,14 +1564,13 @@ def test_selection_snapshot_must_belong_to_live_completed_ancestry(tmp_path: Pat
     }
     orphan = {**orphan_body, "snapshot_digest": fs._digest(orphan_body)}
     fs._atomic_write(root / "completed" / "orphan-snapshot.json", orphan, immutable=True)
-    selection = _selection(orphan["snapshot_digest"], [case])
     before = _tree_bytes(root)
     with pytest.raises(fs.StateError, match="outside the live ancestry"):
-        fs.weekly_plan(
+        _approved_selection(
+            tmp_path,
             root,
-            _write(tmp_path / "orphan-selection.json", selection),
-            tmp_path / "orphan-plan.json",
-            "2026-07-11T08:01:00Z",
+            orphan["snapshot_digest"],
+            [case],
         )
     assert _tree_bytes(root) == before
     assert completed["snapshot_digest"] == pointer["snapshot_digest"]
@@ -1520,7 +1594,7 @@ def test_high_signal_never_auto_selects_and_explicit_selection_has_no_cap(tmp_pa
         for index, case in enumerate(cases)
     ]
     completed = _complete_live(tmp_path, root, receipts)
-    empty = _selection(completed["snapshot_digest"], [])
+    empty = _approved_selection(tmp_path, root, completed["snapshot_digest"], [])
     empty_result = fs.weekly_plan(
         root,
         _write(tmp_path / "empty-selection.json", empty),
@@ -1528,7 +1602,7 @@ def test_high_signal_never_auto_selects_and_explicit_selection_has_no_cap(tmp_pa
         "2026-07-11T08:01:00Z",
     )
     assert empty_result["selected_count"] == 0
-    selected = _selection(completed["snapshot_digest"], cases)
+    selected = _approved_selection(tmp_path, root, completed["snapshot_digest"], cases)
     all_result = fs.weekly_plan(
         root,
         _write(tmp_path / "all-selection.json", selected),
@@ -1542,7 +1616,7 @@ def test_finalize_requires_exact_receipts_rejects_drift_and_is_idempotent(tmp_pa
     case = _candidate()
     root, stage = _stage(tmp_path, case)
     completed = _complete_live(tmp_path, root, [stage])
-    selection = _selection(completed["snapshot_digest"], [case])
+    selection = _approved_selection(tmp_path, root, completed["snapshot_digest"], [case])
     plan_path = tmp_path / "plan.json"
     fs.weekly_plan(
         root,
@@ -1597,10 +1671,21 @@ def test_finalize_requires_exact_receipts_rejects_drift_and_is_idempotent(tmp_pa
         root,
         plan_path,
         prepared_path,
-        tmp_path / "checked-manifest.json",
+        output,
         "2026-07-12T08:02:00Z",
     )
     assert allowed["status"] == "finalized"
+    rebound_output = tmp_path / "checked-manifest.json"
+    with pytest.raises(fs.StateError, match="different plan/prepared/output") as raised:
+        fs.finalize_publication(
+            root,
+            plan_path,
+            prepared_path,
+            rebound_output,
+            "2026-07-12T08:02:00Z",
+        )
+    assert raised.value.code == "wal-request-conflict"
+    assert not rebound_output.exists()
 
     changed = json.loads(json.dumps(checked))
     changed["case"]["revision"] = 2
@@ -1615,10 +1700,9 @@ def test_finalize_requires_exact_receipts_rejects_drift_and_is_idempotent(tmp_pa
             root,
             plan_path,
             prepared_path,
-            tmp_path / "drifted-manifest.json",
+            output,
             "2026-07-12T08:04:00Z",
         )
-    assert not (tmp_path / "drifted-manifest.json").exists()
     assert output.read_bytes() == before
 
     closure = {
@@ -1911,8 +1995,9 @@ def test_weekly_output_conflict_has_no_state_side_effect(
     case = _candidate()
     root, stage = _stage(tmp_path, case)
     completed = _complete_live(tmp_path, root, [stage])
-    selection = _selection(completed["snapshot_digest"], [case])
+    selection = _approved_selection(tmp_path, root, completed["snapshot_digest"], [case])
     output = _write(tmp_path / "conflicting-plan.json", {"foreign": True})
+    output.chmod(0o600)
     before = _tree_bytes(root)
     with pytest.raises(fs.StateError, match="already conflicts"):
         fs.weekly_plan(
@@ -1925,7 +2010,9 @@ def test_weekly_output_conflict_has_no_state_side_effect(
     assert output.read_text(encoding="utf-8").strip() == '{"foreign": true}'
 
 
-def test_weekly_late_active_conflict_has_no_partial_plan_or_registry(tmp_path: Path) -> None:
+def test_selection_preflight_rejects_active_publication_without_partial_state(
+    tmp_path: Path,
+) -> None:
     cases = [
         _candidate(occurrences=[_occurrence(0, root=f"root:weekly-{index}")]) for index in range(2)
     ]
@@ -1945,38 +2032,40 @@ def test_weekly_late_active_conflict_has_no_partial_plan_or_registry(tmp_path: P
         root,
         _write(
             tmp_path / "occupied-selection.json",
-            _selection(completed["snapshot_digest"], [occupied]),
+            _approved_selection(tmp_path, root, completed["snapshot_digest"], [occupied]),
         ),
         tmp_path / "occupied-plan.json",
         "2026-07-11T08:01:00Z",
     )
     before = _tree_bytes(root)
-    output = tmp_path / "conflicted-multi-plan.json"
-    with pytest.raises(fs.StateError, match="another active publication"):
-        fs.weekly_plan(
+    with pytest.raises(fs.StateError, match="already has an active publication"):
+        _approved_selection(
+            tmp_path,
             root,
-            _write(
-                tmp_path / "conflicted-multi-selection.json",
-                _selection(completed["snapshot_digest"], ordered),
-            ),
-            output,
-            "2026-07-11T08:02:00Z",
+            completed["snapshot_digest"],
+            ordered,
+            checked_at="2026-07-11T08:02:00Z",
+            approved_at="2026-07-11T08:03:00Z",
         )
     assert _tree_bytes(root) == before
-    assert not output.exists()
 
 
-def test_weekly_plan_recovers_external_output_gap_across_now(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def _leave_pending_weekly_external_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    output_parent: Path | None = None,
+) -> tuple[Path, Path, Path, dict[str, Any]]:
     case = _candidate()
     root, stage = _stage(tmp_path, case)
     completed = _complete_live(tmp_path, root, [stage])
     selection_path = _write(
         tmp_path / "interrupted-selection.json",
-        _selection(completed["snapshot_digest"], [case]),
+        _approved_selection(tmp_path, root, completed["snapshot_digest"], [case]),
     )
-    output = tmp_path / "interrupted-plan.json"
+    parent = output_parent or tmp_path
+    parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    output = parent / "interrupted-plan.json"
     original = fs.StateStore.write_json
     injected = False
 
@@ -1986,18 +2075,32 @@ def test_weekly_plan_recovers_external_output_gap_across_now(
         value: dict[str, Any],
         *,
         immutable: bool = False,
+        max_bytes: int | None = None,
     ) -> str:
         nonlocal injected
-        if not injected and store.root == tmp_path and Path(relative) == Path(output.name):
+        if not injected and store.root == parent and Path(relative) == Path(output.name):
             injected = True
             raise OSError("injected weekly output interruption")
-        return original(store, relative, value, immutable=immutable)
+        return original(
+            store,
+            relative,
+            value,
+            immutable=immutable,
+            max_bytes=max_bytes,
+        )
 
     monkeypatch.setattr(fs.StateStore, "write_json", fail_external_output)
     with pytest.raises(OSError, match="injected weekly output interruption"):
         fs.weekly_plan(root, selection_path, output, "2026-07-11T08:01:00Z")
     monkeypatch.setattr(fs.StateStore, "write_json", original)
     assert not output.exists()
+    return root, selection_path, output, case
+
+
+def test_weekly_plan_recovers_external_output_gap_across_now(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, selection_path, output, case = _leave_pending_weekly_external_write(tmp_path, monkeypatch)
     recovered = fs.weekly_plan(root, selection_path, output, "2026-07-11T09:01:00Z")
     plan = fs._load_json(output)
     assert recovered["plan_digest"] == plan["plan_digest"]
@@ -2006,14 +2109,447 @@ def test_weekly_plan_recovers_external_output_gap_across_now(
     assert active["activated_at"] == "2026-07-11T08:01:00Z"
 
 
-def test_weekly_plan_supports_fourteen_large_cases_without_wal_truncation(
+def test_weekly_wal_recovery_never_recreates_a_missing_external_parent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    output_parent = tmp_path / "external"
+    root, selection_path, output, _ = _leave_pending_weekly_external_write(
+        tmp_path, monkeypatch, output_parent=output_parent
+    )
+    output_parent.rmdir()
+
+    with pytest.raises(fs.StateError, match="parent disappeared") as raised:
+        fs.weekly_plan(root, selection_path, output, "2026-07-11T09:01:00Z")
+
+    assert raised.value.code == "external-parent-missing"
+    assert not output_parent.exists()
+
+
+def test_weekly_wal_recovery_rejects_same_path_replacement_parent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    output_parent = tmp_path / "external"
+    root, selection_path, output, _ = _leave_pending_weekly_external_write(
+        tmp_path, monkeypatch, output_parent=output_parent
+    )
+    displaced = tmp_path / "external-displaced"
+    output_parent.rename(displaced)
+    output_parent.mkdir(mode=0o700)
+
+    with pytest.raises(fs.StateError, match="identity/name chain changed") as raised:
+        fs.weekly_plan(root, selection_path, output, "2026-07-11T09:01:00Z")
+
+    assert raised.value.code == "external-parent-replaced"
+    assert not output.exists()
+    assert not (displaced / output.name).exists()
+
+
+@pytest.mark.parametrize("replacement_kind", ["file", "symlink"])
+def test_weekly_wal_recovery_classifies_non_directory_parent_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    replacement_kind: str,
+) -> None:
+    output_parent = tmp_path / "external"
+    root, selection_path, output, _ = _leave_pending_weekly_external_write(
+        tmp_path, monkeypatch, output_parent=output_parent
+    )
+    displaced = tmp_path / "external-displaced"
+    output_parent.rename(displaced)
+    if replacement_kind == "file":
+        output_parent.write_text("replacement", encoding="utf-8")
+        output_parent.chmod(0o600)
+    else:
+        output_parent.symlink_to(displaced, target_is_directory=True)
+
+    with pytest.raises(fs.StateError, match="no longer the directory chain") as raised:
+        fs.weekly_plan(root, selection_path, output, "2026-07-11T09:01:00Z")
+
+    assert raised.value.code == "external-parent-replaced"
+    assert not (displaced / output.name).exists()
+
+
+def test_weekly_wal_recovery_rejects_external_parent_access_policy_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    output_parent = tmp_path / "external"
+    root, selection_path, output, _ = _leave_pending_weekly_external_write(
+        tmp_path, monkeypatch, output_parent=output_parent
+    )
+    output_parent.chmod(0o500)
+    try:
+        with pytest.raises(fs.StateError, match="parent access policy changed") as raised:
+            fs.weekly_plan(root, selection_path, output, "2026-07-11T09:01:00Z")
+        assert raised.value.code == "external-parent-policy-changed"
+        assert not output.exists()
+    finally:
+        output_parent.chmod(0o700)
+
+
+def test_weekly_wal_recovery_ignores_external_parent_child_churn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    output_parent = tmp_path / "external"
+    root, selection_path, output, _ = _leave_pending_weekly_external_write(
+        tmp_path, monkeypatch, output_parent=output_parent
+    )
+    before = output_parent.stat()
+    transient = output_parent / "transient"
+    transient.mkdir(mode=0o700)
+    after = output_parent.stat()
+    assert (before.st_mtime_ns, before.st_size, before.st_nlink) != (
+        after.st_mtime_ns,
+        after.st_size,
+        after.st_nlink,
+    )
+
+    recovered = fs.weekly_plan(root, selection_path, output, "2026-07-11T09:01:00Z")
+
+    assert recovered["status"] == "planned"
+    assert output.exists()
+    transient.rmdir()
+
+
+def test_weekly_wal_recovery_revalidates_existing_after_image_policy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    case = _candidate()
+    root, stage = _stage(tmp_path, case)
+    completed = _complete_live(tmp_path, root, [stage])
+    selection_path = _write(
+        tmp_path / "after-image-selection.json",
+        _approved_selection(tmp_path, root, completed["snapshot_digest"], [case]),
+    )
+    output = tmp_path / "after-image-plan.json"
+    original_commit = fs._commit_wal
+
+    def interrupt_weekly_commit(store: Any, intent: dict[str, Any]) -> None:
+        if intent["operation"] == "weekly-plan":
+            raise OSError("injected weekly commit interruption")
+        original_commit(store, intent)
+
+    monkeypatch.setattr(fs, "_commit_wal", interrupt_weekly_commit)
+    with pytest.raises(OSError, match="injected weekly commit interruption"):
+        fs.weekly_plan(root, selection_path, output, "2026-07-11T08:01:00Z")
+    monkeypatch.setattr(fs, "_commit_wal", original_commit)
+    assert output.exists()
+    output.chmod(0o644)
+    try:
+        with pytest.raises(fs.StateError, match="group or other access") as raised:
+            fs.weekly_plan(root, selection_path, output, "2026-07-11T09:01:00Z")
+        assert raised.value.code == "unsafe-permissions"
+        _, commit_relative = fs._wal_paths(
+            "weekly-plan", fs._load_json(selection_path)["selection_id"]
+        )
+        assert not (root / commit_relative).exists()
+    finally:
+        output.chmod(0o600)
+
+
+def test_external_after_image_loss_after_commit_publication_rolls_back_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    case = _candidate()
+    root, stage = _stage(tmp_path, case)
+    completed = _complete_live(tmp_path, root, [stage])
+    selection = _approved_selection(tmp_path, root, completed["snapshot_digest"], [case])
+    selection_path = _write(tmp_path / "commit-custody-selection.json", selection)
+    output = tmp_path / "commit-custody-plan.json"
+    _, commit_relative = fs._wal_paths("weekly-plan", selection["selection_id"])
+    original = fs.StateStore.write_json
+    injected = False
+
+    def remove_after_commit_publication(
+        store: Any,
+        relative: Path | str,
+        value: dict[str, Any],
+        *,
+        immutable: bool = False,
+        max_bytes: int | None = None,
+    ) -> str:
+        nonlocal injected
+        digest = original(
+            store,
+            relative,
+            value,
+            immutable=immutable,
+            max_bytes=max_bytes,
+        )
+        if not injected and store.root == root and Path(relative) == commit_relative:
+            injected = True
+            output.unlink()
+        return digest
+
+    monkeypatch.setattr(fs.StateStore, "write_json", remove_after_commit_publication)
+    with pytest.raises(fs.StateError, match="exactly one link") as raised:
+        fs.weekly_plan(root, selection_path, output, "2026-07-11T08:01:00Z")
+    assert raised.value.code == "unsafe-link-count"
+    monkeypatch.setattr(fs.StateStore, "write_json", original)
+
+    intent_relative, _ = fs._wal_paths("weekly-plan", selection["selection_id"])
+    assert (root / intent_relative).exists()
+    assert not (root / commit_relative).exists()
+    assert not output.exists()
+
+    recovered = fs.weekly_plan(root, selection_path, output, "2026-07-11T09:01:00Z")
+    assert recovered["status"] == "planned"
+    assert output.exists() and (root / commit_relative).exists()
+
+
+def _rewrite_external_wal_as_legacy(
+    root: Path, operation: str, natural_key: str
+) -> tuple[Path, Path]:
+    intent_relative, commit_relative = fs._wal_paths(operation, natural_key)
+    intent_path = root / intent_relative
+    commit_path = root / commit_relative
+    intent = fs._load_json(intent_path)
+    for write in intent["writes"]:
+        if write["scope"] == "external":
+            write.pop("parent_binding")
+    intent_body = {key: value for key, value in intent.items() if key != "intent_digest"}
+    intent["intent_digest"] = fs._digest(intent_body)
+    intent_path.write_bytes(fs._canonical_bytes(intent))
+    commit = fs._load_json(commit_path)
+    commit["intent_digest"] = intent["intent_digest"]
+    commit_body = {key: value for key, value in commit.items() if key != "commit_digest"}
+    commit["commit_digest"] = fs._digest(commit_body)
+    commit_path.write_bytes(fs._canonical_bytes(commit))
+    return intent_path, commit_path
+
+
+def test_committed_legacy_external_wal_is_read_only_validated(
+    tmp_path: Path,
+) -> None:
+    case = _candidate()
+    root, stage = _stage(tmp_path, case)
+    completed = _complete_live(tmp_path, root, [stage])
+    selection = _approved_selection(tmp_path, root, completed["snapshot_digest"], [case])
+    output = tmp_path / "legacy-committed-plan.json"
+    fs.weekly_plan(
+        root,
+        _write(tmp_path / "legacy-committed-selection.json", selection),
+        output,
+        "2026-07-11T08:01:00Z",
+    )
+    _rewrite_external_wal_as_legacy(root, "weekly-plan", selection["selection_id"])
+
+    with fs._state_lock(root, create=False) as store:
+        fs._recover_pending_wal(store)
+    assert output.exists()
+
+    output.unlink()
+    with fs._state_lock(root, create=False) as store:
+        with pytest.raises(fs.StateError, match="automatic replay is unsafe") as raised:
+            fs._recover_pending_wal(store)
+    assert raised.value.code == "legacy-external-wal-unbound"
+    assert not output.exists()
+
+
+def test_pending_legacy_external_wal_fails_closed_without_rebinding(
+    tmp_path: Path,
+) -> None:
+    case = _candidate()
+    root, stage = _stage(tmp_path, case)
+    completed = _complete_live(tmp_path, root, [stage])
+    selection = _approved_selection(tmp_path, root, completed["snapshot_digest"], [case])
+    output = tmp_path / "legacy-pending-plan.json"
+    fs.weekly_plan(
+        root,
+        _write(tmp_path / "legacy-pending-selection.json", selection),
+        output,
+        "2026-07-11T08:01:00Z",
+    )
+    _, commit_path = _rewrite_external_wal_as_legacy(root, "weekly-plan", selection["selection_id"])
+    commit_path.unlink()
+
+    with fs._state_lock(root, create=False) as store:
+        with pytest.raises(fs.StateError, match="no recoverable parent identity") as raised:
+            fs._recover_pending_wal(store)
+    assert raised.value.code == "legacy-external-wal-unbound"
+    assert output.exists()
+
+
+def test_selection_preflight_binds_exact_draft_and_current_case_bytes(tmp_path: Path) -> None:
+    case = _candidate()
+    root, stage = _stage(tmp_path, case)
+    completed = _complete_live(tmp_path, root, [stage])
+    selection = _selection(completed["snapshot_digest"], [case])
+    draft = {key: selection[key] for key in fs.SELECTION_BASIS_FIELDS}
+
+    result = fs.preflight_selection(
+        root,
+        _write(tmp_path / "selection-draft.json", draft),
+        "2026-07-11T08:00:01Z",
+    )
+
+    assert result["status"] == "ready"
+    assert result["resource_preflight"] == selection["resource_preflight"]
+    assert result["selection_basis_digest"] == fs._digest(draft)
+    assert (
+        fs._load_json(root / "publication" / "preflights" / f"{selection['selection_id']}.json")
+        == result
+    )
+    intent_relative, commit_relative = fs._wal_paths(
+        "selection-preflight", selection["selection_id"]
+    )
+    assert (root / intent_relative).exists() and (root / commit_relative).exists()
+    assert (
+        fs.preflight_selection(
+            root,
+            tmp_path / "selection-draft.json",
+            "2026-07-11T09:00:01Z",
+        )
+        == result
+    )
+
+
+@pytest.mark.parametrize(
+    ("checked_at", "approved_at"),
+    [
+        ("2026-07-11T08:00:00Z", "2026-07-11T08:00:00Z"),
+        ("2026-07-10T12:31:00Z", "2026-07-10T12:31:00Z"),
+    ],
+)
+def test_selection_approval_must_be_strictly_later_than_preflight_and_snapshot(
+    tmp_path: Path,
+    checked_at: str,
+    approved_at: str,
+) -> None:
+    case = _candidate()
+    root, stage = _stage(tmp_path, case)
+    completed = _complete_live(tmp_path, root, [stage])
+    selection = _approved_selection(
+        tmp_path,
+        root,
+        completed["snapshot_digest"],
+        [case],
+        checked_at=checked_at,
+        approved_at=approved_at,
+    )
+
+    with pytest.raises(fs.StateError, match="must be after helper preflight") as raised:
+        fs.weekly_plan(
+            root,
+            _write(tmp_path / "equal-time-selection.json", selection),
+            tmp_path / "equal-time-plan.json",
+            "2026-07-11T08:01:00Z",
+        )
+
+    assert raised.value.code == "clock-order"
+
+
+def test_selection_preflight_rejects_incomplete_daily_without_new_writes(
+    tmp_path: Path,
+) -> None:
+    case = _candidate()
+    root, stage = _stage(tmp_path, case)
+    completed = _complete_live(tmp_path, root, [stage])
+    pending = _candidate(occurrences=[_occurrence(0, root="root:pending-daily")])
+    fs.stage_candidate(
+        _write(tmp_path / "pending-daily.json", pending),
+        root,
+        "2026-07-11T07:00:00Z",
+    )
+    selection = _selection(completed["snapshot_digest"], [case])
+    draft = {key: selection[key] for key in fs.SELECTION_BASIS_FIELDS}
+    before = _tree_bytes(root)
+
+    with pytest.raises(fs.StateError, match="incomplete Daily audit") as raised:
+        fs.preflight_selection(
+            root,
+            _write(tmp_path / "incomplete-daily-selection.json", draft),
+            "2026-07-11T08:00:00Z",
+        )
+
+    assert raised.value.code == "daily-incomplete"
+    assert _tree_bytes(root) == before
+
+
+def test_selection_resource_envelope_has_no_count_cap_and_is_size_sensitive() -> None:
+    case_items = [
+        {
+            "case_id": fs.new_case_id("2026-06-01T12:00:00Z"),
+            "revision": 1,
+            "semantic_digest": "sha256:" + "a" * 64,
+        }
+        for _ in range(256)
+    ]
+
+    def basis(count: int) -> dict[str, Any]:
+        return {
+            "version": 1,
+            "kind": "publication-selection",
+            "selection_id": str(uuid.uuid4()),
+            "daily_snapshot_digest": "b" * 64,
+            "base_intent": {
+                "repository": "Joey-Tools/codex-skill-friction-ledger",
+                "base_branch": "master",
+                "base_sha": "a" * 40,
+            },
+            "cases": case_items[:count],
+        }
+
+    boundary_count = next(
+        count
+        for count in range(1, len(case_items) + 1)
+        if fs._selection_resource_preflight(basis(count), count * fs.MAX_CASE_JSON_BYTES)[
+            "finalize_wal_upper_bound_bytes"
+        ]
+        > fs.MAX_WAL_JSON_BYTES
+    )
+    same_count_basis = basis(boundary_count)
+    small_resource = fs._selection_resource_preflight(same_count_basis, boundary_count * 1024)
+    assert fs._validate_selection_resource(small_resource, same_count_basis) == small_resource
+
+    maximum_resource = fs._selection_resource_preflight(
+        same_count_basis, boundary_count * fs.MAX_CASE_JSON_BYTES
+    )
+    with pytest.raises(fs.StateError, match="bounded publication WAL") as raised:
+        fs._validate_selection_resource(maximum_resource, same_count_basis)
+    assert raised.value.code == "selection-resource-limit"
+
+
+def test_selection_preflight_rejects_budget_before_any_control_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    case = _candidate()
+    root, stage = _stage(tmp_path, case)
+    completed = _complete_live(tmp_path, root, [stage])
+    selection = _selection(completed["snapshot_digest"], [case])
+    draft = {key: selection[key] for key in fs.SELECTION_BASIS_FIELDS}
+    exact = fs._selection_resource_preflight(
+        draft, fs._publication_case_bytes_upper_bound(case["case"])
+    )
+    before = _tree_bytes(root)
+    monkeypatch.setattr(
+        fs,
+        "MAX_WAL_JSON_BYTES",
+        max(
+            exact["weekly_wal_upper_bound_bytes"],
+            exact["finalize_wal_upper_bound_bytes"],
+        )
+        - 1,
+    )
+
+    with pytest.raises(fs.StateError, match="bounded publication WAL") as raised:
+        fs.preflight_selection(
+            root,
+            _write(tmp_path / "oversized-selection-draft.json", draft),
+            "2026-07-11T08:00:01Z",
+        )
+
+    assert raised.value.code == "selection-resource-limit"
+    assert _tree_bytes(root) == before
+
+
+def test_weekly_plan_supports_twenty_eight_max_evidence_cases_past_legacy_cap(
     tmp_path: Path,
 ) -> None:
     cases: list[dict[str, Any]] = []
     receipts: list[dict[str, Any]] = []
     root = tmp_path / "state"
     base = dt.datetime(2026, 6, 1, 12, tzinfo=dt.UTC)
-    for case_index in range(14):
+    for case_index in range(28):
         occurrences: list[dict[str, Any]] = []
         for occurrence_index in range(256):
             observed_at = (
@@ -2040,7 +2576,7 @@ def test_weekly_plan_supports_fourteen_large_cases_without_wal_truncation(
         )
 
     completed = _complete_live(tmp_path, root, receipts)
-    selection = _selection(completed["snapshot_digest"], cases)
+    selection = _approved_selection(tmp_path, root, completed["snapshot_digest"], cases)
     output = tmp_path / "large-weekly-plan.json"
     result = fs.weekly_plan(
         root,
@@ -2048,10 +2584,91 @@ def test_weekly_plan_supports_fourteen_large_cases_without_wal_truncation(
         output,
         "2026-07-11T08:01:00Z",
     )
-    assert result["selected_count"] == 14
-    assert len(output.read_bytes()) < fs.MAX_JSON_BYTES
+    assert result["selected_count"] == 28
+    output_size = len(output.read_bytes())
+    assert fs.MAX_JSON_BYTES < output_size < fs.MAX_PUBLICATION_JSON_BYTES
+    assert output_size <= selection["resource_preflight"]["publication_upper_bound_bytes"]
     intent_relative, _ = fs._wal_paths("weekly-plan", selection["selection_id"])
-    assert (root / intent_relative).stat().st_size > 5 * 1024 * 1024
+    intent_size = (root / intent_relative).stat().st_size
+    assert intent_size > 5 * 1024 * 1024
+    assert intent_size <= selection["resource_preflight"]["weekly_wal_upper_bound_bytes"]
+
+    plan = fs._load_json(output, max_bytes=fs.MAX_PUBLICATION_JSON_BYTES)
+    prepared_path = _write(tmp_path / "large-prepared.json", _prepared_receipt(plan))
+    manifest_output = tmp_path / "large-manifest.json"
+    finalized = fs.finalize_publication(
+        root,
+        output,
+        prepared_path,
+        manifest_output,
+        "2026-07-11T08:32:00Z",
+    )
+    manifest_bytes = manifest_output.read_bytes()
+    assert finalized["entry_count"] == 28
+    assert (
+        fs.MAX_JSON_BYTES
+        < len(manifest_bytes)
+        <= selection["resource_preflight"]["publication_upper_bound_bytes"]
+    )
+    finalize_key = f"{selection['selection_id']}:{plan['plan_digest']}"
+    finalize_intent_relative, _ = fs._wal_paths("finalize-publication", finalize_key)
+    finalize_intent_size = (root / finalize_intent_relative).stat().st_size
+    assert finalize_intent_size > fs.MAX_JSON_BYTES
+    assert finalize_intent_size <= selection["resource_preflight"]["finalize_wal_upper_bound_bytes"]
+
+    manifest_output.unlink()
+    replayed = fs.finalize_publication(
+        root,
+        output,
+        prepared_path,
+        manifest_output,
+        "2026-07-11T09:32:00Z",
+    )
+    assert replayed == finalized
+    assert manifest_output.read_bytes() == manifest_bytes
+
+
+def test_prepared_variable_metadata_has_closed_resource_bounds(tmp_path: Path) -> None:
+    _, plan, _ = _finalize_one(tmp_path, _candidate())
+    maximum_metadata = _prepared_receipt(plan)
+    four_byte_character = chr(0x1F642)
+    maximum_metadata["entries"][0]["validation"]["commands"] = [
+        four_byte_character * fs.MAX_PREPARED_COMMAND_CHARS for _ in range(fs.MAX_PREPARED_COMMANDS)
+    ]
+    maximum_metadata["entries"][0]["signature"]["signer"] = (
+        four_byte_character * fs.MAX_PREPARED_SIGNER_CHARS
+    )
+    assert fs._validate_prepared_receipt(
+        maximum_metadata,
+        plan,
+        now="2026-07-11T08:32:00Z",
+    )
+    assert (
+        len(fs._canonical_bytes(maximum_metadata))
+        <= plan["resource_preflight"]["publication_upper_bound_bytes"]
+    )
+
+    too_many_commands = _prepared_receipt(plan)
+    too_many_commands["entries"][0]["validation"]["commands"] = [
+        f"validate-{index}" for index in range(fs.MAX_PREPARED_COMMANDS + 1)
+    ]
+    with pytest.raises(fs.StateError, match="validation commands exceed") as commands_error:
+        fs._validate_prepared_receipt(
+            too_many_commands,
+            plan,
+            now="2026-07-11T08:32:00Z",
+        )
+    assert commands_error.value.code == "validation-too-large"
+
+    oversized_signer = _prepared_receipt(plan)
+    oversized_signer["entries"][0]["signature"]["signer"] = "x" * (fs.MAX_PREPARED_SIGNER_CHARS + 1)
+    with pytest.raises(fs.StateError, match="signature.signer") as signer_error:
+        fs._validate_prepared_receipt(
+            oversized_signer,
+            plan,
+            now="2026-07-11T08:32:00Z",
+        )
+    assert signer_error.value.code == "invalid-text"
 
 
 def test_oversized_wal_intent_fails_before_any_state_side_effect(
@@ -2743,6 +3360,7 @@ def test_cli_advertises_every_control_transition() -> None:
         "stage",
         "transition-dormant",
         "complete-audit",
+        "selection-preflight",
         "weekly-plan",
         "finalize-publication",
         "close-publication",

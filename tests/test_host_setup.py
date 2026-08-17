@@ -9,7 +9,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -225,9 +225,9 @@ class FakeRunner(hs.CommandRunner):
         args = list(argv)
         self.calls.append((args, cwd))
         self.environments.append(dict(env) if env is not None else None)
-        if len(args) == 2 and args[1] == "--version":
+        if args[1:] == [*hs.PYTHON_ISOLATION_FLAGS, "--version"]:
             return subprocess.CompletedProcess(args, 0, "Python 3.14.2\n", "")
-        if args and args[0] == "launchctl":
+        if args and args[0] == hs.LAUNCHCTL_EXECUTABLE:
             return self._launch_result(args)
         command = next((name for name in ("ensure", "prefetch", "status") if name in args), None)
         if command is not None:
@@ -257,6 +257,7 @@ cache_root = "{cache_root}"
 
 [host_setup]
 workspace_root = "{workspace}"
+account_home = "{workspace.parent / "home"}"
 python_executable = "{python}"
 control_repo = "codex-host-workflows"
 skill_relative_path = ".agents/skills/daily-skill-friction"
@@ -496,6 +497,7 @@ def test_production_manifest_and_both_launch_agents_are_exact() -> None:
     assert config.cache_root == Path(
         "/Users/hoteng/Program/GitHub/Joey-Tools/codex-workspace/.codex-local/daily-skill-friction"
     )
+    assert config.account_home == Path("/Users/hoteng")
     assert config.skill_relative_path == Path(".agents/skills/daily-skill-friction")
     assert config.python_executable == Path(
         "/Users/hoteng/.local/share/uv/python/cpython-3.14.2-macos-aarch64-none/bin/python3.14"
@@ -510,6 +512,16 @@ def test_production_manifest_and_both_launch_agents_are_exact() -> None:
         assert parsed == hs.desired_launch_agent(config, key)
         assert "ensure" not in parsed["ProgramArguments"]
         assert "clone" not in parsed["ProgramArguments"]
+        assert parsed["EnvironmentVariables"] == {"PATH": hs.TRUSTED_SYSTEM_PATH}
+        assert parsed["ProgramArguments"][:6] == [
+            hs.SHELL_EXECUTABLE,
+            hs.SHELL_PRIVILEGED_FLAG,
+            "-c",
+            hs.LAUNCH_ENV_COMMAND,
+            hs.LAUNCH_ENV_ARG0,
+            str(config.account_home),
+        ]
+        assert list(hs.PYTHON_ISOLATION_FLAGS) == parsed["ProgramArguments"][7:10]
     weekly = hs.desired_launch_agent(config, "weekly")
     control = hs.desired_launch_agent(config, "control")
     assert control["ProgramArguments"][-1] == "prefetch-control"
@@ -548,6 +560,72 @@ def test_empty_host_apply_is_idempotent_and_preserves_shared_prefetch(tmp_path: 
         assert (spec.destination.stat().st_ino, spec.destination.read_bytes()) == before["plists"][
             spec.key
         ]
+
+
+def test_launch_agent_clean_launcher_drops_inherited_tool_control_environment(
+    tmp_path: Path,
+) -> None:
+    config = hs.load_config(REPO_ROOT / "config" / "host-workspace.toml")
+    launch_arguments = hs.desired_launch_agent(config, "control")["ProgramArguments"]
+    python_index = launch_arguments.index(str(config.python_executable))
+    startup_marker = tmp_path / "shell-startup-ran"
+    hostile_startup = tmp_path / "hostile-shell-startup"
+    hostile_startup.write_text(
+        f'#!/bin/sh\n/usr/bin/touch "{startup_marker}"\n',
+        encoding="utf-8",
+    )
+    hostile_environment = {
+        **os.environ,
+        "PATH": "/tmp/hostile-path",
+        "HOME": "/tmp/hostile-home",
+        "SSH_AUTH_SOCK": "/tmp/test-agent.sock",
+        "PYTHONHOME": "/tmp/hostile-python-home",
+        "PYTHONPATH": "/tmp/hostile-python-path",
+        "DYLD_INSERT_LIBRARIES": "/tmp/hostile-inject.dylib",
+        "GIT_EXEC_PATH": "/tmp/hostile-git-exec",
+        "BASH_ENV": str(hostile_startup),
+        "ENV": str(hostile_startup),
+        "BASH_FUNC_[%%": f'() {{ /usr/bin/touch "{startup_marker}"; return 1; }}',
+    }
+    probe = (
+        "import json, os, sys; "
+        "print(json.dumps({'environment': dict(os.environ), "
+        "'isolated': sys.flags.isolated, 'no_site': sys.flags.no_site, "
+        "'no_user_site': sys.flags.no_user_site}))"
+    )
+    result = subprocess.run(
+        [
+            *launch_arguments[:python_index],
+            sys.executable,
+            *hs.PYTHON_ISOLATION_FLAGS,
+            "-c",
+            probe,
+        ],
+        check=True,
+        text=True,
+        capture_output=True,
+        env=hostile_environment,
+    )
+    observed = json.loads(result.stdout)
+    environment = observed["environment"]
+    assert environment["PATH"] == hs.TRUSTED_SYSTEM_PATH
+    assert environment["HOME"] == str(config.account_home)
+    assert environment["LANG"] == hs.TRUSTED_LOCALE
+    assert environment["TMPDIR"] == hs.TRUSTED_TMPDIR
+    assert environment["SSH_AUTH_SOCK"] == "/tmp/test-agent.sock"
+    assert not startup_marker.exists()
+    assert observed["isolated"] == 1
+    assert observed["no_site"] == 1
+    assert observed["no_user_site"] == 1
+    for hostile_key in (
+        "PYTHONHOME",
+        "PYTHONPATH",
+        "DYLD_INSERT_LIBRARIES",
+        "GIT_EXEC_PATH",
+        "BASH_ENV",
+        "ENV",
+    ):
+        assert hostile_key not in environment
 
 
 def test_foreign_locator_and_launch_agent_fail_closed(tmp_path: Path) -> None:
@@ -1215,7 +1293,7 @@ def test_stale_reload_digest_advances_then_reloads_current_plist(tmp_path: Path)
     assert report["status"] == "ready"
     assert hs._load_reload_receipt(active)[1] == {}
     assert old_digest != hs._source_plist(hs._launch_agent_specs(active, fixture.home)[0])[0].digest
-    assert any(args[:2] == ["launchctl", "bootstrap"] for args, _cwd in runner.calls)
+    assert any(args[:2] == [hs.LAUNCHCTL_EXECUTABLE, "bootstrap"] for args, _cwd in runner.calls)
 
 
 def test_reload_receipt_write_rejects_concurrent_valid_replacement(tmp_path: Path) -> None:
@@ -1264,7 +1342,7 @@ def test_plist_source_drift_after_plan_fails_before_service_reload(tmp_path: Pat
             env: Mapping[str, str] | None = None,
         ) -> subprocess.CompletedProcess[str]:
             args = list(argv)
-            if args[:2] == ["launchctl", "print"] and not self.changed:
+            if args[:2] == [hs.LAUNCHCTL_EXECUTABLE, "print"] and not self.changed:
                 self.changed = True
                 active.launch_agent_source.write_bytes(
                     active.launch_agent_source.read_bytes().replace(
@@ -1279,7 +1357,11 @@ def test_plist_source_drift_after_plan_fails_before_service_reload(tmp_path: Pat
         _apply_ready(fixture, runner)
     assert control_spec.destination.read_bytes() == installed_before
     assert not any(
-        args[:2] in (["launchctl", "bootout"], ["launchctl", "bootstrap"])
+        args[:2]
+        in (
+            [hs.LAUNCHCTL_EXECUTABLE, "bootout"],
+            [hs.LAUNCHCTL_EXECUTABLE, "bootstrap"],
+        )
         for args, _cwd in runner.calls
     )
 
@@ -1342,7 +1424,11 @@ def test_launchctl_same_path_and_arguments_with_extra_behavior_is_blocked(
     assert check["status"] == "blocked"
     assert expected_field in check["detail"]
     assert not any(
-        args[:2] in (["launchctl", "bootout"], ["launchctl", "bootstrap"])
+        args[:2]
+        in (
+            [hs.LAUNCHCTL_EXECUTABLE, "bootout"],
+            [hs.LAUNCHCTL_EXECUTABLE, "bootstrap"],
+        )
         for args, _cwd in runner.calls[calls_before_status:]
     )
 
@@ -1481,7 +1567,11 @@ def test_launchctl_same_label_foreign_definition_is_blocked(tmp_path: Path) -> N
     assert "unexpected definition" in check["detail"]
     assert "ProgramArguments" in check["detail"]
     assert not any(
-        args[:2] in (["launchctl", "bootout"], ["launchctl", "bootstrap"])
+        args[:2]
+        in (
+            [hs.LAUNCHCTL_EXECUTABLE, "bootout"],
+            [hs.LAUNCHCTL_EXECUTABLE, "bootstrap"],
+        )
         for args, _cwd in runner.calls[calls_before_status:]
     )
 
@@ -1552,12 +1642,12 @@ def test_service_restore_is_gated_per_label(tmp_path: Path, other_was_loaded: bo
     assert runner.loaded[control.label] is True
     assert runner.loaded[weekly.label] is other_was_loaded
     assert any(
-        args[:2] == ["launchctl", "bootout"] and args[2].endswith(weekly.label)
+        args[:2] == [hs.LAUNCHCTL_EXECUTABLE, "bootout"] and args[2].endswith(weekly.label)
         for args, _cwd in runner.calls
     )
     if other_was_loaded:
         assert any(
-            args[:2] == ["launchctl", "bootstrap"]
+            args[:2] == [hs.LAUNCHCTL_EXECUTABLE, "bootstrap"]
             and Path(args[-1]).name == weekly.destination.name
             for args, _cwd in runner.calls
         )
@@ -1757,6 +1847,13 @@ def test_manifest_identity_stamp_names_python_and_zero_age_guards(tmp_path: Path
             historical=True,
             weekly=True,
         )
+    with pytest.raises(hs.SetupError, match="does not match host_setup.account_home"):
+        hs.status_setup(
+            fixture.config,
+            tmp_path / "other-home",
+            FakeRunner(),
+            no_launchctl=True,
+        )
     unsafe_repo = fixture.control_source / "config" / "unsafe-repo.toml"
     unsafe_repo.write_text(
         fixture.config.path.read_text().replace(
@@ -1863,6 +1960,137 @@ def test_git_and_helper_environments_disable_executable_fsmonitor(tmp_path: Path
         for index in range(int(helper_environment["GIT_CONFIG_COUNT"]))
     }
     assert overrides["core.fsmonitor"] == "false"
+    assert overrides["core.sshCommand"] == hs.SSH_EXECUTABLE
+
+
+def test_command_boundaries_use_fixed_executables_and_closed_environments(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _build_host(tmp_path)
+    active = _active(fixture)
+    hostile = str(tmp_path / "hostile-tools")
+    monkeypatch.setenv("PATH", f"{hostile}:/usr/bin:/bin")
+    monkeypatch.setenv("HOME", str(tmp_path / "preserved-home"))
+    monkeypatch.setenv("LANG", "en_GB.UTF-8")
+    monkeypatch.setenv("TMPDIR", str(tmp_path / "preserved-tmp"))
+    monkeypatch.setenv("GIT_EXEC_PATH", hostile)
+    monkeypatch.setenv("GIT_SSH_COMMAND", f"{hostile}/ssh")
+    monkeypatch.setenv("PYTHONPATH", hostile)
+    monkeypatch.setenv("DYLD_INSERT_LIBRARIES", f"{hostile}/inject.dylib")
+    monkeypatch.setenv("SSH_ASKPASS", f"{hostile}/askpass")
+    runner = FakeRunner()
+
+    assert hs._check_python(active, runner).status == "ready"
+    assert not hs._query_service(active.launch_agent_label, runner).loaded
+    helper_result = hs._run_helper(
+        active,
+        active.main_manifest,
+        ["status", "--repo", "alpha"],
+        runner,
+    )
+    assert helper_result.returncode == 0
+
+    version_index = next(
+        index
+        for index, (args, _cwd) in enumerate(runner.calls)
+        if args == [str(active.python_executable), *hs.PYTHON_ISOLATION_FLAGS, "--version"]
+    )
+    launchctl_index = next(
+        index
+        for index, (args, _cwd) in enumerate(runner.calls)
+        if args[:2] == [hs.LAUNCHCTL_EXECUTABLE, "print"]
+    )
+    helper_index = next(
+        index
+        for index, (args, _cwd) in enumerate(runner.calls)
+        if str(active.workspace_helper) in args
+    )
+    assert runner.calls[launchctl_index][0][0] == hs.LAUNCHCTL_EXECUTABLE
+    assert runner.calls[helper_index][0][:5] == [
+        str(active.python_executable),
+        *hs.PYTHON_ISOLATION_FLAGS,
+        str(active.workspace_helper),
+    ]
+    base_environment = hs._trusted_process_environment()
+    assert runner.environments[version_index] == base_environment
+    assert runner.environments[launchctl_index] == base_environment
+    helper_environment = runner.environments[helper_index]
+    assert helper_environment == hs._git_environment(disable_hooks=False)
+    assert helper_environment is not None
+    assert helper_environment["PATH"] == hs.TRUSTED_SYSTEM_PATH
+    assert helper_environment["HOME"] == hs._trusted_account_home()
+    assert helper_environment["HOME"] != str(tmp_path / "preserved-home")
+    assert helper_environment["LANG"] == "en_GB.UTF-8"
+    assert helper_environment["TMPDIR"] == str(tmp_path / "preserved-tmp")
+    assert helper_environment["GIT_SSH"] == hs.SSH_EXECUTABLE
+    for hostile_key in (
+        "GIT_EXEC_PATH",
+        "GIT_SSH_COMMAND",
+        "PYTHONPATH",
+        "DYLD_INSERT_LIBRARIES",
+        "SSH_ASKPASS",
+    ):
+        assert hostile_key not in helper_environment
+
+
+def test_direct_git_uses_absolute_binary_and_closed_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _build_host(tmp_path)
+    mirror = fixture.config.cache_root / "repos" / "alpha"
+    captured: dict[str, Any] = {}
+
+    def capture_run(argv: Sequence[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        captured["argv"] = list(argv)
+        captured["env"] = dict(kwargs["env"])
+        return subprocess.CompletedProcess(list(argv), 0, ".git\n", "")
+
+    monkeypatch.setattr(hs.subprocess, "run", capture_run)
+    result = hs._run_git(mirror, "rev-parse", "--git-dir")
+
+    assert result.stdout == ".git\n"
+    assert captured["argv"] == [hs.GIT_EXECUTABLE, "rev-parse", "--git-dir"]
+    assert captured["env"] == hs._git_environment(disable_hooks=True)
+
+
+def test_hostile_path_shim_cannot_intercept_direct_or_delegated_git(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    helper_source = Path(
+        "/Users/hoteng/Program/GitHub/Joey-Tools/codex-workspace/scripts/codex_workspace.py"
+    )
+    if not helper_source.is_file():
+        pytest.skip("host workspace helper is unavailable")
+    fixture = _build_host(tmp_path)
+    shutil.copy2(helper_source, fixture.config.workspace_helper)
+    active = replace(_active(fixture), python_executable=Path(sys.executable))
+    hostile_root = tmp_path / "hostile-path"
+    hostile_root.mkdir()
+    marker = tmp_path / "hostile-git-invoked"
+    shim = hostile_root / "git"
+    shim.write_text(
+        f'#!/bin/sh\nprintf invoked > "{marker}"\nexit 97\n',
+        encoding="utf-8",
+    )
+    shim.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{hostile_root}:{os.environ['PATH']}")
+    monkeypatch.setenv("GIT_EXEC_PATH", str(hostile_root))
+
+    mirror = active.cache_root / "repos" / "alpha"
+    direct = hs._run_git(mirror, "rev-parse", "--git-dir")
+    delegated = hs._run_helper(
+        active,
+        active.main_manifest,
+        ["status", "--repo", "alpha"],
+        hs.CommandRunner(timeout_seconds=10),
+    )
+
+    assert direct.stdout.strip() == ".git"
+    assert delegated.returncode == 0
+    assert not marker.exists()
 
 
 @pytest.mark.parametrize("unsafe_state", ["dirty", "wrong-branch", "wrong-remote", "diverged"])

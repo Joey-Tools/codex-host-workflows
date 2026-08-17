@@ -7,7 +7,16 @@
     <string>com.hoteng.codex.daily-skill-friction-weekly-prefetch</string>
     <key>ProgramArguments</key>
     <array>
+        <string>/bin/sh</string>
+        <string>-p</string>
+        <string>-c</string>
+        <string>account_home=$1; shift; if [ -n "${SSH_AUTH_SOCK-}" ]; then exec /usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin "HOME=$account_home" LANG=en_US.UTF-8 TMPDIR=/tmp "SSH_AUTH_SOCK=$SSH_AUTH_SOCK" "$@"; fi; exec /usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin "HOME=$account_home" LANG=en_US.UTF-8 TMPDIR=/tmp "$@"</string>
+        <string>daily-skill-friction-clean-env</string>
+        <string>/Users/hoteng</string>
         <string>/Users/hoteng/.local/share/uv/python/cpython-3.14.2-macos-aarch64-none/bin/python3.14</string>
+        <string>-I</string>
+        <string>-B</string>
+        <string>-S</string>
         <string>/Users/hoteng/Program/GitHub/Joey-Tools/codex-workspace/.codex-local/daily-skill-friction/repos/codex-host-workflows/scripts/host_setup.py</string>
         <string>prefetch-weekly</string>
     </array>
@@ -29,7 +38,7 @@
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <string>/usr/bin:/bin:/usr/sbin:/sbin</string>
     </dict>
 </dict>
 </plist>

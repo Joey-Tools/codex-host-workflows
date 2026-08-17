@@ -26,10 +26,13 @@ superseded_by:
 - Bootstrap installs independent 02:45 control and Friday 06:30 paired-prefetch LaunchAgents without changing the existing 02:50 main prefetch.
 - Daily doctor binds both freshness stamps to clean current Git mirrors. Weekly doctor additionally requires the current digest-bound pair receipt.
 - Managed filesystem replacement, reload receipts, and service rollback fail closed on foreign targets or unsafe path ancestry.
+- Host control subprocesses use fixed system executables, isolated Python startup, and a manifest-bound account home under a rebuilt environment; writable `PATH` entries cannot substitute Git, SSH, launchctl, or Python startup behavior.
 - LaunchAgent readiness uses a closed behavior schema for the loaded service, including every calendar trigger, event channel, scheduling default, process type, and launch property; a foreign or behavior-augmented service reusing the managed label is blocked.
 - Control-state transactions bind every directory from the filesystem root through the state root by object identity, access policy, and parent-visible name before publishing a WAL commit.
+- External Weekly WAL outputs retain the original destination-parent identity and access-policy chain across recovery; missing, rebound, or unsafe parents are never recreated or silently adopted.
 - Daily completion derives its created, updated, unchanged, and dormant case counts from the exact validated stage and dormancy receipts, including WAL recovery.
 - A case absent from control state can enter only as `watching` or `proposed`; `source_kind`, including `legacy-migration`, cannot import an approval, implementation, terminal state, or other lifecycle authority.
+- Weekly selection has no count-based candidate cap, but an immutable helper-generated preflight receipt must prove the exact draft fits the publication and WAL byte envelopes before a later Joey approval can bind it; the old implicit 4 MiB post-approval failure is not retained.
 - The redesigned Daily path is evidence-only. Publication and repair happen in the explicit Weekly path, with separate approval boundaries for creating changes, pushing, and opening a PR.
 - The existing private overlay remains independently installed and is not absorbed into this host manifest. Host-only control can be removed without changing overlay installation; each later squash commit must describe the concrete friction it addresses so a no-longer-needed repair can be identified and reverted.
 
