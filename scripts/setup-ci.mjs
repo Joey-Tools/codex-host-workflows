@@ -422,7 +422,7 @@ function buildPackagePatch(selected) {
   }
 
   return {
-    name: 'replace-me',
+    name: '@joey-tools/codex-host-workflows',
     version: '0.1.0',
     private: true,
     type: 'module',
@@ -925,6 +925,7 @@ out/
 target/
 coverage/
 .venv/
+tests/fixtures/ledger_authority/**
 `;
 }
 
@@ -992,8 +993,9 @@ function markdownlintConfig() {
   "config": {
     "default": true,
     "MD013": false,
+    "MD025": false,
   },
-  "globs": ["**/*.md", "!node_modules", "!dist", "!build", "!out", "!target"],
+  "globs": ["**/*.md", "!.venv", "!node_modules", "!dist", "!build", "!out", "!target"],
 }
 `;
 }
@@ -1009,7 +1011,7 @@ benchmark = [
 
   return `# ${GENERATED_BY}
 [project]
-name = "replace-me"
+name = "codex-host-workflows"
 version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = []
@@ -1024,6 +1026,7 @@ ${benchmarkGroup}
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+extend-exclude = ["tests/fixtures/ledger_authority"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
@@ -1031,6 +1034,22 @@ select = ["E", "F", "I", "UP", "B"]
 [tool.pyright]
 pythonVersion = "3.12"
 typeCheckingMode = "standard"
+venvPath = "."
+venv = ".venv"
+exclude = [
+  ".cache",
+  ".pytest_cache",
+  ".pyright",
+  ".ruff_cache",
+  ".venv",
+  "build",
+  "coverage",
+  "dist",
+  "node_modules",
+  "out",
+  "target",
+  "tests/fixtures/ledger_authority",
+]
 
 [tool.pytest.ini_options]
 addopts = "-ra"

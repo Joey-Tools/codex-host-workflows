@@ -1,0 +1,8 @@
+{
+  "config": {
+    "default": true,
+    "MD013": false,
+    "MD025": false,
+  },
+  "globs": ["**/*.md", "!.venv", "!node_modules", "!dist", "!build", "!out", "!target"],
+}

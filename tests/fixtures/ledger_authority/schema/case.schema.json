@@ -1,0 +1,933 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Joey-Tools/codex-skill-friction-ledger/schema/case.schema.json",
+  "title": "Daily Skill Friction case",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "revision",
+    "id",
+    "title",
+    "status",
+    "support",
+    "classification",
+    "source_kind",
+    "urgency",
+    "causal",
+    "evidence",
+    "evidence_last_seen",
+    "applicability",
+    "currentness_checked_at",
+    "scope",
+    "lifecycle",
+    "lifecycle_changed_at",
+    "repairs",
+    "effectiveness"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "revision": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 1000000
+    },
+    "id": {
+      "$ref": "#/$defs/case_id"
+    },
+    "title": {
+      "type": "string",
+      "minLength": 8,
+      "maxLength": 160,
+      "pattern": "^[^\\r\\n]+$"
+    },
+    "status": {
+      "description": "Lifecycle state. Base-history validation permits closed to proposed only for a sealed same-case recurrence reopen.",
+      "enum": [
+        "watching",
+        "proposed",
+        "approved",
+        "implemented",
+        "observing",
+        "closed",
+        "dormant",
+        "superseded"
+      ]
+    },
+    "support": {
+      "enum": [
+        "novel",
+        "repeated"
+      ]
+    },
+    "classification": {
+      "enum": [
+        "repo-local",
+        "cross-workflow",
+        "global-invariant"
+      ]
+    },
+    "source_kind": {
+      "enum": [
+        "human-root",
+        "automation-derived",
+        "legacy-migration"
+      ]
+    },
+    "urgency": {
+      "$ref": "#/$defs/urgency"
+    },
+    "causal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "summary",
+        "first_observed_at",
+        "occurrence_count",
+        "root_task_count",
+        "workflow_count",
+        "repository_count",
+        "opportunity_count",
+        "causal_signature_count"
+      ],
+      "properties": {
+        "summary": {
+          "$ref": "#/$defs/long_summary"
+        },
+        "first_observed_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "occurrence_count": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 256
+        },
+        "root_task_count": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 256
+        },
+        "workflow_count": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 256
+        },
+        "repository_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 256
+        },
+        "opportunity_count": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 256
+        },
+        "causal_signature_count": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 256
+        }
+      }
+    },
+    "evidence": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 256,
+      "items": {
+        "$ref": "#/$defs/evidence"
+      }
+    },
+    "evidence_last_seen": {
+      "$ref": "#/$defs/timestamp"
+    },
+    "applicability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "state",
+        "summary"
+      ],
+      "properties": {
+        "state": {
+          "enum": [
+            "present",
+            "changed",
+            "absent",
+            "unknown"
+          ]
+        },
+        "summary": {
+          "$ref": "#/$defs/summary"
+        }
+      }
+    },
+    "currentness_checked_at": {
+      "$ref": "#/$defs/timestamp"
+    },
+    "scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "target_repository",
+        "global_rationale",
+        "global_invariant_kind"
+      ],
+      "properties": {
+        "target_repository": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/repository"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "global_rationale": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/long_summary"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "global_invariant_kind": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "authorization",
+            "data-integrity",
+            null
+          ]
+        }
+      }
+    },
+    "lifecycle": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "created_at",
+        "dormant_since",
+        "dormant_from_status",
+        "superseded_by",
+        "revisit_when"
+      ],
+      "properties": {
+        "created_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "dormant_since": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/timestamp"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "dormant_from_status": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "watching",
+            "proposed",
+            null
+          ]
+        },
+        "superseded_by": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/case_id"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "revisit_when": {
+          "type": "array",
+          "maxItems": 12,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 8,
+            "maxLength": 240,
+            "pattern": "^[^\\r\\n]+$"
+          }
+        }
+      }
+    },
+    "lifecycle_changed_at": {
+      "$ref": "#/$defs/timestamp"
+    },
+    "repairs": {
+      "type": "array",
+      "maxItems": 64,
+      "items": {
+        "$ref": "#/$defs/repair"
+      }
+    },
+    "effectiveness": {
+      "$ref": "#/$defs/effectiveness"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "classification": {
+            "const": "repo-local"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "scope": {
+            "properties": {
+              "target_repository": {
+                "$ref": "#/$defs/repository"
+              },
+              "global_rationale": {
+                "type": "null"
+              },
+              "global_invariant_kind": {
+                "type": "null"
+              }
+            }
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "scope": {
+            "properties": {
+              "global_rationale": {
+                "$ref": "#/$defs/long_summary"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "repairs": {
+            "minItems": 1
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "effectiveness": {
+            "properties": {
+              "method": {
+                "enum": [
+                  "deterministic",
+                  "behavioral",
+                  "both"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "enum": [
+              "approved",
+              "implemented",
+              "observing",
+              "closed"
+            ]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "repairs": {
+            "minItems": 1
+          },
+          "effectiveness": {
+            "properties": {
+              "method": {
+                "enum": [
+                  "deterministic",
+                  "behavioral",
+                  "both"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "classification": {
+            "const": "cross-workflow"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "causal": {
+            "properties": {
+              "root_task_count": {
+                "minimum": 2
+              }
+            },
+            "anyOf": [
+              {
+                "properties": {
+                  "workflow_count": {
+                    "minimum": 2
+                  }
+                }
+              },
+              {
+                "properties": {
+                  "repository_count": {
+                    "minimum": 2
+                  }
+                }
+              }
+            ]
+          },
+          "scope": {
+            "properties": {
+              "global_invariant_kind": {
+                "type": "null"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "classification": {
+            "const": "global-invariant"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "scope": {
+            "properties": {
+              "global_invariant_kind": {
+                "enum": [
+                  "authorization",
+                  "data-integrity"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "source_kind": {
+            "const": "automation-derived"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "evidence": {
+            "contains": {
+              "properties": {
+                "signal_type": {
+                  "const": "explicit-human-correction"
+                }
+              },
+              "required": [
+                "signal_type"
+              ]
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "dormant"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "lifecycle": {
+            "properties": {
+              "dormant_since": {
+                "$ref": "#/$defs/timestamp"
+              },
+              "dormant_from_status": {
+                "enum": [
+                  "watching",
+                  "proposed"
+                ]
+              },
+              "revisit_when": {
+                "minItems": 1
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "urgency": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "level",
+        "reason",
+        "source_event_ids"
+      ],
+      "properties": {
+        "level": {
+          "enum": [
+            "normal",
+            "high-signal"
+          ]
+        },
+        "reason": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "data-loss-or-corruption",
+            "recovery-boundary-failure",
+            "credential-or-private-data-exposure",
+            "unauthorized-access",
+            "unauthorized-irreversible-external-side-effect",
+            "material-authority-boundary-breach",
+            null
+          ]
+        },
+        "source_event_ids": {
+          "type": "array",
+          "maxItems": 16,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/stable_id"
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "level": {
+                "const": "high-signal"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "reason": {
+                "type": "string"
+              },
+              "source_event_ids": {
+                "minItems": 1
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "reason": {
+                "type": "null"
+              },
+              "source_event_ids": {
+                "maxItems": 0
+              }
+            }
+          }
+        }
+      ]
+    },
+    "case_id": {
+      "type": "string",
+      "pattern": "^DSF-[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]{1,6})?Z$"
+    },
+    "date": {
+      "type": "string",
+      "format": "date",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"
+    },
+    "summary": {
+      "type": "string",
+      "minLength": 8,
+      "maxLength": 500,
+      "pattern": "^[^\\r\\n]+$"
+    },
+    "long_summary": {
+      "type": "string",
+      "minLength": 16,
+      "maxLength": 800,
+      "pattern": "^[^\\r\\n]+$"
+    },
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "stable_id": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 200,
+      "pattern": "^[A-Za-z][A-Za-z0-9+.-]*:[^\\s]+$"
+    },
+    "commit": {
+      "type": "string",
+      "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$"
+    },
+    "repository": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 160,
+      "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"
+    },
+    "pull_request_url": {
+      "type": "string",
+      "minLength": 20,
+      "maxLength": 240,
+      "pattern": "^https://github\\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/[1-9][0-9]*$"
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "root_task_id",
+        "workflow_id",
+        "opportunity_id",
+        "causal_signature",
+        "observed_at",
+        "signal_type",
+        "source_event_ids",
+        "source_digest",
+        "summary",
+        "repository"
+      ],
+      "properties": {
+        "root_task_id": {
+          "$ref": "#/$defs/stable_id"
+        },
+        "workflow_id": {
+          "$ref": "#/$defs/stable_id"
+        },
+        "opportunity_id": {
+          "$ref": "#/$defs/stable_id"
+        },
+        "causal_signature": {
+          "$ref": "#/$defs/digest"
+        },
+        "observed_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "signal_type": {
+          "enum": [
+            "explicit-human-correction",
+            "repeated-retry",
+            "manual-workaround",
+            "blocked-operation",
+            "unexpected-result",
+            "policy-mismatch",
+            "validation-failure"
+          ]
+        },
+        "source_event_ids": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 16,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/stable_id"
+          }
+        },
+        "source_digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "summary": {
+          "type": "string",
+          "minLength": 8,
+          "maxLength": 400,
+          "pattern": "^[^\\r\\n]+$"
+        },
+        "repository": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/repository"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "repair": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "repository",
+        "action",
+        "state",
+        "problem_statement",
+        "change_summary",
+        "pull_request_url",
+        "commit",
+        "commit_trailer",
+        "installed_on",
+        "removed_on",
+        "replaces_repair_id"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 12,
+          "pattern": "^R[1-9][0-9]*$"
+        },
+        "repository": {
+          "$ref": "#/$defs/repository"
+        },
+        "action": {
+          "enum": [
+            "install",
+            "amend",
+            "remove-forward"
+          ]
+        },
+        "state": {
+          "enum": [
+            "planned",
+            "open",
+            "merged",
+            "superseded"
+          ]
+        },
+        "problem_statement": {
+          "$ref": "#/$defs/long_summary"
+        },
+        "change_summary": {
+          "$ref": "#/$defs/summary"
+        },
+        "pull_request_url": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/pull_request_url"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "commit": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/commit"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "commit_trailer": {
+          "$ref": "#/$defs/trailer"
+        },
+        "installed_on": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/date"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "removed_on": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/date"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "replaces_repair_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 2,
+          "maxLength": 12,
+          "pattern": "^R[1-9][0-9]*$"
+        }
+      }
+    },
+    "trailer": {
+      "type": "string",
+      "pattern": "^Friction-Case: DSF-[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "effectiveness": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "method",
+        "state",
+        "checked_on",
+        "summary",
+        "deterministic",
+        "behavioral"
+      ],
+      "properties": {
+        "method": {
+          "enum": [
+            "none",
+            "deterministic",
+            "behavioral",
+            "both"
+          ]
+        },
+        "state": {
+          "enum": [
+            "not-started",
+            "monitoring",
+            "passed",
+            "failed"
+          ]
+        },
+        "checked_on": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/date"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "summary": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/summary"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "deterministic": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/deterministic"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "behavioral": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/behavioral"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "deterministic": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "test_ref",
+        "result",
+        "commit"
+      ],
+      "properties": {
+        "test_ref": {
+          "type": "string",
+          "minLength": 5,
+          "maxLength": 300,
+          "pattern": "^[^\\r\\n]+$"
+        },
+        "result": {
+          "enum": [
+            "pending",
+            "passed",
+            "failed"
+          ]
+        },
+        "commit": {
+          "$ref": "#/$defs/commit"
+        }
+      }
+    },
+    "behavioral": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "started_on",
+        "ended_on",
+        "relevant_opportunities",
+        "recurrences"
+      ],
+      "properties": {
+        "started_on": {
+          "$ref": "#/$defs/date"
+        },
+        "ended_on": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/date"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "relevant_opportunities": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000000
+        },
+        "recurrences": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000000
+        }
+      }
+    }
+  }
+}

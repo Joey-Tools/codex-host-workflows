@@ -9,3 +9,19 @@ out/
 target/
 __pycache__/
 *.py[cod]
+
+# >>> setup-ci generated ignores >>>
+*.log
+*.py[cod]
+.cache/
+.coverage
+.pyright/
+.pytest_cache/
+.ruff_cache/
+.venv/
+__pycache__/
+coverage/
+node_modules/
+# <<< setup-ci generated ignores <<<
+
+/docs/project_journal/INDEX.md

@@ -1,0 +1,7 @@
+interface:
+  display_name: 'Daily Skill Friction'
+  short_description: 'Audit and stage private Codex workflow friction'
+  default_prompt: 'Use $daily-skill-friction to run the requested evidence-first audit or publication-preparation mode.'
+
+policy:
+  allow_implicit_invocation: false
