@@ -76,6 +76,70 @@ def _init_mirror(path: Path, remote: Path, files: dict[str, bytes]) -> None:
     _commit_and_push(path, remote)
 
 
+def _forge_divergence_as_behind(
+    mirror: Path,
+    remote: Path,
+    updater: Path,
+    mechanism: str,
+) -> tuple[str, str]:
+    mirror.joinpath("local-only.txt").write_text("local\n", encoding="utf-8")
+    _git(mirror, "add", "local-only.txt")
+    _git(
+        mirror,
+        "-c",
+        "user.name=Host Setup Test",
+        "-c",
+        "user.email=host-setup@example.invalid",
+        "commit",
+        "-m",
+        "local divergence",
+    )
+    subprocess.run(
+        ["git", "clone", str(remote), str(updater)],
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+    updater.joinpath("remote-only.txt").write_text("remote\n", encoding="utf-8")
+    _commit_and_push(updater, remote, "remote divergence")
+    _git(mirror, "fetch", "origin")
+    local_head = _git(mirror, "rev-parse", "HEAD")
+    remote_head = _git(mirror, "rev-parse", "@{u}")
+
+    if mechanism == "graft":
+        mirror.joinpath(".git", "info", "grafts").write_text(
+            f"{remote_head} {local_head}\n",
+            encoding="ascii",
+        )
+    else:
+        remote_tree = _git(mirror, "rev-parse", f"{remote_head}^{{tree}}")
+        replacement = _git(
+            mirror,
+            "-c",
+            "user.name=Host Setup Test",
+            "-c",
+            "user.email=host-setup@example.invalid",
+            "commit-tree",
+            remote_tree,
+            "-p",
+            local_head,
+            "-m",
+            "forged replacement topology",
+        )
+        _git(mirror, "replace", remote_head, replacement)
+        if mechanism == "packed-replace":
+            _git(mirror, "pack-refs", "--all", "--prune")
+            replace_dir = mirror / ".git" / "refs" / "replace"
+            if replace_dir.is_dir():
+                replace_dir.rmdir()
+
+    assert _git(mirror, "rev-list", "--left-right", "--count", "HEAD...@{u}").split() == [
+        "0",
+        "1",
+    ]
+    return local_head, remote_head
+
+
 class FakeRunner(hs.CommandRunner):
     def __init__(
         self,
@@ -1961,6 +2025,8 @@ def test_git_and_helper_environments_disable_executable_fsmonitor(tmp_path: Path
     }
     assert overrides["core.fsmonitor"] == "false"
     assert overrides["core.sshCommand"] == hs.SSH_EXECUTABLE
+    assert helper_environment["GIT_NO_REPLACE_OBJECTS"] == "1"
+    assert helper_environment["GIT_GRAFT_FILE"] == "/dev/null"
 
 
 def test_command_boundaries_use_fixed_executables_and_closed_environments(
@@ -1985,7 +2051,7 @@ def test_command_boundaries_use_fixed_executables_and_closed_environments(
     assert not hs._query_service(active.launch_agent_label, runner).loaded
     helper_result = hs._run_helper(
         active,
-        active.main_manifest,
+        hs._load_main_manifest(active),
         ["status", "--repo", "alpha"],
         runner,
     )
@@ -2042,17 +2108,103 @@ def test_direct_git_uses_absolute_binary_and_closed_environment(
     mirror = fixture.config.cache_root / "repos" / "alpha"
     captured: dict[str, Any] = {}
 
-    def capture_run(argv: Sequence[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+    def capture_run(
+        _runner: hs.CommandRunner,
+        argv: Sequence[str],
+        **kwargs: Any,
+    ) -> subprocess.CompletedProcess[str]:
         captured["argv"] = list(argv)
         captured["env"] = dict(kwargs["env"])
         return subprocess.CompletedProcess(list(argv), 0, ".git\n", "")
 
-    monkeypatch.setattr(hs.subprocess, "run", capture_run)
+    monkeypatch.setattr(hs.CommandRunner, "run", capture_run)
     result = hs._run_git(mirror, "rev-parse", "--git-dir")
 
     assert result.stdout == ".git\n"
     assert captured["argv"] == [hs.GIT_EXECUTABLE, "rev-parse", "--git-dir"]
     assert captured["env"] == hs._git_environment(disable_hooks=True)
+
+
+def test_direct_git_output_cap_kills_descendant_group_and_prevents_late_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _build_host(tmp_path)
+    mirror = fixture.config.cache_root / "repos" / "alpha"
+    late_write = tmp_path / "git-output-limit-late-write"
+    grandchild_ready = tmp_path / "git-output-limit-grandchild.json"
+    grandchild = tmp_path / "git-output-limit-grandchild.py"
+    grandchild.write_text(
+        """import json, os, pathlib, signal, sys, time
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+ready = pathlib.Path(sys.argv[2])
+temporary = ready.with_suffix('.tmp')
+temporary.write_text(json.dumps({'pid': os.getpid(), 'pgid': os.getpgrp()}), encoding='utf-8')
+temporary.replace(ready)
+time.sleep(0.6)
+pathlib.Path(sys.argv[1]).write_text('late', encoding='utf-8')
+""",
+        encoding="utf-8",
+    )
+    fake_git = tmp_path / "git-output-limit"
+    fake_git.write_text(
+        f"""#!{sys.executable}
+import os, pathlib, signal, subprocess, sys, time
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+subprocess.Popen([
+    sys.executable,
+    {str(grandchild)!r},
+    {str(late_write)!r},
+    {str(grandchild_ready)!r},
+])
+deadline = time.monotonic() + 5
+while not pathlib.Path({str(grandchild_ready)!r}).is_file():
+    if time.monotonic() >= deadline:
+        sys.exit(91)
+    time.sleep(0.01)
+for _ in range(2048):
+    os.write(1, b'x' * 1024)
+time.sleep(5)
+""",
+        encoding="utf-8",
+    )
+    fake_git.chmod(0o755)
+    monkeypatch.setattr(hs, "GIT_EXECUTABLE", str(fake_git))
+    monkeypatch.setattr(hs, "COMMAND_TERM_GRACE_SECONDS", 0.1)
+    monkeypatch.setattr(hs, "COMMAND_KILL_GRACE_SECONDS", 1)
+
+    with pytest.raises(hs.CommandOutputLimitError) as captured:
+        hs._run_git(mirror, "status", "--porcelain=v1", "--untracked-files=all")
+
+    error = captured.value
+    assert error.output_limit_bytes == hs.MAX_COMMAND_OUTPUT_BYTES
+    assert error.captured_total_bytes == hs.MAX_COMMAND_OUTPUT_BYTES
+    readiness = json.loads(grandchild_ready.read_text(encoding="utf-8"))
+    pid = readiness["pid"]
+    process_group = readiness["pgid"]
+    assert isinstance(pid, int)
+    assert isinstance(process_group, int)
+    assert pid != process_group
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.01)
+    else:
+        pytest.fail(f"Git output-limit grandchild {pid} survived cleanup")
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline:
+        try:
+            os.killpg(process_group, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.01)
+    else:
+        pytest.fail(f"Git output-limit process group {process_group} survived cleanup")
+    time.sleep(0.65)
+    assert not late_write.exists()
 
 
 def test_hostile_path_shim_cannot_intercept_direct_or_delegated_git(
@@ -2083,7 +2235,7 @@ def test_hostile_path_shim_cannot_intercept_direct_or_delegated_git(
     direct = hs._run_git(mirror, "rev-parse", "--git-dir")
     delegated = hs._run_helper(
         active,
-        active.main_manifest,
+        hs._load_main_manifest(active),
         ["status", "--repo", "alpha"],
         hs.CommandRunner(timeout_seconds=10),
     )
@@ -2229,6 +2381,114 @@ def test_ensure_semantic_precheck_allows_clean_behind_mirror(tmp_path: Path) -> 
 
     assert check.status == "ready"
     assert "ahead=0 behind=1" in check.detail
+
+
+@pytest.mark.parametrize("mechanism", ["loose-replace", "packed-replace", "graft"])
+def test_ensure_rejects_topology_replacement_that_masks_divergence(
+    tmp_path: Path,
+    mechanism: str,
+) -> None:
+    fixture = _build_host(tmp_path)
+    active = _active(fixture)
+    manifest = hs._load_main_manifest(active)
+    alpha = manifest.repos[0]
+    mirror = manifest.repo_path(alpha)
+    _forge_divergence_as_behind(
+        mirror,
+        Path(alpha.url),
+        tmp_path / f"{mechanism}-updater",
+        mechanism,
+    )
+
+    topology = next(
+        check
+        for check in hs._git_admin_path_checks(mirror, prefix="test")
+        if check.name == "test-topology-replacements"
+    )
+    assert topology.status == "blocked"
+    assert {
+        "loose-replace": "loose replacement refs",
+        "packed-replace": "packed replacement ref",
+        "graft": "graft file",
+    }[mechanism] in topology.detail
+    semantic = hs._ensure_mirror_precheck(manifest, alpha)
+    assert semantic.status == "blocked"
+    assert "ahead=1 behind=1" in semantic.detail
+
+    runner = FakeRunner()
+    with pytest.raises(hs.SetupError, match="initial preflight blocked"):
+        hs.apply_setup(
+            fixture.config,
+            fixture.home,
+            runner,
+            ensure=True,
+            no_launchctl=True,
+        )
+
+    assert not any(
+        any(command in args for command in ("ensure", "prefetch", "status"))
+        for args, _cwd in runner.calls
+    )
+
+
+@pytest.mark.parametrize("entrypoint", ["status", "prefetch"])
+def test_status_and_prefetch_reject_grafts_before_helper_mutation(
+    tmp_path: Path,
+    entrypoint: str,
+) -> None:
+    fixture = _build_host(tmp_path)
+    active = _active(fixture)
+    manifests = (
+        hs.load_workspace_manifest(
+            active.control_mirror_manifest,
+            label="control test manifest",
+            expected_cache_root=active.cache_root,
+        ),
+        hs._load_main_manifest(active),
+    )
+    for manifest in manifests:
+        for repo in manifest.repos:
+            manifest.repo_path(repo).joinpath(".git", "info", "grafts").write_text(
+                f"{_git(manifest.repo_path(repo), 'rev-parse', 'HEAD')}\n",
+                encoding="ascii",
+            )
+    runner = FakeRunner()
+
+    if entrypoint == "status":
+        report = hs.status_setup(active, fixture.home, runner, no_launchctl=True)
+        assert report["status"] == "blocked"
+    else:
+        report, _refreshed = hs.prefetch_weekly(active, runner)
+        assert report["status"] == "blocked"
+
+    assert not any(
+        any(command in args for command in ("ensure", "prefetch", "status"))
+        for args, _cwd in runner.calls
+    )
+
+
+def test_helper_revalidates_replacement_absence_after_invocation(tmp_path: Path) -> None:
+    fixture = _build_host(tmp_path)
+    active = _active(fixture)
+    manifest = hs._load_main_manifest(active)
+    mirror = manifest.repo_path(manifest.repos[0])
+
+    def install_graft(_args: list[str]) -> None:
+        head = _git(mirror, "rev-parse", "HEAD")
+        mirror.joinpath(".git", "info", "grafts").write_text(
+            f"{head}\n",
+            encoding="ascii",
+        )
+
+    runner = FakeRunner(on_helper=install_graft)
+    with pytest.raises(hs.SetupError, match="Git graft file .* is present"):
+        hs._run_workspace_status(active, manifest, runner)
+
+    assert any("status" in args for args, _cwd in runner.calls)
+    helper_environment = runner.environments[-1]
+    assert helper_environment is not None
+    assert helper_environment["GIT_NO_REPLACE_OBJECTS"] == "1"
+    assert helper_environment["GIT_GRAFT_FILE"] == "/dev/null"
 
 
 @pytest.mark.parametrize("returncode", [0, 17])

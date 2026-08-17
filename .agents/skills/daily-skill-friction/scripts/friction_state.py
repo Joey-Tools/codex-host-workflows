@@ -335,7 +335,7 @@ def _read_fd_stable(
 
 
 def _open_external_stable(path: Path, *, max_bytes: int = MAX_JSON_BYTES) -> tuple[bytes, str]:
-    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
+    flags = os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC
     try:
         fd = os.open(path, flags)
     except FileNotFoundError:
@@ -2271,6 +2271,27 @@ def _validate_external_parent_binding(value: Any, path: Path) -> list[dict[str, 
     return normalized
 
 
+def _normalize_external_output_outside_state_root(state_root: Path, path: Path) -> Path:
+    """Return one canonical output path only when it is outside managed state.
+
+    The protected property is the managed state root's object identity and
+    namespace layout: an external after-image must never name the root itself or
+    any entry beneath it.  This lexical check handles canonical ``..`` paths;
+    descriptor-bound identity is checked separately once the state root is open.
+    """
+
+    root = Path(os.path.abspath(os.fspath(state_root)))
+    absolute = Path(os.path.abspath(os.fspath(path)))
+    try:
+        absolute.relative_to(root)
+    except ValueError:
+        return absolute
+    _fail(
+        "output-inside-state-root",
+        f"external output must be outside the managed state root: {absolute}",
+    )
+
+
 @contextmanager
 def _bound_external_parent(
     path: Path, expected_binding: Any | None = None
@@ -2344,6 +2365,76 @@ def _bound_external_parent(
         store.close()
 
 
+def _validate_external_output_target(
+    store: StateStore,
+    path: Path,
+    *,
+    parent: StateStore | None = None,
+) -> Path:
+    """Reject lexical descendants and descriptor aliases of managed state.
+
+    Device, inode, and file type are the only compared signals because they
+    define object identity.  Directory timestamps, sizes, and link counts are
+    intentionally irrelevant: ordinary child-entry churn may change them
+    without moving an external output into managed state.
+    """
+
+    absolute = _normalize_external_output_outside_state_root(store.root, path)
+    store._bind_state_chain("external output boundary validation")
+    root_info = os.fstat(store.root_fd)
+    root_identity = (
+        root_info.st_dev,
+        root_info.st_ino,
+        stat.S_IFMT(root_info.st_mode),
+    )
+
+    def reject_descriptor_alias(bound_parent: StateStore) -> None:
+        parent_binding = _external_parent_binding(bound_parent)
+        if any(
+            (
+                entry["device"],
+                entry["inode"],
+                entry["file_type"],
+            )
+            == root_identity
+            for entry in parent_binding
+        ):
+            _fail(
+                "output-inside-state-root",
+                f"external output parent resolves inside the managed state root: {absolute}",
+            )
+        try:
+            target_info = os.stat(
+                absolute.name,
+                dir_fd=bound_parent.root_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            _fail(
+                "external-output-revalidation-failed",
+                f"could not inspect external output target {absolute}: {exc}",
+            )
+        target_identity = (
+            target_info.st_dev,
+            target_info.st_ino,
+            stat.S_IFMT(target_info.st_mode),
+        )
+        if target_identity == root_identity:
+            _fail(
+                "output-inside-state-root",
+                f"external output resolves to the managed state root: {absolute}",
+            )
+
+    if parent is not None:
+        reject_descriptor_alias(parent)
+    else:
+        with _bound_external_parent(absolute) as (bound_parent, _):
+            reject_descriptor_alias(bound_parent)
+    return absolute
+
+
 def _read_optional_external(parent: StateStore, target: Path) -> tuple[bytes, str] | None:
     leaf = Path(target.name)
     if not parent.exists(leaf):
@@ -2352,9 +2443,9 @@ def _read_optional_external(parent: StateStore, target: Path) -> tuple[bytes, st
 
 
 def _planned_external_write(
-    path: Path, value: Mapping[str, Any], *, immutable: bool
+    store: StateStore, path: Path, value: Mapping[str, Any], *, immutable: bool
 ) -> dict[str, Any]:
-    absolute = Path(os.path.abspath(os.fspath(path)))
+    absolute = _normalize_external_output_outside_state_root(store.root, path)
     payload = _canonical_bytes(value)
     if len(payload) > MAX_PUBLICATION_JSON_BYTES:
         _fail(
@@ -2363,6 +2454,7 @@ def _planned_external_write(
         )
     after_digest = hashlib.sha256(payload).hexdigest()
     with _bound_external_parent(absolute) as (parent, parent_binding):
+        _validate_external_output_target(store, absolute, parent=parent)
         current = _read_optional_external(parent, absolute)
         if immutable and current is not None and current[1] != after_digest:
             _fail("immutable-output-exists", f"immutable output already conflicts: {absolute}")
@@ -2378,6 +2470,7 @@ def _planned_external_write(
 
 
 def _validate_wal_intent(
+    store: StateStore,
     intent: Mapping[str, Any],
     expected_operation: str,
     *,
@@ -2435,11 +2528,6 @@ def _validate_wal_intent(
             expected_fields.add("parent_binding")
             bound_external = True
         elif scope == "external":
-            if not allow_committed_legacy_external:
-                _fail(
-                    "legacy-external-wal-unbound",
-                    "pending legacy external WAL has no recoverable parent identity binding",
-                )
             legacy_external = True
         _exact_fields(
             write,
@@ -2490,6 +2578,15 @@ def _validate_wal_intent(
     body = {key: value for key, value in intent.items() if key != "intent_digest"}
     if intent["intent_digest"] != _digest(body):
         _fail("invalid-wal", "WAL intent digest mismatch")
+    for raw_write in writes:
+        write = _require_object(raw_write, "wal.write")
+        if write["scope"] == "external":
+            _validate_external_output_target(store, Path(write["path"]))
+    if legacy_external and not allow_committed_legacy_external:
+        _fail(
+            "legacy-external-wal-unbound",
+            "pending legacy external WAL has no recoverable parent identity binding",
+        )
     return legacy_external
 
 
@@ -2759,6 +2856,7 @@ def _run_transaction(
     if store.exists(intent_path):
         intent, _ = store.read_json(intent_path)
         legacy_external = _validate_wal_intent(
+            store,
             intent,
             operation,
             allow_committed_legacy_external=committed,
@@ -2779,6 +2877,7 @@ def _run_transaction(
             "result": dict(result),
         }
         intent = {**body, "intent_digest": _digest(body)}
+        _validate_wal_intent(store, intent, operation)
         intent_bytes = _canonical_bytes(intent)
         if (
             approved_intent_upper_bound is not None
@@ -2865,6 +2964,7 @@ def _recover_pending_wal(store: StateStore) -> None:
             candidate_commit = commit_paths.get(key)
             candidate_committed = candidate_commit is not None
             legacy_external = _validate_wal_intent(
+                store,
                 intent,
                 operation,
                 allow_committed_legacy_external=candidate_committed,
@@ -2912,6 +3012,7 @@ def _recover_pending_wal(store: StateStore) -> None:
             _fail("wal-layout-changed", f"WAL intent changed during recovery: {intent_path}")
         intent = current_intent
         _validate_wal_intent(
+            store,
             intent,
             operation,
             allow_committed_legacy_external=commit_path is not None,
@@ -2939,7 +3040,12 @@ def _require_committed_transaction(
         _fail("missing-authority-transaction", f"{operation} has no committed control transaction")
     intent, _ = store.read_json(intent_path)
     commit, _ = store.read_json(commit_path)
-    legacy_external = _validate_wal_intent(intent, operation, allow_committed_legacy_external=True)
+    legacy_external = _validate_wal_intent(
+        store,
+        intent,
+        operation,
+        allow_committed_legacy_external=True,
+    )
     _validate_wal_commit(commit, intent)
     if legacy_external:
         _verify_committed_legacy_external_after_images(intent)
@@ -3711,7 +3817,7 @@ def transition_dormant(state_root: Path, now: str) -> dict[str, Any]:
         intent_path, _ = _wal_paths("dormancy", natural_key)
         if store.exists(intent_path):
             intent, _ = store.read_json(intent_path)
-            _validate_wal_intent(intent, "dormancy")
+            _validate_wal_intent(store, intent, "dormancy")
             return _run_transaction(
                 store,
                 operation="dormancy",
@@ -4780,6 +4886,7 @@ def preflight_selection(state_root: Path, selection_draft_path: Path, now: str) 
 
 
 def weekly_plan(state_root: Path, selection_path: Path, output: Path, now: str) -> dict[str, Any]:
+    output = _normalize_external_output_outside_state_root(state_root, output)
     now_value = _timestamp(now, "now")
     selection = _load_json(selection_path, max_bytes=MAX_PUBLICATION_JSON_BYTES)
     selection_id, selected = _validate_selection(selection)
@@ -4796,6 +4903,7 @@ def weekly_plan(state_root: Path, selection_path: Path, output: Path, now: str) 
         "output": str(Path(os.path.abspath(os.fspath(output)))),
     }
     with _state_lock(state_root, create=False) as store:
+        _validate_external_output_target(store, output)
         _recover_pending_wal(store)
         preflight_intent = _require_committed_transaction(
             store, "selection-preflight", selection_id
@@ -4995,7 +5103,7 @@ def weekly_plan(state_root: Path, selection_path: Path, output: Path, now: str) 
             }
             active = {**active_body, "record_digest": _digest(active_body)}
             active_writes.append(_planned_write(store, active_relative, active, immutable=False))
-        output_write = _planned_external_write(output, plan, immutable=True)
+        output_write = _planned_external_write(store, output, plan, immutable=True)
         writes = [_planned_write(store, registry_relative, plan, immutable=True)]
         writes.extend(active_writes)
         writes.append(output_write)
@@ -5455,6 +5563,7 @@ def _validate_manifest(
 def finalize_publication(
     state_root: Path, plan_path: Path, prepared_path: Path, output: Path, now: str
 ) -> dict[str, Any]:
+    output = _normalize_external_output_outside_state_root(state_root, output)
     now_value = _timestamp(now, "now")
     plan = _load_json(plan_path, max_bytes=MAX_PUBLICATION_JSON_BYTES)
     plan_entries = _validate_plan(plan)
@@ -5481,6 +5590,7 @@ def finalize_publication(
     natural_key = f"{plan['selection_id']}:{plan['plan_digest']}"
 
     with _state_lock(state_root, create=False) as store:
+        _validate_external_output_target(store, output)
         _recover_pending_wal(store)
         intent_path, _ = _wal_paths("finalize-publication", natural_key)
         existing_finalize_intent: dict[str, Any] | None = None
@@ -5590,7 +5700,7 @@ def finalize_publication(
                 "invalid-plan-resource-envelope",
                 "manifest exceeds the preapproved publication envelope",
             )
-        output_write = _planned_external_write(output, manifest, immutable=True)
+        output_write = _planned_external_write(store, output, manifest, immutable=True)
         prepared_relative = Path("publication") / "prepared" / f"{plan['selection_id']}.json"
         result = {
             "version": VERSION,

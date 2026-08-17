@@ -229,6 +229,17 @@ class WorkspaceManifest:
 
 
 @dataclasses.dataclass(frozen=True)
+class GitTopologyGuard:
+    """Bind the administrative parents that must remain replacement-free."""
+
+    repository: Path
+    repository_binding: Binding | None
+    git_dir_binding: Binding | None
+    refs_binding: Binding | None
+    info_binding: Binding | None
+
+
+@dataclasses.dataclass(frozen=True)
 class HostConfig:
     path: Path
     manifest_snapshot: FileSnapshot
@@ -1781,6 +1792,241 @@ def _regular_file_check(
     return Check(name, "ready", f"{path}; sha256={snapshot.digest}")
 
 
+def _open_optional_child_directory(
+    parent_fd: int,
+    parent_path: Path,
+    name: str,
+    *,
+    label: str,
+) -> tuple[int, Binding] | None:
+    """Open one administrative child without following or accepting replacement."""
+
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    flags |= getattr(os, "O_NONBLOCK", 0)
+    try:
+        descriptor = os.open(name, flags, dir_fd=parent_fd)
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise SetupError(
+            f"{label} could not be opened without following links: "
+            f"{error.strerror or type(error).__name__}"
+        ) from error
+    try:
+        metadata = os.fstat(descriptor)
+        _validate_directory_metadata(
+            metadata,
+            label=label,
+            require_current_owner=True,
+        )
+        path_metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        binding = Binding.from_stat(metadata)
+        if _directory_binding_tuple(Binding.from_stat(path_metadata)) != _directory_binding_tuple(
+            binding
+        ):
+            raise SetupError(f"{label} was replaced while opening: {parent_path / name}")
+        return descriptor, binding
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _require_missing_git_admin_entry(parent_fd: int, name: str, *, label: str) -> None:
+    try:
+        os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        raise SetupError(
+            f"{label} absence could not be verified: {error.strerror or type(error).__name__}"
+        ) from error
+    raise SetupError(f"{label} is present")
+
+
+def _packed_refs_contains_replace_ref(data: bytes) -> bool:
+    for line in data.splitlines():
+        if not line or line.startswith((b"#", b"^")):
+            continue
+        fields = line.split(b" ", 1)
+        if len(fields) == 2 and fields[1].startswith(b"refs/replace/"):
+            return True
+    return False
+
+
+def _inspect_git_topology_replacements(
+    repository: Path,
+    *,
+    expected: GitTopologyGuard | None = None,
+) -> GitTopologyGuard:
+    """Reject Git topology substitution and bind its administrative parents.
+
+    Object identity and access policy are protected for the repository, ``.git``,
+    and any existing ``refs``/``info`` parents. Packed refs may legitimately be
+    rewritten by fetch, so only the absence of replacement refs is revalidated.
+    """
+
+    repository_fd, repository_binding = _open_real_directory(
+        repository,
+        label="Git topology repository",
+        require_current_owner=True,
+    )
+    git_dir_opened: tuple[int, Binding] | None = None
+    refs_opened: tuple[int, Binding] | None = None
+    info_opened: tuple[int, Binding] | None = None
+    try:
+        if expected is not None and expected.repository_binding is not None:
+            if _directory_binding_tuple(repository_binding) != _directory_binding_tuple(
+                expected.repository_binding
+            ):
+                raise SetupError(
+                    f"Git topology repository identity or access policy changed: {repository}"
+                )
+        git_dir_opened = _open_optional_child_directory(
+            repository_fd,
+            repository,
+            ".git",
+            label="Git topology .git directory",
+        )
+        if git_dir_opened is None:
+            raise SetupError(f"Git topology .git directory is missing: {repository / '.git'}")
+        git_fd, git_dir_binding = git_dir_opened
+        if expected is not None and expected.git_dir_binding is not None:
+            if _directory_binding_tuple(git_dir_binding) != _directory_binding_tuple(
+                expected.git_dir_binding
+            ):
+                raise SetupError(
+                    f"Git topology .git identity or access policy changed: {repository / '.git'}"
+                )
+
+        refs_opened = _open_optional_child_directory(
+            git_fd,
+            repository / ".git",
+            "refs",
+            label="Git topology refs directory",
+        )
+        info_opened = _open_optional_child_directory(
+            git_fd,
+            repository / ".git",
+            "info",
+            label="Git topology info directory",
+        )
+        refs_binding = refs_opened[1] if refs_opened is not None else None
+        info_binding = info_opened[1] if info_opened is not None else None
+        if expected is not None and expected.refs_binding is not None:
+            if refs_binding is None or _directory_binding_tuple(
+                refs_binding
+            ) != _directory_binding_tuple(expected.refs_binding):
+                raise SetupError(
+                    f"Git topology refs identity or access policy changed: "
+                    f"{repository / '.git' / 'refs'}"
+                )
+        if expected is not None and expected.info_binding is not None:
+            if info_binding is None or _directory_binding_tuple(
+                info_binding
+            ) != _directory_binding_tuple(expected.info_binding):
+                raise SetupError(
+                    f"Git topology info identity or access policy changed: "
+                    f"{repository / '.git' / 'info'}"
+                )
+
+        if refs_opened is not None:
+            _require_missing_git_admin_entry(
+                refs_opened[0],
+                "replace",
+                label=f"Git loose replacement refs path {repository / '.git' / 'refs' / 'replace'}",
+            )
+        if info_opened is not None:
+            _require_missing_git_admin_entry(
+                info_opened[0],
+                "grafts",
+                label=f"Git graft file {repository / '.git' / 'info' / 'grafts'}",
+            )
+        packed_refs = _snapshot_at(
+            git_fd,
+            "packed-refs",
+            max_bytes=MAX_CONFIG_BYTES,
+            label=f"Git packed refs {repository / '.git' / 'packed-refs'}",
+            missing_ok=True,
+        )
+        if packed_refs is not None and _packed_refs_contains_replace_ref(packed_refs.data):
+            raise SetupError(
+                f"Git packed replacement ref is present: {repository / '.git' / 'packed-refs'}"
+            )
+
+        _directory_path_matches(
+            repository,
+            repository_binding,
+            label="Git topology repository",
+        )
+        _directory_path_matches(
+            repository / ".git",
+            git_dir_binding,
+            label="Git topology .git directory",
+        )
+        if refs_opened is not None:
+            _directory_path_matches(
+                repository / ".git" / "refs",
+                refs_opened[1],
+                label="Git topology refs directory",
+            )
+            _require_missing_git_admin_entry(
+                refs_opened[0],
+                "replace",
+                label=f"Git loose replacement refs path {repository / '.git' / 'refs' / 'replace'}",
+            )
+        if info_opened is not None:
+            _directory_path_matches(
+                repository / ".git" / "info",
+                info_opened[1],
+                label="Git topology info directory",
+            )
+            _require_missing_git_admin_entry(
+                info_opened[0],
+                "grafts",
+                label=f"Git graft file {repository / '.git' / 'info' / 'grafts'}",
+            )
+        packed_refs_rebound = _snapshot_at(
+            git_fd,
+            "packed-refs",
+            max_bytes=MAX_CONFIG_BYTES,
+            label=f"Git packed refs {repository / '.git' / 'packed-refs'}",
+            missing_ok=True,
+        )
+        if packed_refs_rebound is not None and _packed_refs_contains_replace_ref(
+            packed_refs_rebound.data
+        ):
+            raise SetupError(
+                f"Git packed replacement ref is present: {repository / '.git' / 'packed-refs'}"
+            )
+        return GitTopologyGuard(
+            repository=repository,
+            repository_binding=repository_binding,
+            git_dir_binding=git_dir_binding,
+            refs_binding=refs_binding,
+            info_binding=info_binding,
+        )
+    finally:
+        if info_opened is not None:
+            os.close(info_opened[0])
+        if refs_opened is not None:
+            os.close(refs_opened[0])
+        if git_dir_opened is not None:
+            os.close(git_dir_opened[0])
+        os.close(repository_fd)
+
+
+def _git_topology_replacement_check(repository: Path, *, prefix: str) -> Check:
+    try:
+        _inspect_git_topology_replacements(repository)
+    except SetupError as error:
+        return Check(f"{prefix}-topology-replacements", "blocked", str(error))
+    return Check(
+        f"{prefix}-topology-replacements",
+        "ready",
+        f"no Git replace refs or graft file: {repository}",
+    )
+
+
 def _git_admin_path_checks(repository: Path, *, prefix: str) -> list[Check]:
     """Validate the Git worktree/admin boundary without invoking Git."""
 
@@ -1819,6 +2065,7 @@ def _git_admin_path_checks(repository: Path, *, prefix: str) -> list[Check]:
             ),
         ]
     )
+    checks.append(_git_topology_replacement_check(repository, prefix=prefix))
     return checks
 
 
@@ -1828,6 +2075,8 @@ def _git_environment(*, disable_hooks: bool = True) -> dict[str, str]:
         {
             "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_GRAFT_FILE": "/dev/null",
+            "GIT_NO_REPLACE_OBJECTS": "1",
             "GIT_TERMINAL_PROMPT": "0",
             "GIT_OPTIONAL_LOCKS": "0",
             "GIT_NO_LAZY_FETCH": "1",
@@ -1858,19 +2107,18 @@ def _run_git(
     )
     os.close(descriptor)
     try:
-        result = subprocess.run(
+        result = CommandRunner(
+            timeout_seconds=GIT_TIMEOUT_SECONDS,
+            term_grace_seconds=COMMAND_TERM_GRACE_SECONDS,
+            kill_grace_seconds=COMMAND_KILL_GRACE_SECONDS,
+        ).run(
             [GIT_EXECUTABLE, *arguments],
             cwd=repository,
-            check=False,
-            text=True,
-            capture_output=True,
-            timeout=GIT_TIMEOUT_SECONDS,
             env=_git_environment(disable_hooks=True),
         )
-    except (OSError, subprocess.TimeoutExpired) as error:
-        raise SetupError(
-            f"Git command could not complete in {repository}: {type(error).__name__}"
-        ) from error
+    except SetupError:
+        _directory_path_matches(repository, binding, label="Git repository")
+        raise
     _directory_path_matches(repository, binding, label="Git repository")
     if check and result.returncode != 0:
         detail = (result.stderr or result.stdout).strip()[:MAX_COMMAND_DETAIL]
@@ -1904,11 +2152,11 @@ def _run_workspace_status(
     *,
     repo: RepoSpec | None = None,
 ) -> None:
-    result = runner.run(
-        _workspace_status_argv(config, manifest, repo),
-        cwd=config.workspace_root,
-        env=_git_environment(disable_hooks=False),
-    )
+    arguments = ["status"]
+    if repo is not None:
+        arguments.extend(["--repo", repo.name])
+    arguments.append("--strict")
+    result = _run_helper(config, manifest, arguments, runner)
     if result.returncode != 0:
         detail = (result.stderr or result.stdout).strip()[:MAX_COMMAND_DETAIL]
         target = repo.name if repo is not None else "all repositories"
@@ -3496,25 +3744,77 @@ def _write_reload_receipt(
     return transaction.new_snapshot
 
 
+def _bind_helper_git_topology(
+    manifest: WorkspaceManifest,
+    *,
+    allow_missing: bool,
+) -> tuple[GitTopologyGuard, ...]:
+    guards: list[GitTopologyGuard] = []
+    for repo in manifest.repos:
+        repository = manifest.repo_path(repo)
+        occupancy = _directory_check(
+            repository,
+            name=f"helper topology repository {repo.name}",
+            missing_status="missing",
+        )
+        if occupancy.status == "ready":
+            guards.append(_inspect_git_topology_replacements(repository))
+            continue
+        if occupancy.status == "missing" and allow_missing:
+            guards.append(GitTopologyGuard(repository, None, None, None, None))
+            continue
+        raise SetupError(occupancy.detail)
+    return tuple(guards)
+
+
+def _revalidate_helper_git_topology(guards: Sequence[GitTopologyGuard]) -> None:
+    for guard in guards:
+        occupancy = _directory_check(
+            guard.repository,
+            name="helper topology repository revalidation",
+            missing_status="missing",
+        )
+        if guard.repository_binding is None:
+            if occupancy.status == "missing":
+                continue
+            if occupancy.status != "ready":
+                raise SetupError(occupancy.detail)
+            _inspect_git_topology_replacements(guard.repository)
+            continue
+        if occupancy.status != "ready":
+            raise SetupError(
+                f"Git topology repository changed during helper invocation: {guard.repository}; "
+                f"{occupancy.detail}"
+            )
+        _inspect_git_topology_replacements(guard.repository, expected=guard)
+
+
 def _run_helper(
     config: HostConfig,
-    manifest: Path,
+    manifest: WorkspaceManifest,
     arguments: Sequence[str],
     runner: CommandRunner,
 ) -> subprocess.CompletedProcess[str]:
+    topology_guards = _bind_helper_git_topology(
+        manifest,
+        allow_missing=bool(arguments) and arguments[0] == "ensure",
+    )
     argv = [
         str(config.python_executable),
         *PYTHON_ISOLATION_FLAGS,
         str(config.workspace_helper),
         "--config",
-        str(manifest),
+        str(manifest.path),
         *arguments,
     ]
-    return runner.run(
-        argv,
-        cwd=config.workspace_root,
-        env=_git_environment(disable_hooks=False),
-    )
+    try:
+        return runner.run(
+            argv,
+            cwd=config.workspace_root,
+            env=_git_environment(disable_hooks=False),
+        )
+    finally:
+        _revalidate_helper_git_topology(topology_guards)
 
 
 def _run_ensure(config: HostConfig, runner: CommandRunner) -> None:
@@ -3544,7 +3844,7 @@ def _run_ensure(config: HostConfig, runner: CommandRunner) -> None:
             precheck = _ensure_mirror_precheck(manifest, repo)
             if precheck.status == "blocked":
                 raise SetupError(f"ensure mirror revalidation blocked: {precheck.detail}")
-        result = _run_helper(config, manifest.path, ["ensure"], runner)
+        result = _run_helper(config, manifest, ["ensure"], runner)
         if result.returncode != 0:
             detail = (result.stderr or result.stdout).strip()[:MAX_COMMAND_DETAIL]
             raise SetupError(
@@ -4103,7 +4403,7 @@ def _capture_prefetch_step(
     try:
         result = _run_helper(
             config,
-            manifest.path,
+            manifest,
             _prefetch_arguments(temporary_stamp, repo),
             runner,
         )

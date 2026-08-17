@@ -6,6 +6,7 @@ import importlib.util
 import json
 import os
 import stat
+import subprocess
 import sys
 import uuid
 from pathlib import Path, PurePosixPath
@@ -737,6 +738,51 @@ def _tree_bytes(root: Path) -> dict[str, tuple[int, bytes]]:
                 path.read_bytes(),
             )
     return result
+
+
+@pytest.mark.parametrize(
+    ("command", "input_flag"),
+    [
+        ("validate", "--candidate"),
+        ("complete-audit", "--receipt"),
+        ("selection-preflight", "--selection-draft"),
+    ],
+)
+def test_external_json_cli_loaders_reject_no_writer_fifo_without_blocking(
+    tmp_path: Path,
+    command: str,
+    input_flag: str,
+) -> None:
+    fifo = tmp_path / f"{command}.json"
+    os.mkfifo(fifo, 0o600)
+    argv = [sys.executable, str(HELPER), command]
+    if command != "validate":
+        argv.extend(["--state-root", str(tmp_path / "unused-state")])
+    argv.extend([input_flag, str(fifo)])
+    if command != "validate":
+        argv.extend(["--now", "2026-07-11T08:00:00Z"])
+
+    completed = subprocess.run(
+        argv,
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=2,
+        check=False,
+    )
+
+    assert completed.returncode == 2
+    assert json.loads(completed.stdout)["code"] == "unsafe-file"
+    assert not (tmp_path / "unused-state").exists()
+
+
+def test_external_stable_open_still_reads_an_ordinary_file(tmp_path: Path) -> None:
+    path = _write(tmp_path / "ordinary.json", {"ordinary": True})
+
+    raw, digest = fs._open_external_stable(path)
+
+    assert raw == path.read_bytes()
+    assert digest == hashlib.sha256(raw).hexdigest()
 
 
 def _create_wal_temp(root: Path, name: str, payload: bytes = b"partial") -> None:
@@ -1738,6 +1784,39 @@ def test_finalize_requires_exact_receipts_rejects_drift_and_is_idempotent(tmp_pa
     assert closure_result["status"] == "closed"
 
 
+def test_finalize_external_output_cannot_target_managed_state_without_side_effects(
+    tmp_path: Path,
+) -> None:
+    case = _candidate()
+    root, stage = _stage(tmp_path, case)
+    completed = _complete_live(tmp_path, root, [stage])
+    selection = _approved_selection(tmp_path, root, completed["snapshot_digest"], [case])
+    plan_path = tmp_path / "outside-plan.json"
+    fs.weekly_plan(
+        root,
+        _write(tmp_path / "finalize-inside-selection.json", selection),
+        plan_path,
+        "2026-07-11T08:01:00Z",
+    )
+    plan = fs._load_json(plan_path)
+    prepared_path = _write(tmp_path / "inside-state-prepared.json", _prepared_receipt(plan))
+    output = root / "publication" / "poison-manifest.json"
+    before = _tree_bytes(root)
+
+    with pytest.raises(fs.StateError, match="outside the managed state root") as raised:
+        fs.finalize_publication(
+            root,
+            plan_path,
+            prepared_path,
+            output,
+            "2026-07-11T08:32:00Z",
+        )
+
+    assert raised.value.code == "output-inside-state-root"
+    assert _tree_bytes(root) == before
+    assert not output.exists()
+
+
 def test_atomic_state_files_and_directories_are_owner_only(tmp_path: Path) -> None:
     root, stage = _stage(tmp_path, _candidate())
     assert stat.S_IMODE(root.stat().st_mode) == 0o700
@@ -2008,6 +2087,56 @@ def test_weekly_output_conflict_has_no_state_side_effect(
         )
     assert _tree_bytes(root) == before
     assert output.read_text(encoding="utf-8").strip() == '{"foreign": true}'
+
+
+@pytest.mark.parametrize("target_kind", ["root", "descendant", "normalized-descendant"])
+def test_weekly_external_output_cannot_target_managed_state_without_side_effects(
+    tmp_path: Path,
+    target_kind: str,
+) -> None:
+    case = _candidate()
+    root, stage = _stage(tmp_path, case)
+    completed = _complete_live(tmp_path, root, [stage])
+    selection = _approved_selection(tmp_path, root, completed["snapshot_digest"], [case])
+    selection_path = _write(tmp_path / "inside-state-selection.json", selection)
+    outputs = {
+        "root": root,
+        "descendant": root / "publication" / "poison-plan.json",
+        "normalized-descendant": (root / "publication" / ".." / "cases" / "poison-plan.json"),
+    }
+    output = outputs[target_kind]
+    normalized_output = Path(os.path.abspath(os.fspath(output)))
+    before = _tree_bytes(root)
+
+    with pytest.raises(fs.StateError, match="outside the managed state root") as raised:
+        fs.weekly_plan(root, selection_path, output, "2026-07-11T08:01:00Z")
+
+    assert raised.value.code == "output-inside-state-root"
+    assert _tree_bytes(root) == before
+    if normalized_output != root:
+        assert not normalized_output.exists()
+
+
+def test_weekly_external_output_allows_a_normalized_sibling(tmp_path: Path) -> None:
+    case = _candidate()
+    root, stage = _stage(tmp_path, case)
+    completed = _complete_live(tmp_path, root, [stage])
+    selection = _approved_selection(tmp_path, root, completed["snapshot_digest"], [case])
+    sibling = tmp_path / "state-sibling"
+    sibling.mkdir(mode=0o700)
+    output = root / ".." / sibling.name / "plan.json"
+
+    result = fs.weekly_plan(
+        root,
+        _write(tmp_path / "sibling-selection.json", selection),
+        output,
+        "2026-07-11T08:01:00Z",
+    )
+
+    normalized_output = sibling / "plan.json"
+    assert result["status"] == "planned"
+    assert result["plan_path"] == str(normalized_output)
+    assert normalized_output.exists()
 
 
 def test_selection_preflight_rejects_active_publication_without_partial_state(
@@ -2626,6 +2755,87 @@ def _rewrite_external_wal_as_legacy(
     commit["commit_digest"] = fs._digest(commit_body)
     commit_path.write_bytes(fs._canonical_bytes(commit))
     return intent_path, commit_path
+
+
+def _rewrite_external_wal_target(
+    root: Path,
+    operation: str,
+    natural_key: str,
+    target: Path,
+    *,
+    committed: bool,
+    legacy: bool,
+) -> tuple[Path, Path]:
+    intent_relative, commit_relative = fs._wal_paths(operation, natural_key)
+    intent_path = root / intent_relative
+    commit_path = root / commit_relative
+    intent = fs._load_json(intent_path)
+    external_writes = [write for write in intent["writes"] if write["scope"] == "external"]
+    assert len(external_writes) == 1
+    write = external_writes[0]
+    absolute_target = Path(os.path.abspath(os.fspath(target)))
+    write["path"] = str(absolute_target)
+    write["before_sha256"] = None
+    if legacy:
+        write.pop("parent_binding")
+    else:
+        parent = fs.StateStore(absolute_target.parent, create=False)
+        try:
+            write["parent_binding"] = fs._external_parent_binding(parent)
+        finally:
+            parent.close()
+    intent_body = {key: value for key, value in intent.items() if key != "intent_digest"}
+    intent["intent_digest"] = fs._digest(intent_body)
+    intent_path.write_bytes(fs._canonical_bytes(intent))
+    if not committed:
+        commit_path.unlink()
+        return intent_path, commit_path
+    commit = fs._load_json(commit_path)
+    commit["intent_digest"] = intent["intent_digest"]
+    commit_body = {key: value for key, value in commit.items() if key != "commit_digest"}
+    commit["commit_digest"] = fs._digest(commit_body)
+    commit_path.write_bytes(fs._canonical_bytes(commit))
+    return intent_path, commit_path
+
+
+@pytest.mark.parametrize(
+    ("committed", "legacy"),
+    [(False, False), (False, True), (True, False), (True, True)],
+    ids=["pending-bound", "pending-legacy", "committed-bound", "committed-legacy"],
+)
+def test_global_wal_recovery_rejects_external_targets_inside_managed_state(
+    tmp_path: Path,
+    committed: bool,
+    legacy: bool,
+) -> None:
+    case = _candidate()
+    root, stage = _stage(tmp_path, case)
+    completed = _complete_live(tmp_path, root, [stage])
+    selection = _approved_selection(tmp_path, root, completed["snapshot_digest"], [case])
+    fs.weekly_plan(
+        root,
+        _write(tmp_path / "crafted-wal-selection.json", selection),
+        tmp_path / "original-external-plan.json",
+        "2026-07-11T08:01:00Z",
+    )
+    target = root / "publication" / f"poison-{committed}-{legacy}.json"
+    _rewrite_external_wal_target(
+        root,
+        "weekly-plan",
+        selection["selection_id"],
+        target,
+        committed=committed,
+        legacy=legacy,
+    )
+    before = _tree_bytes(root)
+
+    with fs._state_lock(root, create=False) as store:
+        with pytest.raises(fs.StateError, match="outside the managed state root") as raised:
+            fs._recover_pending_wal(store)
+
+    assert raised.value.code == "output-inside-state-root"
+    assert _tree_bytes(root) == before
+    assert not target.exists()
 
 
 def test_committed_legacy_external_wal_is_read_only_validated(
