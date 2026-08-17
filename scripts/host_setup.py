@@ -11,6 +11,14 @@ Subprocess guards protect executable-selection integrity: host commands use
 audited absolute executables, delegated helpers receive a system-only PATH, and
 every child starts from a closed environment allowlist. This does not attest the
 publisher identity of the fixed executables or the behavior of remote services.
+
+The already-running isolated Python interpreter and the OS loader that created it
+are an explicit startup trust root. This process can prove its current version,
+isolation flags, and the identity/content/access policy of its nominal executable
+path, but it cannot retrospectively prove which vnode the loader consumed before
+Python started. Delegated helper code is therefore never reopened by pathname:
+one stable owned-file snapshot is compiled and executed from its exact in-memory
+bytes in a forked child of this interpreter.
 """
 
 from __future__ import annotations
@@ -33,11 +41,14 @@ import signal
 import stat
 import subprocess
 import sys
+import threading
 import time
 import tomllib
+import traceback
+import types
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO, Protocol
 
 
 class SetupError(RuntimeError):
@@ -199,6 +210,20 @@ class FileSnapshot:
     @property
     def digest(self) -> str:
         return hashlib.sha256(self.data).hexdigest()
+
+
+@dataclasses.dataclass(frozen=True)
+class CurrentInterpreterBinding:
+    """Evidence available after the current interpreter has already started.
+
+    ``nominal_snapshot`` binds the current object at the manifest pathname. The
+    running image itself is an explicit trust root: neither ``sys.executable``
+    nor a post-start pathname snapshot proves which vnode the OS loader opened.
+    """
+
+    executable: Path
+    version: tuple[int, int, int]
+    nominal_snapshot: FileSnapshot
 
 
 @dataclasses.dataclass(frozen=True)
@@ -370,6 +395,63 @@ class LoadedLaunchAgent:
     properties: frozenset[str]
 
 
+class _SupervisedProcess(Protocol):
+    pid: int
+    args: Any
+    stdout: Any
+    stderr: Any
+    returncode: int | None
+
+    def wait(self, timeout: float | None = None) -> int: ...
+
+
+class _ForkedPythonProcess:
+    """Minimal waitable process wrapper for one Python ``fork`` child."""
+
+    def __init__(
+        self,
+        pid: int,
+        args: Sequence[str],
+        stdout_descriptor: int,
+        stderr_descriptor: int,
+    ) -> None:
+        self.pid = pid
+        self.args = tuple(args)
+        self.stdout: BinaryIO | None = os.fdopen(stdout_descriptor, "rb", buffering=0)
+        self.stderr: BinaryIO | None = os.fdopen(stderr_descriptor, "rb", buffering=0)
+        self.returncode: int | None = None
+
+    def _collect(self, *, nohang: bool) -> int | None:
+        if self.returncode is not None:
+            return self.returncode
+        options = os.WNOHANG if nohang else 0
+        try:
+            waited_pid, status = os.waitpid(self.pid, options)
+        except ChildProcessError as error:
+            raise OSError(errno.ECHILD, "forked Python child was reaped externally") from error
+        if waited_pid == 0:
+            return None
+        if waited_pid != self.pid:
+            raise OSError(errno.ECHILD, "waitpid returned an unexpected child")
+        self.returncode = os.waitstatus_to_exitcode(status)
+        return self.returncode
+
+    def wait(self, timeout: float | None = None) -> int:
+        if timeout is None:
+            result = self._collect(nohang=False)
+            assert result is not None
+            return result
+        deadline = time.monotonic() + max(0.0, timeout)
+        while True:
+            result = self._collect(nohang=True)
+            if result is not None:
+                return result
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(self.args, timeout)
+            time.sleep(min(0.01, remaining))
+
+
 class CommandRunner:
     """Injectable, byte-bounded subprocess boundary for delegated operations.
 
@@ -395,6 +477,8 @@ class CommandRunner:
         self.term_grace_seconds = term_grace_seconds
         self.kill_grace_seconds = kill_grace_seconds
         self.output_limit_bytes = output_limit_bytes
+        self._interpreter_baseline: CurrentInterpreterBinding | None = None
+        self._workspace_helper_baselines: dict[Path, FileSnapshot] = {}
 
     def run(
         self,
@@ -417,6 +501,86 @@ class CommandRunner:
             raise SetupError(
                 f"could not start {argv[0]}: {error.strerror or type(error).__name__}"
             ) from error
+        return self._supervise(process, argv)
+
+    def bind_current_interpreter(self, config: HostConfig) -> CurrentInterpreterBinding:
+        """Enforce the production interpreter trust-root policy.
+
+        Test runners may override this method as an injection seam. The CLI and
+        every ordinary ``CommandRunner`` instance always use the strict policy.
+        """
+
+        return self._remember_current_interpreter(_bind_current_interpreter(config))
+
+    def _remember_current_interpreter(
+        self,
+        candidate: CurrentInterpreterBinding,
+    ) -> CurrentInterpreterBinding:
+        baseline = self._interpreter_baseline
+        if baseline is None:
+            self._interpreter_baseline = candidate
+            return candidate
+        if candidate != baseline:
+            raise SetupError("Python executable changed from this operation's trusted baseline")
+        return baseline
+
+    def bind_workspace_helper(self, config: HostConfig) -> FileSnapshot:
+        """Bind one exact helper object/content/access policy per operation."""
+
+        candidate = _read_owned_regular_file(
+            config.workspace_helper,
+            max_bytes=MAX_CONFIG_BYTES,
+            label="workspace helper",
+        )
+        baseline = self._workspace_helper_baselines.get(config.workspace_helper)
+        if baseline is None:
+            self._workspace_helper_baselines[config.workspace_helper] = candidate
+            return candidate
+        if candidate != baseline:
+            raise SetupError("workspace helper changed from this operation's trusted baseline")
+        return baseline
+
+    def revalidate_helper_runtime(self, config: HostConfig) -> None:
+        """Prove nominal Python/helper paths still match operation baselines."""
+
+        self.bind_current_interpreter(config)
+        self.bind_workspace_helper(config)
+
+    def run_python_source(
+        self,
+        argv: Sequence[str],
+        *,
+        source: FileSnapshot,
+        source_path: Path,
+        cwd: Path,
+        env: Mapping[str, str],
+    ) -> subprocess.CompletedProcess[str]:
+        """Fork this interpreter and execute exact validated source bytes.
+
+        No manifest-controlled executable or helper pathname is resolved in the
+        child. The fork inherits the already-running isolated interpreter, then
+        closes every inherited non-stdio descriptor before executing ``source``.
+        """
+
+        try:
+            process = self._fork_python_source(
+                argv,
+                source=source,
+                source_path=source_path,
+                cwd=cwd,
+                env=env,
+            )
+        except OSError as error:
+            raise SetupError(
+                f"could not fork {source_path}: {error.strerror or type(error).__name__}"
+            ) from error
+        return self._supervise(process, argv)
+
+    def _supervise(
+        self,
+        process: _SupervisedProcess,
+        argv: Sequence[str],
+    ) -> subprocess.CompletedProcess[str]:
         try:
             stdout, stderr = self._capture_output(process)
             assert process.returncode is not None
@@ -442,7 +606,161 @@ class CommandRunner:
                 f"{error.strerror or type(error).__name__}"
             ) from error
 
-    def _capture_output(self, process: subprocess.Popen[bytes]) -> tuple[str, str]:
+    @staticmethod
+    def _maximum_child_descriptor() -> int:
+        try:
+            maximum = os.sysconf("SC_OPEN_MAX")
+        except (OSError, ValueError) as error:
+            raise SetupError("could not determine the child descriptor ceiling") from error
+        if not isinstance(maximum, int) or maximum < 4:
+            raise SetupError("child descriptor ceiling is invalid")
+        return maximum
+
+    @staticmethod
+    def _require_fork_safe_thread_state() -> None:
+        if (
+            threading.current_thread() is not threading.main_thread()
+            or threading.active_count() != 1
+        ):
+            raise SetupError("delegated helper fork requires one active main Python thread")
+
+    def _fork_python_source(
+        self,
+        argv: Sequence[str],
+        *,
+        source: FileSnapshot,
+        source_path: Path,
+        cwd: Path,
+        env: Mapping[str, str],
+    ) -> _ForkedPythonProcess:
+        if len(argv) < 5 or tuple(argv[1:4]) != PYTHON_ISOLATION_FLAGS:
+            raise SetupError("delegated helper argv lost the required Python isolation flags")
+        if Path(argv[4]) != source_path:
+            raise SetupError("delegated helper argv does not match its validated source path")
+        self._require_fork_safe_thread_state()
+        maximum_descriptor = self._maximum_child_descriptor()
+        environment = dict(env)
+        child_argv = [str(source_path), *argv[5:]]
+        stdout_read, stdout_write = self._noninheritable_pipe()
+        try:
+            stderr_read, stderr_write = self._noninheritable_pipe()
+        except BaseException:
+            os.close(stdout_read)
+            os.close(stdout_write)
+            raise
+        try:
+            pid = os.fork()
+        except BaseException:
+            for descriptor in (stdout_read, stdout_write, stderr_read, stderr_write):
+                os.close(descriptor)
+            raise
+        if pid == 0:
+            self._execute_python_source_child(
+                argv,
+                child_argv=child_argv,
+                source=source,
+                source_path=source_path,
+                cwd=cwd,
+                environment=environment,
+                stdout_read=stdout_read,
+                stdout_write=stdout_write,
+                stderr_read=stderr_read,
+                stderr_write=stderr_write,
+                maximum_descriptor=maximum_descriptor,
+            )
+            os._exit(127)
+        os.close(stdout_write)
+        os.close(stderr_write)
+        try:
+            return _ForkedPythonProcess(pid, argv, stdout_read, stderr_read)
+        except BaseException:
+            os.close(stdout_read)
+            os.close(stderr_read)
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            try:
+                os.waitpid(pid, 0)
+            except ChildProcessError:
+                pass
+            raise
+
+    @staticmethod
+    def _noninheritable_pipe() -> tuple[int, int]:
+        descriptors = os.pipe()
+        if any(os.get_inheritable(descriptor) for descriptor in descriptors):
+            for descriptor in descriptors:
+                os.close(descriptor)
+            raise SetupError("Python pipe descriptors must be close-on-exec")
+        return descriptors
+
+    @staticmethod
+    def _execute_python_source_child(
+        display_argv: Sequence[str],
+        *,
+        child_argv: list[str],
+        source: FileSnapshot,
+        source_path: Path,
+        cwd: Path,
+        environment: dict[str, str],
+        stdout_read: int,
+        stdout_write: int,
+        stderr_read: int,
+        stderr_write: int,
+        maximum_descriptor: int,
+    ) -> None:
+        try:
+            os.dup2(stdout_write, 1)
+            os.dup2(stderr_write, 2)
+            os.closerange(3, maximum_descriptor)
+            encoding = locale.getpreferredencoding(False)
+            sys.stdout = open(1, "w", encoding=encoding, errors="backslashreplace", closefd=False)
+            sys.stderr = open(2, "w", encoding=encoding, errors="backslashreplace", closefd=False)
+            os.setsid()
+            os.chdir(cwd)
+            os.environ.clear()
+            os.environ.update(environment)
+            signal.signal(signal.SIGINT, signal.default_int_handler)
+            signal.signal(signal.SIGTERM, signal.SIG_DFL)
+            signal.signal(signal.SIGHUP, signal.SIG_DFL)
+            signal.signal(signal.SIGPIPE, signal.SIG_IGN)
+            sys.argv = child_argv
+            sys.orig_argv = list(display_argv)
+            main_module = types.ModuleType("__main__")
+            namespace = main_module.__dict__
+            namespace.update(
+                {
+                    "__file__": str(source_path),
+                    "__package__": None,
+                    "__cached__": None,
+                    "__loader__": None,
+                    "__spec__": None,
+                }
+            )
+            sys.modules["__main__"] = main_module
+            code = compile(source.data, str(source_path), "exec", dont_inherit=True)
+            exec(code, namespace)
+        except SystemExit as error:
+            if error.code is None:
+                exit_code = 0
+            elif isinstance(error.code, int):
+                exit_code = error.code
+            else:
+                print(error.code, file=sys.stderr)
+                exit_code = 1
+        except BaseException:
+            traceback.print_exc()
+            exit_code = 1
+        else:
+            exit_code = 0
+        try:
+            sys.stdout.flush()
+            sys.stderr.flush()
+        finally:
+            os._exit(exit_code)
+
+    def _capture_output(self, process: _SupervisedProcess) -> tuple[str, str]:
         """Stream both pipes through one retained-byte budget until exit."""
 
         stdout = bytearray()
@@ -495,7 +813,7 @@ class CommandRunner:
         return stdout.decode(encoding), stderr.decode(encoding)
 
     @staticmethod
-    def _drain_process_pipes(process: subprocess.Popen[bytes], timeout_seconds: float) -> bool:
+    def _drain_process_pipes(process: _SupervisedProcess, timeout_seconds: float) -> bool:
         """Discard pipe data with fixed per-read memory until EOF or deadline."""
 
         deadline = time.monotonic() + max(0.0, timeout_seconds)
@@ -529,7 +847,7 @@ class CommandRunner:
             selector.close()
 
     @staticmethod
-    def _close_process_pipes(process: subprocess.Popen[bytes]) -> OSError | None:
+    def _close_process_pipes(process: _SupervisedProcess) -> OSError | None:
         """Close every still-owned pipe while retaining the first close failure."""
 
         first_error: OSError | None = None
@@ -543,49 +861,74 @@ class CommandRunner:
                     first_error = error
         return first_error
 
-    def _terminate_process_group(self, process: subprocess.Popen[bytes]) -> None:
+    def _terminate_process_group(self, process: _SupervisedProcess) -> None:
         """Terminate the complete command process group and bound pipe draining."""
 
         process_group = process.pid
-        cleanup_error: OSError | None = None
-        cleanup_message = "command process pipes could not be drained"
-        try:
-            os.killpg(process_group, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-        except OSError as error:
-            cleanup_error = error
-            cleanup_message = "command process group could not be terminated"
+        signal_error: OSError | None = self._signal_process_group_with_pid_fallback(
+            process, signal.SIGTERM
+        )
+        pipe_error: OSError | None = None
         try:
             self._drain_process_pipes(process, self.term_grace_seconds)
         except OSError as error:
-            if cleanup_error is None:
-                cleanup_error = error
-        try:
-            os.killpg(process_group, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        except OSError as error:
-            if cleanup_error is None:
-                cleanup_error = error
-                cleanup_message = "command process group could not be terminated"
+            pipe_error = error
+        kill_error = self._signal_process_group_with_pid_fallback(process, signal.SIGKILL)
+        if signal_error is None:
+            signal_error = kill_error
         try:
             drained = self._drain_process_pipes(process, self.kill_grace_seconds)
         except OSError as error:
             drained = False
-            if cleanup_error is None:
-                cleanup_error = error
+            if pipe_error is None:
+                pipe_error = error
         close_error = self._close_process_pipes(process)
-        if cleanup_error is None:
-            cleanup_error = close_error
+        if pipe_error is None:
+            pipe_error = close_error
         try:
             process.wait(timeout=self.kill_grace_seconds)
         except subprocess.TimeoutExpired as error:
             raise SetupError("command process group could not be reaped") from error
-        if cleanup_error is not None:
-            raise SetupError(cleanup_message) from cleanup_error
+        if signal_error is not None:
+            try:
+                os.killpg(process_group, 0)
+            except ProcessLookupError:
+                signal_error = None
+            except OSError:
+                pass
+        if signal_error is not None:
+            raise SetupError("command process group could not be terminated") from signal_error
+        if pipe_error is not None:
+            raise SetupError("command process pipes could not be drained") from pipe_error
         if not drained:
             raise SetupError("command process pipes could not be drained")
+
+    @staticmethod
+    def _signal_process_group_with_pid_fallback(
+        process: _SupervisedProcess,
+        requested_signal: int,
+    ) -> OSError | None:
+        """Signal the session, retaining uncertainty until its PGID disappears."""
+
+        try:
+            os.killpg(process.pid, requested_signal)
+            return None
+        except ProcessLookupError as group_error:
+            try:
+                os.kill(process.pid, requested_signal)
+            except ProcessLookupError:
+                return None
+            except OSError:
+                pass
+            return group_error
+        except OSError as group_error:
+            try:
+                os.kill(process.pid, requested_signal)
+            except ProcessLookupError:
+                pass
+            except OSError:
+                pass
+            return group_error
 
 
 def _binding_tuple(metadata: os.stat_result) -> tuple[int, int, int, int, int, int]:
@@ -2314,44 +2657,66 @@ def manifest_snapshots(
     return {repo.name: mirror_snapshot(config, manifest, repo, runner) for repo in manifest.repos}
 
 
+def _bind_current_interpreter(config: HostConfig) -> CurrentInterpreterBinding:
+    """Validate the already-running interpreter and its nominal path policy.
+
+    The protected runtime object is the current process image, which fork will
+    inherit without a new pathname lookup. ``sys.executable`` and the stable
+    snapshot below prove that the manifest names the current safe pathname and
+    that its present object has stable content and access policy. They do not
+    retrospectively identify the vnode opened by the OS loader at process start.
+    """
+
+    executable = _normalized_absolute(Path(sys.executable), field="current Python executable")
+    if executable != config.python_executable:
+        raise SetupError(
+            "current Python executable does not match host_setup.python_executable: "
+            f"{executable} != {config.python_executable}"
+        )
+    snapshot = _read_owned_regular_file(
+        config.python_executable,
+        max_bytes=256 * 1024 * 1024,
+        label="Python executable",
+    )
+    if not snapshot.binding.mode & 0o111:
+        raise SetupError("Python executable has no executable bit")
+    version = (sys.version_info.major, sys.version_info.minor, sys.version_info.micro)
+    if version < (3, 12, 0):
+        raise SetupError("current Python interpreter must be version 3.12 or newer")
+    required_flags = {
+        "isolated": sys.flags.isolated,
+        "no_site": sys.flags.no_site,
+        "no_user_site": sys.flags.no_user_site,
+        "dont_write_bytecode": sys.flags.dont_write_bytecode,
+    }
+    missing = [name for name, value in required_flags.items() if value != 1]
+    if missing:
+        raise SetupError(
+            "current Python interpreter lacks required -I -B -S isolation: " + ", ".join(missing)
+        )
+    return CurrentInterpreterBinding(
+        executable=executable,
+        version=version,
+        nominal_snapshot=snapshot,
+    )
+
+
 def _check_python(config: HostConfig, runner: CommandRunner) -> Check:
     try:
-        snapshot = _read_owned_regular_file(
-            config.python_executable,
-            max_bytes=256 * 1024 * 1024,
-            label="Python executable",
-        )
-        if not snapshot.binding.mode & 0o111:
-            raise SetupError("Python executable has no executable bit")
-        result = runner.run(
-            [str(config.python_executable), *PYTHON_ISOLATION_FLAGS, "--version"],
-            env=_trusted_process_environment(),
-        )
-        version = (result.stdout or result.stderr).strip()
-        match = re.fullmatch(r"Python ([0-9]+)\.([0-9]+)(?:\.([0-9]+))?", version)
-        if result.returncode != 0 or match is None:
-            raise SetupError("Python executable version probe failed")
-        if (int(match.group(1)), int(match.group(2))) < (3, 12):
-            raise SetupError("Python executable must be version 3.12 or newer")
-        rebound = _read_owned_regular_file(
-            config.python_executable,
-            max_bytes=256 * 1024 * 1024,
-            label="Python executable",
-        )
-        if rebound != snapshot:
-            raise SetupError("Python executable changed during its version probe")
+        binding = runner.bind_current_interpreter(config)
     except SetupError as error:
         return Check("python-executable", "blocked", str(error))
-    return Check("python-executable", "ready", f"{config.python_executable}: {version}")
+    version = ".".join(str(part) for part in binding.version)
+    return Check(
+        "python-executable",
+        "ready",
+        f"current isolated interpreter {binding.executable}: Python {version}",
+    )
 
 
-def _check_workspace_helper(config: HostConfig) -> Check:
+def _check_workspace_helper(config: HostConfig, runner: CommandRunner) -> Check:
     try:
-        _read_owned_regular_file(
-            config.workspace_helper,
-            max_bytes=MAX_CONFIG_BYTES,
-            label="workspace helper",
-        )
+        runner.bind_workspace_helper(config)
     except SetupError as error:
         return Check("workspace-helper", "blocked", str(error))
     return Check("workspace-helper", "ready", str(config.workspace_helper))
@@ -3472,7 +3837,7 @@ def collect_core_checks(
     checks.extend(
         [
             _check_python(config, runner),
-            _check_workspace_helper(config),
+            _check_workspace_helper(config, runner),
             _check_control_mirror_manifest(config),
             _check_skill_source(config),
             _check_locator(config),
@@ -3799,22 +4164,29 @@ def _run_helper(
         manifest,
         allow_missing=bool(arguments) and arguments[0] == "ensure",
     )
-    argv = [
-        str(config.python_executable),
-        *PYTHON_ISOLATION_FLAGS,
-        str(config.workspace_helper),
-        "--config",
-        str(manifest.path),
-        *arguments,
-    ]
     try:
-        return runner.run(
+        runner.bind_current_interpreter(config)
+        helper_snapshot = runner.bind_workspace_helper(config)
+        argv = [
+            str(config.python_executable),
+            *PYTHON_ISOLATION_FLAGS,
+            str(config.workspace_helper),
+            "--config",
+            str(manifest.path),
+            *arguments,
+        ]
+        return runner.run_python_source(
             argv,
+            source=helper_snapshot,
+            source_path=config.workspace_helper,
             cwd=config.workspace_root,
             env=_git_environment(disable_hooks=False),
         )
     finally:
-        _revalidate_helper_git_topology(topology_guards)
+        try:
+            runner.revalidate_helper_runtime(config)
+        finally:
+            _revalidate_helper_git_topology(topology_guards)
 
 
 def _run_ensure(config: HostConfig, runner: CommandRunner) -> None:
@@ -4608,7 +4980,7 @@ def prefetch_control(
     now: dt.datetime | None = None,
 ) -> tuple[dict[str, Any], HostConfig]:
     operations = file_ops or FileOps()
-    global_checks = [_check_python(config, runner), _check_workspace_helper(config)]
+    global_checks = [_check_python(config, runner), _check_workspace_helper(config, runner)]
     _raise_if_blocked(global_checks, phase="control prefetch preflight")
     freshness_journal = _begin_freshness_directory(config, operations)
     step, captured = _capture_prefetch_step(
@@ -4714,7 +5086,7 @@ def prefetch_weekly(
     now: dt.datetime | None = None,
 ) -> tuple[dict[str, Any], HostConfig]:
     operations = file_ops or FileOps()
-    prechecks = [_check_python(config, runner), _check_workspace_helper(config)]
+    prechecks = [_check_python(config, runner), _check_workspace_helper(config, runner)]
     _raise_if_blocked(prechecks, phase="weekly prefetch preflight")
     freshness_journal = _begin_freshness_directory(config, operations)
     steps: list[dict[str, Any]] = []
@@ -5084,7 +5456,7 @@ def _initial_preflight_checks(
     cache_parts = config.cache_root.relative_to(config.workspace_root).parts
     checks: list[Check] = [
         _check_python(config, runner),
-        _check_workspace_helper(config),
+        _check_workspace_helper(config, runner),
         _preflight_creation_path(
             config.workspace_root,
             config.locator_relative_path.parent.parts,

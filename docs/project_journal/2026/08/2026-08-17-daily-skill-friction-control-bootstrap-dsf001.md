@@ -3,7 +3,7 @@ id: 20260817-dsf001
 title: Daily Skill Friction Control Bootstrap
 status: active
 created: 2026-08-17
-updated: 2026-08-17
+updated: 2026-08-18
 branch: codex/daily-skill-friction-control
 pr:
 supersedes: []
@@ -32,6 +32,7 @@ superseded_by:
 - External Weekly WAL outputs retain the original destination-parent identity and access-policy chain across recovery; missing, rebound, or unsafe parents are never recreated or silently adopted.
 - A failed WAL commit publication rolls back only the exact leaf linked by that invocation, including failures after link publication but before `write_json` returns; global recovery validates canonical intent/commit pairing and every WAL leaf before replaying any transaction.
 - Delegated helper and launchctl stdout/stderr share a 1 MiB retained-output ceiling; overflow and timeout both terminate, drain, kill, and reap the complete managed process group before returning a bounded diagnostic.
+- Delegated workspace helpers are compiled and executed from exact stable in-memory source bytes in a fork of the already-running isolated interpreter; no post-preflight Python or helper pathname is executed. The current interpreter and OS loader are explicit startup trust roots, and this process does not claim to retrospectively prove a pre-start vnode.
 - Direct Git topology checks use the same bounded process supervisor, disable replacement-object and graft semantics, and reject loose or packed replacement refs plus `info/grafts` before and after workspace-helper execution.
 - Daily completion derives its created, updated, unchanged, and dormant case counts from the exact validated stage and dormancy receipts, including WAL recovery.
 - A case absent from control state can enter only as `watching` or `proposed`; `source_kind`, including `legacy-migration`, cannot import an approval, implementation, terminal state, or other lifecycle authority.

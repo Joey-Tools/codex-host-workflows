@@ -5,11 +5,12 @@ import json
 import os
 import plistlib
 import shutil
+import signal
 import subprocess
 import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
@@ -149,6 +150,7 @@ class FakeRunner(hs.CommandRunner):
         launch_failures: dict[tuple[str, str], list[int]] | None = None,
         print_error: int | None = None,
     ) -> None:
+        super().__init__()
         self.calls: list[tuple[list[str], Path | None]] = []
         self.environments: list[dict[str, str] | None] = []
         self.on_helper = on_helper
@@ -279,6 +281,49 @@ class FakeRunner(hs.CommandRunner):
             self.loaded[label] = False
         return subprocess.CompletedProcess(args, 0, "", "")
 
+    def bind_current_interpreter(self, config: hs.HostConfig) -> hs.CurrentInterpreterBinding:
+        snapshot = hs._read_owned_regular_file(
+            config.python_executable,
+            max_bytes=256 * 1024 * 1024,
+            label="Python executable",
+        )
+        if not snapshot.binding.mode & 0o111:
+            raise hs.SetupError("Python executable has no executable bit")
+        return self._remember_current_interpreter(
+            hs.CurrentInterpreterBinding(
+                executable=config.python_executable,
+                version=(3, 14, 2),
+                nominal_snapshot=snapshot,
+            )
+        )
+
+    def run_python_source(
+        self,
+        argv: Sequence[str],
+        *,
+        source: hs.FileSnapshot,
+        source_path: Path,
+        cwd: Path,
+        env: Mapping[str, str],
+    ) -> subprocess.CompletedProcess[str]:
+        args = list(argv)
+        assert Path(args[4]) == source_path
+        assert source.data
+        self.calls.append((args, cwd))
+        self.environments.append(dict(env))
+        command = next((name for name in ("ensure", "prefetch", "status") if name in args), None)
+        assert command is not None
+        if self.on_helper is not None:
+            self.on_helper(args)
+        code = self.helper_failures.get(command, 0)
+        if command == "prefetch" and "--stamp" in args:
+            stamp = args[args.index("--stamp") + 1]
+            for configured_stamp, configured_code in self.helper_failures.items():
+                if stamp == configured_stamp or stamp.startswith(f"{configured_stamp}-run-"):
+                    code = configured_code
+                    break
+        return subprocess.CompletedProcess(args, code, "", "helper failed" if code else "")
+
     def run(
         self,
         argv: Sequence[str],
@@ -306,6 +351,26 @@ class FakeRunner(hs.CommandRunner):
                         break
             return subprocess.CompletedProcess(args, code, "", "helper failed" if code else "")
         return subprocess.CompletedProcess(args, 0, "", "")
+
+
+class ForkTestRunner(hs.CommandRunner):
+    """Exercise the real fork supervisor from this non-isolated pytest process."""
+
+    def bind_current_interpreter(self, config: hs.HostConfig) -> hs.CurrentInterpreterBinding:
+        snapshot = hs._read_owned_regular_file(
+            config.python_executable,
+            max_bytes=256 * 1024 * 1024,
+            label="Python executable",
+        )
+        if not snapshot.binding.mode & 0o111:
+            raise hs.SetupError("Python executable has no executable bit")
+        return self._remember_current_interpreter(
+            hs.CurrentInterpreterBinding(
+                executable=config.python_executable,
+                version=(sys.version_info.major, sys.version_info.minor, sys.version_info.micro),
+                nominal_snapshot=snapshot,
+            )
+        )
 
 
 def _manifest_text(
@@ -2057,11 +2122,7 @@ def test_command_boundaries_use_fixed_executables_and_closed_environments(
     )
     assert helper_result.returncode == 0
 
-    version_index = next(
-        index
-        for index, (args, _cwd) in enumerate(runner.calls)
-        if args == [str(active.python_executable), *hs.PYTHON_ISOLATION_FLAGS, "--version"]
-    )
+    assert not any("--version" in args for args, _cwd in runner.calls)
     launchctl_index = next(
         index
         for index, (args, _cwd) in enumerate(runner.calls)
@@ -2079,7 +2140,6 @@ def test_command_boundaries_use_fixed_executables_and_closed_environments(
         str(active.workspace_helper),
     ]
     base_environment = hs._trusted_process_environment()
-    assert runner.environments[version_index] == base_environment
     assert runner.environments[launchctl_index] == base_environment
     helper_environment = runner.environments[helper_index]
     assert helper_environment == hs._git_environment(disable_hooks=False)
@@ -2218,7 +2278,8 @@ def test_hostile_path_shim_cannot_intercept_direct_or_delegated_git(
         pytest.skip("host workspace helper is unavailable")
     fixture = _build_host(tmp_path)
     shutil.copy2(helper_source, fixture.config.workspace_helper)
-    active = replace(_active(fixture), python_executable=Path(sys.executable))
+    shutil.copy2(Path(sys.executable).resolve(), fixture.config.python_executable)
+    active = _active(fixture)
     hostile_root = tmp_path / "hostile-path"
     hostile_root.mkdir()
     marker = tmp_path / "hostile-git-invoked"
@@ -2237,7 +2298,7 @@ def test_hostile_path_shim_cannot_intercept_direct_or_delegated_git(
         active,
         hs._load_main_manifest(active),
         ["status", "--repo", "alpha"],
-        hs.CommandRunner(timeout_seconds=10),
+        ForkTestRunner(timeout_seconds=10),
     )
 
     assert direct.stdout.strip() == ".git"
@@ -2298,7 +2359,7 @@ def test_real_helper_ensure_precheck_preserves_invalid_mirror_admin(
         hs.apply_setup(
             fixture.config,
             fixture.home,
-            hs.CommandRunner(timeout_seconds=10),
+            ForkTestRunner(timeout_seconds=10),
             ensure=True,
             no_launchctl=True,
         )
@@ -2345,7 +2406,7 @@ def test_real_helper_ensure_precheck_covers_every_main_mirror(
         hs.apply_setup(
             fixture.config,
             fixture.home,
-            hs.CommandRunner(timeout_seconds=10),
+            ForkTestRunner(timeout_seconds=10),
             ensure=True,
             no_launchctl=True,
         )
@@ -2489,6 +2550,392 @@ def test_helper_revalidates_replacement_absence_after_invocation(tmp_path: Path)
     assert helper_environment is not None
     assert helper_environment["GIT_NO_REPLACE_OBJECTS"] == "1"
     assert helper_environment["GIT_GRAFT_FILE"] == "/dev/null"
+
+
+def test_production_interpreter_policy_requires_exact_isolated_runtime() -> None:
+    config_path = REPO_ROOT / "config" / "host-workspace.toml"
+    config = hs.load_config(config_path)
+    module_path = REPO_ROOT / "scripts" / "host_setup.py"
+    probe = (
+        "import importlib.util, pathlib, sys; "
+        f"path=pathlib.Path({str(module_path)!r}); "
+        "spec=importlib.util.spec_from_file_location('host_setup_probe', path); "
+        "module=importlib.util.module_from_spec(spec); "
+        "sys.modules[spec.name]=module; "
+        "spec.loader.exec_module(module); "
+        f"config=module.load_config(pathlib.Path({str(config_path)!r})); "
+        "binding=module._bind_current_interpreter(config); "
+        "print('.'.join(str(part) for part in binding.version))"
+    )
+
+    isolated = subprocess.run(
+        [str(config.python_executable), *hs.PYTHON_ISOLATION_FLAGS, "-c", probe],
+        check=False,
+        text=True,
+        capture_output=True,
+        env=hs._trusted_process_environment(),
+    )
+    assert isolated.returncode == 0, isolated.stderr
+    assert isolated.stdout.strip().startswith("3.14.")
+
+    unisolated = subprocess.run(
+        [str(config.python_executable), "-c", probe],
+        check=False,
+        text=True,
+        capture_output=True,
+        env=hs._trusted_process_environment(),
+    )
+    assert unisolated.returncode != 0
+    assert "lacks required -I -B -S isolation" in unisolated.stderr
+
+
+@pytest.mark.parametrize("replacement_target", ["python", "helper"])
+def test_helper_fork_consumes_snapshot_after_manifest_path_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    replacement_target: str,
+) -> None:
+    fixture = _build_host(tmp_path)
+    active = _active(fixture)
+    original_marker = tmp_path / "original-helper-ran"
+    malicious_marker = tmp_path / "malicious-replacement-ran"
+    active.workspace_helper.write_text(
+        "import pathlib\n"
+        f"pathlib.Path({str(original_marker)!r}).write_text('original', encoding='utf-8')\n"
+        "print('original-helper')\n",
+        encoding="utf-8",
+    )
+    active.workspace_helper.chmod(0o755)
+    if replacement_target == "python":
+        target = active.python_executable
+        replacement = target.with_name("python-malicious-replacement")
+        replacement.write_text(
+            f'#!/bin/sh\nprintf malicious > "{malicious_marker}"\nexit 91\n',
+            encoding="utf-8",
+        )
+    else:
+        target = active.workspace_helper
+        replacement = target.with_name("codex_workspace-malicious.py")
+        replacement.write_text(
+            "import pathlib\n"
+            f"pathlib.Path({str(malicious_marker)!r}).write_text('malicious', encoding='utf-8')\n"
+            "print('malicious-helper')\n",
+            encoding="utf-8",
+        )
+    replacement.chmod(0o755)
+    real_fork = hs.os.fork
+    swapped = False
+
+    def replace_after_snapshots() -> int:
+        nonlocal swapped
+        assert not swapped
+        swapped = True
+        os.replace(replacement, target)
+        return real_fork()
+
+    # _run_helper reaches os.fork only after both interpreter and helper snapshots.
+    monkeypatch.setattr(hs.os, "fork", replace_after_snapshots)
+    runner = ForkTestRunner(timeout_seconds=5)
+    with pytest.raises(hs.SetupError, match="changed from this operation's trusted baseline"):
+        hs._run_helper(
+            active,
+            hs._load_main_manifest(active),
+            ["status"],
+            runner,
+        )
+    with pytest.raises(hs.SetupError, match="changed from this operation's trusted baseline"):
+        hs._run_helper(
+            active,
+            hs._load_main_manifest(active),
+            ["status"],
+            runner,
+        )
+
+    assert swapped is True
+    assert original_marker.read_text(encoding="utf-8") == "original"
+    assert not malicious_marker.exists()
+
+
+def test_helper_preflight_baseline_blocks_replacement_before_first_invocation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _build_host(tmp_path)
+    active = _active(fixture)
+    malicious_marker = tmp_path / "preflight-replacement-ran"
+    runner = ForkTestRunner(timeout_seconds=5)
+    assert hs._check_workspace_helper(active, runner).status == "ready"
+    replacement = active.workspace_helper.with_name("preflight-malicious.py")
+    replacement.write_text(
+        "import pathlib\n"
+        f"pathlib.Path({str(malicious_marker)!r}).write_text('malicious', encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+    replacement.chmod(0o755)
+    os.replace(replacement, active.workspace_helper)
+
+    def forbidden_fork() -> int:
+        raise AssertionError("helper replacement must be rejected before fork")
+
+    monkeypatch.setattr(hs.os, "fork", forbidden_fork)
+    with pytest.raises(hs.SetupError, match="workspace helper changed from"):
+        hs._run_helper(
+            active,
+            hs._load_main_manifest(active),
+            ["status"],
+            runner,
+        )
+
+    assert not malicious_marker.exists()
+
+
+def test_forked_python_source_uses_os_pipe_closes_fds_and_preserves_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_path = tmp_path / "fork-source.py"
+    source_path.write_text(
+        "import json, os, sys\n"
+        "try:\n"
+        "    os.fstat(int(sys.argv[2]))\n"
+        "except OSError:\n"
+        "    inherited_fd_closed = True\n"
+        "else:\n"
+        "    inherited_fd_closed = False\n"
+        "print(json.dumps({\n"
+        "    'argv': sys.argv,\n"
+        "    'cwd': os.getcwd(),\n"
+        "    'environment': dict(os.environ),\n"
+        "    'inherited_fd_closed': inherited_fd_closed,\n"
+        "}, sort_keys=True))\n",
+        encoding="utf-8",
+    )
+    source_path.chmod(0o700)
+    snapshot = hs._read_owned_regular_file(
+        source_path,
+        max_bytes=hs.MAX_CONFIG_BYTES,
+        label="fork source",
+    )
+    inherited_fd = os.open(source_path, os.O_RDONLY)
+    environment = {
+        "PATH": hs.TRUSTED_SYSTEM_PATH,
+        "HOME": str(tmp_path),
+        "LANG": hs.TRUSTED_LOCALE,
+        "TMPDIR": str(tmp_path),
+        "SSH_AUTH_SOCK": str(tmp_path / "agent.sock"),
+    }
+    monkeypatch.delattr(hs.os, "pipe2", raising=False)
+    try:
+        result = hs.CommandRunner(timeout_seconds=2).run_python_source(
+            [
+                sys.executable,
+                *hs.PYTHON_ISOLATION_FLAGS,
+                str(source_path),
+                "payload",
+                str(inherited_fd),
+            ],
+            source=snapshot,
+            source_path=source_path,
+            cwd=tmp_path,
+            env=environment,
+        )
+    finally:
+        os.close(inherited_fd)
+
+    assert result.returncode == 0
+    observed = json.loads(result.stdout)
+    assert observed == {
+        "argv": [str(source_path), "payload", str(inherited_fd)],
+        "cwd": str(tmp_path),
+        "environment": environment,
+        "inherited_fd_closed": True,
+    }
+    assert result.stderr == ""
+
+
+def test_forked_python_source_reports_signal_returncode(tmp_path: Path) -> None:
+    source_path = tmp_path / "signal-source.py"
+    source_path.write_text(
+        "import os, signal\nos.kill(os.getpid(), signal.SIGUSR1)\n",
+        encoding="utf-8",
+    )
+    snapshot = hs._read_owned_regular_file(
+        source_path,
+        max_bytes=hs.MAX_CONFIG_BYTES,
+        label="signal source",
+    )
+
+    result = hs.CommandRunner(timeout_seconds=2).run_python_source(
+        [sys.executable, *hs.PYTHON_ISOLATION_FLAGS, str(source_path)],
+        source=snapshot,
+        source_path=source_path,
+        cwd=tmp_path,
+        env=hs._trusted_process_environment(),
+    )
+
+    assert result.returncode == -signal.SIGUSR1
+
+
+def test_forked_python_source_timeout_before_setsid_kills_and_reaps_pid(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_path = tmp_path / "pre-setsid-timeout.py"
+    source_path.write_text("raise AssertionError('source must not run')\n", encoding="utf-8")
+    snapshot = hs._read_owned_regular_file(
+        source_path,
+        max_bytes=hs.MAX_CONFIG_BYTES,
+        label="pre-setsid timeout source",
+    )
+    real_fork = hs.os.fork
+    real_setsid = hs.os.setsid
+    started: dict[str, int] = {}
+
+    def record_fork() -> int:
+        pid = real_fork()
+        if pid > 0:
+            started["pid"] = pid
+        return pid
+
+    def delayed_setsid() -> None:
+        time.sleep(0.5)
+        real_setsid()
+
+    monkeypatch.setattr(hs.os, "fork", record_fork)
+    monkeypatch.setattr(hs.os, "setsid", delayed_setsid)
+    runner = hs.CommandRunner(
+        timeout_seconds=0.05,
+        term_grace_seconds=0.05,
+        kill_grace_seconds=1,
+    )
+
+    with pytest.raises(hs.SetupError, match="command timed out"):
+        runner.run_python_source(
+            [sys.executable, *hs.PYTHON_ISOLATION_FLAGS, str(source_path)],
+            source=snapshot,
+            source_path=source_path,
+            cwd=tmp_path,
+            env=hs._trusted_process_environment(),
+        )
+
+    pid = started["pid"]
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)
+
+
+def _fork_supervision_fixture(
+    tmp_path: Path,
+    *,
+    output_bytes: int,
+) -> tuple[Path, hs.FileSnapshot, Path, Path]:
+    late_write = tmp_path / "fork-late-write"
+    readiness = tmp_path / "fork-grandchild-ready.json"
+    grandchild = tmp_path / "fork-grandchild.py"
+    grandchild.write_text(
+        "import pathlib, signal, sys, time\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "time.sleep(0.8)\n"
+        "pathlib.Path(sys.argv[1]).write_text('late', encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+    source_path = tmp_path / "fork-supervised-source.py"
+    source_path.write_text(
+        "import json, os, pathlib, signal, subprocess, sys, time\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        f"process = subprocess.Popen([sys.executable, {str(grandchild)!r}, "
+        f"{str(late_write)!r}])\n"
+        f"pathlib.Path({str(readiness)!r}).write_text("
+        "json.dumps({'pid': process.pid, 'pgid': os.getpgrp()}), encoding='utf-8')\n"
+        f"output_bytes = {output_bytes}\n"
+        "if output_bytes:\n"
+        "    os.write(1, b'x' * output_bytes)\n"
+        "time.sleep(5)\n",
+        encoding="utf-8",
+    )
+    snapshot = hs._read_owned_regular_file(
+        source_path,
+        max_bytes=hs.MAX_CONFIG_BYTES,
+        label="fork supervision source",
+    )
+    return source_path, snapshot, readiness, late_write
+
+
+def _assert_fork_descendant_cleaned(readiness: Path, late_write: Path) -> None:
+    observed = json.loads(readiness.read_text(encoding="utf-8"))
+    pid = observed["pid"]
+    process_group = observed["pgid"]
+    assert isinstance(pid, int)
+    assert isinstance(process_group, int)
+    assert pid != process_group
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.01)
+    else:
+        pytest.fail(f"forked helper descendant {pid} survived cleanup")
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline:
+        try:
+            os.killpg(process_group, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.01)
+    else:
+        pytest.fail(f"forked helper process group {process_group} survived cleanup")
+    time.sleep(0.85)
+    assert not late_write.exists()
+
+
+def test_forked_python_source_timeout_kills_descendant_group(tmp_path: Path) -> None:
+    source_path, snapshot, readiness, late_write = _fork_supervision_fixture(
+        tmp_path,
+        output_bytes=0,
+    )
+    runner = hs.CommandRunner(
+        timeout_seconds=0.3,
+        term_grace_seconds=0.1,
+        kill_grace_seconds=1,
+    )
+
+    with pytest.raises(hs.SetupError, match="command timed out"):
+        runner.run_python_source(
+            [sys.executable, *hs.PYTHON_ISOLATION_FLAGS, str(source_path)],
+            source=snapshot,
+            source_path=source_path,
+            cwd=tmp_path,
+            env=hs._trusted_process_environment(),
+        )
+
+    _assert_fork_descendant_cleaned(readiness, late_write)
+
+
+def test_forked_python_source_output_cap_kills_descendant_group(tmp_path: Path) -> None:
+    output_limit = 4096
+    source_path, snapshot, readiness, late_write = _fork_supervision_fixture(
+        tmp_path,
+        output_bytes=output_limit * 2,
+    )
+    runner = hs.CommandRunner(
+        timeout_seconds=5,
+        term_grace_seconds=0.1,
+        kill_grace_seconds=1,
+        output_limit_bytes=output_limit,
+    )
+
+    with pytest.raises(hs.CommandOutputLimitError) as captured:
+        runner.run_python_source(
+            [sys.executable, *hs.PYTHON_ISOLATION_FLAGS, str(source_path)],
+            source=snapshot,
+            source_path=source_path,
+            cwd=tmp_path,
+            env=hs._trusted_process_environment(),
+        )
+
+    assert captured.value.captured_total_bytes == output_limit
+    _assert_fork_descendant_cleaned(readiness, late_write)
 
 
 @pytest.mark.parametrize("returncode", [0, 17])
