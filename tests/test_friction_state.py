@@ -1070,7 +1070,7 @@ def test_closed_publication_tuple_allows_only_a_higher_semantic_revision(tmp_pat
         "previous_snapshot_digest": completed["snapshot_digest"],
         "stage_receipts": [_receipt_ref(second_stage)],
         "dormancy_receipts": [],
-        "summary": _audit_summary(),
+        "summary": _audit_summary(candidates_considered=1, cases_updated=1),
     }
     second_completed = fs.complete_audit(
         root,
@@ -1164,6 +1164,81 @@ def test_daily_audit_summary_is_exact_and_bounded(tmp_path: Path, summary: dict[
     assert not root.exists()
 
 
+@pytest.mark.parametrize(
+    ("field", "incorrect"),
+    [
+        ("cases_created", 0),
+        ("cases_updated", 1),
+        ("cases_unchanged", 1),
+        ("cases_dormant", 1),
+    ],
+)
+def test_daily_audit_case_counts_must_match_exact_stage_receipts(
+    tmp_path: Path, field: str, incorrect: int
+) -> None:
+    case = _candidate()
+    root, stage = _stage(tmp_path, case)
+    summary = _audit_summary(candidates_considered=1, cases_created=1)
+    summary[field] = incorrect
+    audit_id = f"mismatched-{field}"
+    audit = {
+        "version": 1,
+        "kind": "daily-audit",
+        "audit_id": audit_id,
+        "started_at": "2026-07-10T11:00:00Z",
+        "ended_at": "2026-07-10T12:30:00Z",
+        "previous_snapshot_digest": None,
+        "stage_receipts": [_receipt_ref(stage)],
+        "dormancy_receipts": [],
+        "summary": summary,
+    }
+    with pytest.raises(fs.StateError, match="does not match its exact receipts"):
+        fs.complete_audit(
+            root,
+            _write(tmp_path / f"{audit_id}.json", audit),
+            "2026-07-10T12:31:00Z",
+            historical_replay=False,
+        )
+    intent_path, _ = fs._wal_paths("complete-audit", audit_id)
+    assert not (root / intent_path).exists()
+    assert not (root / fs.LIVE_POINTER).exists()
+
+
+def test_daily_audit_dormant_count_must_match_changed_receipt_entries(tmp_path: Path) -> None:
+    case = _candidate(lifecycle_at="2026-06-01T12:00:00Z")
+    root, stage = _stage(tmp_path, case)
+    completed = _complete_live(tmp_path, root, [stage])
+    dormancy = fs.transition_dormant(root, "2026-07-12T12:00:00Z")
+    assert len(dormancy["changed"]) == 1
+    audit = {
+        "version": 1,
+        "kind": "daily-audit",
+        "audit_id": "mismatched-dormancy-count",
+        "started_at": "2026-07-12T11:00:00Z",
+        "ended_at": "2026-07-12T12:30:00Z",
+        "previous_snapshot_digest": completed["snapshot_digest"],
+        "stage_receipts": [],
+        "dormancy_receipts": [_receipt_ref(dormancy)],
+        "summary": _audit_summary(cases_dormant=0),
+    }
+    with pytest.raises(fs.StateError, match=r"cases_dormant=0 \(expected 1\)"):
+        fs.complete_audit(
+            root,
+            _write(tmp_path / "mismatched-dormancy-count.json", audit),
+            "2026-07-12T12:31:00Z",
+            historical_replay=False,
+        )
+    assert not (root / "completed" / "mismatched-dormancy-count.json").exists()
+    audit["summary"] = _audit_summary(cases_dormant=1)
+    completed_dormancy = fs.complete_audit(
+        root,
+        _write(tmp_path / "matched-dormancy-count.json", audit),
+        "2026-07-12T12:32:00Z",
+        historical_replay=False,
+    )
+    assert completed_dormancy["status"] == "completed"
+
+
 def test_historical_completion_is_isolated_and_never_writes_live_pointer(tmp_path: Path) -> None:
     case = _candidate()
     root, stage = _stage(tmp_path / "pilot", case)
@@ -1176,7 +1251,7 @@ def test_historical_completion_is_isolated_and_never_writes_live_pointer(tmp_pat
         "previous_snapshot_digest": None,
         "stage_receipts": [_receipt_ref(stage)],
         "dormancy_receipts": [],
-        "summary": _audit_summary(),
+        "summary": _audit_summary(candidates_considered=1, cases_created=1),
     }
     completed = fs.complete_audit(
         root,
@@ -1470,7 +1545,7 @@ def test_complete_audit_recovers_history_pointer_gap_across_now(
         "previous_snapshot_digest": None,
         "stage_receipts": [_receipt_ref(stage)],
         "dormancy_receipts": [],
-        "summary": _audit_summary(),
+        "summary": _audit_summary(candidates_considered=1, cases_created=1),
     }
     receipt_path = _write(tmp_path / "pointer-gap.json", audit)
     original = fs.StateStore.write_json
@@ -1503,6 +1578,76 @@ def test_complete_audit_recovers_history_pointer_gap_across_now(
     assert fs._load_json(history)["completed_at"] == "2026-07-10T12:31:00Z"
     replay = fs.complete_audit(root, receipt_path, "2026-07-10T14:31:00Z", historical_replay=False)
     assert replay == recovered
+
+
+def test_pending_complete_audit_wal_revalidates_its_persisted_receipt_counts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    case = _candidate()
+    root, stage = _stage(tmp_path, case)
+    audit_id = "legacy-invalid-count"
+    audit = {
+        "version": 1,
+        "kind": "daily-audit",
+        "audit_id": audit_id,
+        "started_at": "2026-07-10T11:00:00Z",
+        "ended_at": "2026-07-10T12:30:00Z",
+        "previous_snapshot_digest": None,
+        "stage_receipts": [_receipt_ref(stage)],
+        "dormancy_receipts": [],
+        "summary": _audit_summary(candidates_considered=1),
+    }
+    receipt_path = _write(tmp_path / "legacy-invalid-count.json", audit)
+    original_count_validator = fs._validate_receipt_backed_audit_counts
+    original_write = fs.StateStore.write_json
+    history_relative = Path("completed") / f"{audit_id}.json"
+
+    def skip_legacy_count_validation(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    def fail_first_snapshot(
+        store: Any,
+        relative: Path | str,
+        value: dict[str, Any],
+        *,
+        immutable: bool = False,
+    ) -> str:
+        if Path(relative) == history_relative:
+            raise OSError("injected legacy completion interruption")
+        return original_write(store, relative, value, immutable=immutable)
+
+    monkeypatch.setattr(fs, "_validate_receipt_backed_audit_counts", skip_legacy_count_validation)
+    monkeypatch.setattr(fs.StateStore, "write_json", fail_first_snapshot)
+    with pytest.raises(OSError, match="injected legacy completion interruption"):
+        fs.complete_audit(root, receipt_path, "2026-07-10T12:31:00Z", historical_replay=False)
+    monkeypatch.setattr(fs, "_validate_receipt_backed_audit_counts", original_count_validator)
+    monkeypatch.setattr(fs.StateStore, "write_json", original_write)
+
+    intent_path, commit_path = fs._wal_paths("complete-audit", f"live:{audit_id}")
+    assert (root / intent_path).exists()
+    assert not (root / commit_path).exists()
+    assert not (root / history_relative).exists()
+    before = _tree_bytes(root)
+
+    corrected = json.loads(json.dumps(audit))
+    corrected["summary"] = _audit_summary(candidates_considered=1, cases_created=1)
+    with pytest.raises(fs.StateError, match="does not match its exact receipts"):
+        fs.complete_audit(
+            root,
+            _write(tmp_path / "corrected-legacy-count.json", corrected),
+            "2026-07-10T12:32:00Z",
+            historical_replay=False,
+        )
+    assert _tree_bytes(root) == before
+
+    another_case = _candidate(occurrences=[_occurrence(0, root="root:generic-recovery")])
+    with pytest.raises(fs.StateError, match="does not match its exact receipts"):
+        fs.stage_candidate(
+            _write(tmp_path / "generic-recovery.json", another_case),
+            root,
+            "2026-07-10T12:33:00Z",
+        )
+    assert _tree_bytes(root) == before
 
 
 def test_dormancy_batch_recovers_without_double_revision(
@@ -1917,6 +2062,71 @@ def test_store_distinguishes_benign_metadata_churn_identity_and_content_change(
             store.finish()
     finally:
         monkeypatch.setattr(os, "read", original_read)
+        store.close()
+
+
+def test_state_transaction_revalidates_full_ancestor_chain_before_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ancestor = tmp_path / "bound-ancestor"
+    ancestor.mkdir(mode=0o700)
+    root = ancestor / "state"
+    displaced_ancestor = tmp_path / "displaced-ancestor"
+    store = fs.StateStore(root)
+    store.acquire_lock()
+    original_apply = fs._apply_wal_intent
+    displaced = False
+
+    def displace_after_writes(current: Any, intent: dict[str, Any]) -> None:
+        nonlocal displaced
+        original_apply(current, intent)
+        if not displaced:
+            displaced = True
+            ancestor.rename(displaced_ancestor)
+            ancestor.mkdir(mode=0o700)
+
+    monkeypatch.setattr(fs, "_apply_wal_intent", displace_after_writes)
+    try:
+        write = fs._planned_write(store, Path("probe.json"), {"value": 1}, immutable=False)
+        with pytest.raises(
+            fs.StateError, match="name was rebound during before transaction commit"
+        ):
+            fs._run_transaction(
+                store,
+                operation="stage",
+                natural_key="ancestor-replacement",
+                request={"operation": "ancestor-replacement"},
+                captured_at="2026-07-10T12:00:00Z",
+                writes=[write],
+                result={"status": "must-not-commit"},
+            )
+        _, commit_path = fs._wal_paths("stage", "ancestor-replacement")
+        assert (displaced_ancestor / "state" / "probe.json").exists()
+        assert not (displaced_ancestor / "state" / commit_path).exists()
+        assert not (root / "probe.json").exists()
+    finally:
+        store.close()
+
+
+def test_state_chain_binds_ancestor_access_policy_but_ignores_metadata_churn(
+    tmp_path: Path,
+) -> None:
+    ancestor = tmp_path / "policy-ancestor"
+    ancestor.mkdir(mode=0o700)
+    root = ancestor / "state"
+    store = fs.StateStore(root)
+    store.acquire_lock()
+    try:
+        transient = ancestor / "transient"
+        transient.mkdir(mode=0o700)
+        store._bind_state_chain("benign ancestor child churn")
+        transient.rmdir()
+
+        ancestor.chmod(0o750)
+        with pytest.raises(fs.StateError, match="access policy changed"):
+            store._bind_state_chain("ancestor mode drift")
+    finally:
+        ancestor.chmod(0o700)
         store.close()
 
 

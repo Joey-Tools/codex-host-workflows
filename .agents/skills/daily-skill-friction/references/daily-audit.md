@@ -94,7 +94,11 @@ the shown subcommand and arguments, and never execute the script directly:
    }
    ```
 
-   Every count is a nonnegative integer within the helper's bound.
+   Every count is a nonnegative integer within the helper's bound. The helper
+   derives `cases_created`, `cases_updated`, and `cases_unchanged` from the exact
+   validated stage receipts and derives `cases_dormant` from the changed entries
+   in the exact validated dormancy receipts; any supplied mismatch blocks
+   completion before a completion WAL intent is written.
    `next_watchpoint` is either `null` or a 1–240 character string. Do not add
    summary fields. Then call
    `complete-audit --state-root <DIR> --receipt <FILE> --now <ISO>`. For an

@@ -222,6 +222,19 @@ class ServiceState:
     label: str
     loaded: bool
     plist_snapshot: FileSnapshot | None = None
+    definition: LoadedLaunchAgent | None = None
+
+
+@dataclasses.dataclass(frozen=True)
+class LoadedLaunchAgent:
+    source_path: str
+    program: str
+    program_arguments: tuple[str, ...]
+    working_directory: str
+    standard_out_path: str
+    standard_error_path: str
+    environment_variables: dict[str, str]
+    calendar_intervals: tuple[tuple[tuple[str, int], ...], ...]
 
 
 class CommandRunner:
@@ -2235,10 +2248,219 @@ def _known_launchctl_not_found(result: subprocess.CompletedProcess[str]) -> bool
     )
 
 
+def _launchctl_scalar(lines: Sequence[str], key: str) -> str:
+    prefix = f"\t{key} = "
+    values = [line.removeprefix(prefix) for line in lines if line.startswith(prefix)]
+    if len(values) != 1 or not values[0] or values[0] == "{":
+        raise SetupError(f"launchctl print has an invalid {key} field")
+    return values[0]
+
+
+def _launchctl_top_level_block(lines: Sequence[str], key: str) -> list[str]:
+    opening = f"\t{key} = {{"
+    starts = [index for index, line in enumerate(lines) if line == opening]
+    if len(starts) != 1:
+        raise SetupError(f"launchctl print has an invalid {key} block")
+    start = starts[0]
+    depth = 1
+    for index in range(start + 1, len(lines)):
+        stripped = lines[index].lstrip("\t")
+        if stripped.endswith(" = {"):
+            depth += 1
+        elif stripped == "}":
+            depth -= 1
+            if depth == 0:
+                return list(lines[start + 1 : index])
+    raise SetupError(f"launchctl print has an unterminated {key} block")
+
+
+def _parse_launchctl_arguments(lines: Sequence[str]) -> tuple[str, ...]:
+    arguments: list[str] = []
+    for line in _launchctl_top_level_block(lines, "arguments"):
+        if not line.startswith("\t\t") or line.startswith("\t\t\t"):
+            raise SetupError("launchctl print has an invalid arguments entry")
+        value = line.removeprefix("\t\t")
+        if not value:
+            raise SetupError("launchctl print has an empty arguments entry")
+        arguments.append(value)
+    if not arguments:
+        raise SetupError("launchctl print has no program arguments")
+    return tuple(arguments)
+
+
+def _parse_launchctl_environment(lines: Sequence[str]) -> dict[str, str]:
+    environment: dict[str, str] = {}
+    for line in _launchctl_top_level_block(lines, "environment"):
+        if not line.startswith("\t\t") or line.startswith("\t\t\t"):
+            raise SetupError("launchctl print has an invalid environment entry")
+        key, separator, value = line.removeprefix("\t\t").partition(" => ")
+        if not separator or not key or not value or key in environment:
+            raise SetupError("launchctl print has an invalid environment entry")
+        environment[key] = value
+    return environment
+
+
+def _parse_launchctl_calendar_intervals(
+    lines: Sequence[str],
+) -> tuple[tuple[tuple[str, int], ...], ...]:
+    triggers = _launchctl_top_level_block(lines, "event triggers")
+    intervals: list[tuple[tuple[str, int], ...]] = []
+    index = 0
+    while index < len(triggers):
+        line = triggers[index]
+        if line.lstrip("\t") != "descriptor = {":
+            index += 1
+            continue
+        indent = len(line) - len(line.lstrip("\t"))
+        if indent < 2:
+            raise SetupError("launchctl print has an invalid calendar descriptor")
+        closing = "\t" * indent + "}"
+        entry_prefix = "\t" * (indent + 1)
+        descriptor: dict[str, int] = {}
+        index += 1
+        while index < len(triggers) and triggers[index] != closing:
+            entry = triggers[index]
+            if not entry.startswith(entry_prefix) or entry.startswith(entry_prefix + "\t"):
+                raise SetupError("launchctl print has an invalid calendar descriptor entry")
+            match = re.fullmatch(r'"([A-Za-z]+)" => (-?[0-9]+)', entry.removeprefix(entry_prefix))
+            if match is None or match.group(1) in descriptor:
+                raise SetupError("launchctl print has an invalid calendar descriptor entry")
+            descriptor[match.group(1)] = int(match.group(2))
+            index += 1
+        if index == len(triggers) or not descriptor:
+            raise SetupError("launchctl print has an unterminated calendar descriptor")
+        intervals.append(tuple(sorted(descriptor.items())))
+        index += 1
+    if not intervals:
+        raise SetupError("launchctl print has no calendar interval")
+    return tuple(sorted(intervals))
+
+
+def _parse_launchctl_definition(
+    service: str,
+    output: str,
+) -> LoadedLaunchAgent:
+    if len(output.encode("utf-8")) > MAX_CONFIG_BYTES:
+        raise SetupError("launchctl print output exceeds the size limit")
+    lines = output.splitlines()
+    if not lines or lines[0] != f"{service} = {{" or lines[-1] != "}":
+        raise SetupError("launchctl print does not describe the requested service")
+    if _launchctl_scalar(lines, "type") != "LaunchAgent":
+        raise SetupError("launchctl print does not describe a LaunchAgent")
+    return LoadedLaunchAgent(
+        source_path=_launchctl_scalar(lines, "path"),
+        program=_launchctl_scalar(lines, "program"),
+        program_arguments=_parse_launchctl_arguments(lines),
+        working_directory=_launchctl_scalar(lines, "working directory"),
+        standard_out_path=_launchctl_scalar(lines, "stdout path"),
+        standard_error_path=_launchctl_scalar(lines, "stderr path"),
+        environment_variables=_parse_launchctl_environment(lines),
+        calendar_intervals=_parse_launchctl_calendar_intervals(lines),
+    )
+
+
+def _expected_calendar_intervals(
+    expected: Mapping[str, Any],
+) -> tuple[tuple[tuple[str, int], ...], ...]:
+    configured = expected.get("StartCalendarInterval")
+    entries = [configured] if isinstance(configured, dict) else configured
+    if not isinstance(entries, list) or not entries:
+        raise SetupError("verified LaunchAgent has invalid StartCalendarInterval")
+    intervals: list[tuple[tuple[str, int], ...]] = []
+    for entry in entries:
+        if not isinstance(entry, dict) or not entry:
+            raise SetupError("verified LaunchAgent has invalid StartCalendarInterval")
+        normalized: list[tuple[str, int]] = []
+        for key, value in entry.items():
+            if not isinstance(key, str) or not isinstance(value, int) or isinstance(value, bool):
+                raise SetupError("verified LaunchAgent has invalid StartCalendarInterval")
+            normalized.append((key, value))
+        intervals.append(tuple(sorted(normalized)))
+    return tuple(sorted(intervals))
+
+
+def _loaded_definition_mismatches(
+    spec: LaunchAgentSpec,
+    definition: LoadedLaunchAgent | None,
+    expected: Mapping[str, Any],
+) -> tuple[str, ...]:
+    """Bind behavior-affecting loaded configuration to the verified plist.
+
+    The source path, execution inputs, working directory, output paths, explicit
+    environment, and schedule define what launchd will run and when. Volatile
+    runtime fields such as state, counters, PIDs, and exit status are deliberately
+    ignored because they do not change that protected configuration property.
+    """
+    if definition is None:
+        return ("definition",)
+    label = expected.get("Label")
+    arguments = expected.get("ProgramArguments")
+    working_directory = expected.get("WorkingDirectory")
+    stdout_path = expected.get("StandardOutPath")
+    stderr_path = expected.get("StandardErrorPath")
+    environment = expected.get("EnvironmentVariables")
+    if (
+        label != spec.label
+        or not isinstance(arguments, list)
+        or not arguments
+        or not all(isinstance(value, str) and value for value in arguments)
+        or not isinstance(working_directory, str)
+        or not isinstance(stdout_path, str)
+        or not isinstance(stderr_path, str)
+        or not isinstance(environment, dict)
+        or not all(
+            isinstance(key, str) and isinstance(value, str) for key, value in environment.items()
+        )
+    ):
+        raise SetupError(f"verified {spec.key} LaunchAgent definition is invalid")
+
+    mismatches: list[str] = []
+    if definition.source_path != str(spec.destination):
+        mismatches.append("path")
+    if definition.program != arguments[0]:
+        mismatches.append("program")
+    if definition.program_arguments != tuple(arguments):
+        mismatches.append("ProgramArguments")
+    if definition.working_directory != working_directory:
+        mismatches.append("WorkingDirectory")
+    if definition.standard_out_path != stdout_path:
+        mismatches.append("StandardOutPath")
+    if definition.standard_error_path != stderr_path:
+        mismatches.append("StandardErrorPath")
+
+    observed_environment = dict(definition.environment_variables)
+    service_name = observed_environment.pop("XPC_SERVICE_NAME", spec.label)
+    observed_environment.pop("OSLogRateLimit", None)
+    if service_name != spec.label or observed_environment != environment:
+        mismatches.append("EnvironmentVariables")
+    if definition.calendar_intervals != _expected_calendar_intervals(expected):
+        mismatches.append("StartCalendarInterval")
+    return tuple(mismatches)
+
+
+def _require_loaded_definition(
+    spec: LaunchAgentSpec,
+    state: ServiceState,
+    expected: Mapping[str, Any],
+    *,
+    action: str,
+) -> None:
+    if not state.loaded:
+        raise SetupError(f"{action} did not load {spec.label}")
+    mismatches = _loaded_definition_mismatches(spec, state.definition, expected)
+    if mismatches:
+        raise SetupError(
+            f"{action} loaded an unexpected definition for {spec.label}: "
+            f"fields={','.join(mismatches)}"
+        )
+
+
 def _query_service(label: str, runner: CommandRunner) -> ServiceState:
-    result = runner.run(["launchctl", "print", _launchctl_service(label)])
+    service = _launchctl_service(label)
+    result = runner.run(["launchctl", "print", service])
     if result.returncode == 0:
-        return ServiceState(label=label, loaded=True)
+        definition = _parse_launchctl_definition(service, result.stdout)
+        return ServiceState(label=label, loaded=True, definition=definition)
     if _known_launchctl_not_found(result):
         return ServiceState(label=label, loaded=False)
     detail = (result.stderr or result.stdout).strip()[:MAX_COMMAND_DETAIL]
@@ -2262,6 +2484,15 @@ def _check_launchctl(spec: LaunchAgentSpec, runner: CommandRunner, *, no_launchc
             "needs-apply",
             f"service is not loaded: {spec.label}",
         )
+    try:
+        _require_loaded_definition(
+            spec,
+            state,
+            spec.expected,
+            action="launchctl print",
+        )
+    except SetupError as error:
+        return Check(f"launchctl-{spec.key}", "blocked", str(error))
     return Check(f"launchctl-{spec.key}", "ready", _launchctl_service(spec.label))
 
 
@@ -3802,8 +4033,12 @@ def _reload_services(
             action=f"launchctl bootstrap {spec.label}",
         )
         verified = _query_service(spec.label, runner)
-        if not verified.loaded:
-            raise SetupError(f"launchctl did not load {spec.label}")
+        _require_loaded_definition(
+            spec,
+            verified,
+            spec.expected,
+            action="launchctl bootstrap",
+        )
 
 
 def _restore_services(
@@ -3850,8 +4085,16 @@ def _restore_services(
                     ],
                     action=f"rollback bootstrap {spec.label}",
                 )
-                if not _query_service(spec.label, runner).loaded:
-                    raise SetupError(f"rollback service verification failed: {spec.label}")
+                snapshot = original[spec.label].plist_snapshot
+                if snapshot is None:
+                    raise SetupError(f"rollback lacks the prior plist: {spec.label}")
+                expected = _load_plist(snapshot.data, label="rollback LaunchAgent")
+                _require_loaded_definition(
+                    spec,
+                    _query_service(spec.label, runner),
+                    expected,
+                    action="rollback bootstrap",
+                )
         except SetupError as error:
             errors.append(str(error))
     return errors
@@ -4242,6 +4485,22 @@ def _service_preflight(
             raise SetupError(
                 f"cannot safely restore loaded service after plist drift: {spec.label}"
             )
+        installed_definition = _load_plist(
+            installed.data,
+            label=f"installed {spec.key} LaunchAgent",
+        )
+        try:
+            _require_loaded_definition(
+                spec,
+                original[spec.label],
+                installed_definition,
+                action="launchctl preflight",
+            )
+        except SetupError as error:
+            raise SetupError(
+                f"cannot safely restore loaded service with a foreign definition: "
+                f"{spec.label}; {error}"
+            ) from error
         original[spec.label] = dataclasses.replace(
             original[spec.label], plist_snapshot=plan.installed
         )

@@ -91,7 +91,65 @@ class FakeRunner(hs.CommandRunner):
         self.helper_failures = helper_failures or {}
         self.launch_failures = launch_failures or {}
         self.loaded: dict[str, bool] = {}
+        self.loaded_definitions: dict[str, tuple[Path, dict[str, Any]]] = {}
         self.print_error = print_error
+
+    def load_plist(self, path: Path) -> None:
+        parsed = plistlib.loads(path.read_bytes())
+        assert isinstance(parsed, dict)
+        label = parsed["Label"]
+        assert isinstance(label, str)
+        self.loaded[label] = True
+        self.loaded_definitions[label] = (path, parsed)
+
+    def _print_definition(self, label: str) -> str:
+        path, definition = self.loaded_definitions[label]
+        arguments = definition["ProgramArguments"]
+        environment = definition["EnvironmentVariables"]
+        configured_intervals = definition["StartCalendarInterval"]
+        intervals = (
+            configured_intervals
+            if isinstance(configured_intervals, list)
+            else [configured_intervals]
+        )
+        lines = [
+            f"gui/{os.getuid()}/{label} = {{",
+            "\tactive count = 0",
+            f"\tpath = {path}",
+            "\ttype = LaunchAgent",
+            "\tstate = not running",
+            "",
+            f"\tprogram = {arguments[0]}",
+            "\targuments = {",
+            *(f"\t\t{argument}" for argument in arguments),
+            "\t}",
+            "",
+            f"\tworking directory = {definition['WorkingDirectory']}",
+            "",
+            f"\tstdout path = {definition['StandardOutPath']}",
+            f"\tstderr path = {definition['StandardErrorPath']}",
+            "\tenvironment = {",
+            "\t\tOSLogRateLimit => 64",
+            *(f"\t\t{key} => {value}" for key, value in environment.items()),
+            f"\t\tXPC_SERVICE_NAME => {label}",
+            "\t}",
+            "",
+            "\tevent triggers = {",
+        ]
+        for index, interval in enumerate(intervals, start=1):
+            lines.extend(
+                [
+                    f"\t\t{label}.{index} => {{",
+                    f"\t\t\tservice = {label}",
+                    "\t\t\tstream = com.apple.launchd.calendarinterval",
+                    "\t\t\tdescriptor = {",
+                    *(f'\t\t\t\t"{key}" => {value}' for key, value in interval.items()),
+                    "\t\t\t}",
+                    "\t\t}",
+                ]
+            )
+        lines.extend(["\t}", "}"])
+        return "\n".join(lines) + "\n"
 
     def _launch_result(self, args: list[str]) -> subprocess.CompletedProcess[str]:
         action = args[1]
@@ -102,7 +160,8 @@ class FakeRunner(hs.CommandRunner):
                     args, self.print_error, "", "launchctl transport failure"
                 )
             if self.loaded.get(label, False):
-                return subprocess.CompletedProcess(args, 0, "service = ready", "")
+                output = self._print_definition(label)
+                return subprocess.CompletedProcess(args, 0, output, "")
             return subprocess.CompletedProcess(args, 113, "", "Could not find service")
         label = Path(args[-1]).stem if action == "bootstrap" else args[2].rsplit("/", 1)[-1]
         failures = self.launch_failures.get((action, label), [])
@@ -110,7 +169,10 @@ class FakeRunner(hs.CommandRunner):
             code = failures.pop(0)
             if code:
                 return subprocess.CompletedProcess(args, code, "", f"{action} failed")
-        self.loaded[label] = action == "bootstrap"
+        if action == "bootstrap":
+            self.load_plist(Path(args[-1]))
+        else:
+            self.loaded[label] = False
         return subprocess.CompletedProcess(args, 0, "", "")
 
     def run(
@@ -288,6 +350,15 @@ def _apply_ready(fixture: HostFixture, runner: FakeRunner | None = None) -> dict
         ensure=False,
         no_launchctl=False,
     )
+
+
+def _load_installed_services(
+    runner: FakeRunner,
+    config: hs.HostConfig,
+    home: Path,
+) -> None:
+    for spec in hs._launch_agent_specs(config, home):
+        runner.load_plist(spec.destination)
 
 
 def _write_stamp(
@@ -1163,10 +1234,7 @@ def test_plist_source_drift_after_plan_fails_before_service_reload(tmp_path: Pat
             return super().run(args, cwd=cwd, env=env)
 
     runner = DriftRunner()
-    runner.loaded = {
-        active.launch_agent_label: True,
-        active.weekly_launch_agent_label: True,
-    }
+    _load_installed_services(runner, active, fixture.home)
     with pytest.raises(hs.SetupError, match="source changed"):
         _apply_ready(fixture, runner)
     assert control_spec.destination.read_bytes() == installed_before
@@ -1183,6 +1251,44 @@ def test_launchctl_unknown_print_error_blocks_without_mutation(tmp_path: Path) -
         _apply_ready(fixture, FakeRunner(print_error=5))
     assert hs._exclude_path(fixture.config).read_bytes() == before
     assert not fixture.config.skill_locator.exists()
+
+
+def test_launchctl_exact_loaded_definition_is_ready(tmp_path: Path) -> None:
+    fixture = _build_host(tmp_path)
+    runner = FakeRunner()
+    _apply_ready(fixture, runner)
+    active = _active(fixture)
+
+    report = hs.status_setup(active, fixture.home, runner, no_launchctl=False)
+
+    assert report["status"] == "ready"
+    assert _check(report, "launchctl-control")["status"] == "ready"
+    assert _check(report, "launchctl-weekly")["status"] == "ready"
+
+
+def test_launchctl_same_label_foreign_definition_is_blocked(tmp_path: Path) -> None:
+    fixture = _build_host(tmp_path)
+    runner = FakeRunner()
+    _apply_ready(fixture, runner)
+    active = _active(fixture)
+    label = active.launch_agent_label
+    path, expected = runner.loaded_definitions[label]
+    foreign = plistlib.loads(plistlib.dumps(expected))
+    foreign["ProgramArguments"] = ["/usr/bin/false", "foreign"]
+    runner.loaded_definitions[label] = (path, foreign)
+    calls_before_status = len(runner.calls)
+
+    report = hs.status_setup(active, fixture.home, runner, no_launchctl=False)
+
+    check = _check(report, "launchctl-control")
+    assert report["status"] == "blocked"
+    assert check["status"] == "blocked"
+    assert "unexpected definition" in check["detail"]
+    assert "ProgramArguments" in check["detail"]
+    assert not any(
+        args[:2] in (["launchctl", "bootout"], ["launchctl", "bootstrap"])
+        for args, _cwd in runner.calls[calls_before_status:]
+    )
 
 
 def test_bootstrap_failure_rolls_back_owned_state(tmp_path: Path) -> None:
@@ -1216,10 +1322,7 @@ def test_bootout_failure_restores_prior_plist_and_loaded_service(tmp_path: Path)
     )
     _commit_and_push(active.control_mirror, fixture.control_remote, "plist revision")
     runner = FakeRunner(launch_failures={("bootout", active.launch_agent_label): [7]})
-    runner.loaded = {
-        active.launch_agent_label: True,
-        active.weekly_launch_agent_label: True,
-    }
+    _load_installed_services(runner, active, fixture.home)
     with pytest.raises(hs.SetupError, match="bootout"):
         _apply_ready(fixture, runner)
     assert control_spec.destination.read_bytes() == prior
@@ -1245,7 +1348,8 @@ def test_service_restore_is_gated_per_label(tmp_path: Path, other_was_loaded: bo
         weekly.label: hs.ServiceState(weekly.label, other_was_loaded, weekly_before),
     }
     runner = FakeRunner()
-    runner.loaded = {control.label: True, weekly.label: True}
+    runner.load_plist(control.destination)
+    runner.load_plist(weekly.destination)
     errors = hs._restore_services(
         (control, weekly), original, {control.label, weekly.label}, runner
     )

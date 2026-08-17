@@ -1404,10 +1404,15 @@ def _json_limit_for_parts(parts: Sequence[str]) -> int:
 class StateStore:
     """Descriptor-rooted owner-private state storage.
 
-    The retained parent/root descriptors protect the selected root object's
-    identity.  Every child lookup is relative to a validated directory fd with
-    ``O_NOFOLLOW``.  Reads bind content by a repeated bounded read, while writes
-    fsync both the file and every newly changed parent directory entry.
+    The retained directory descriptors protect the complete path from the
+    filesystem root through the selected state root.  Every path component is
+    bound to its object identity, type, access policy, and parent-visible name.
+    Timestamps and directory link counts are deliberately excluded because
+    ordinary child-entry churn can change them without replacing the protected
+    object or its access policy.  Every child lookup is relative to a validated
+    directory fd with ``O_NOFOLLOW``.  Reads bind content by a repeated bounded
+    read, while writes fsync both the file and every newly changed parent
+    directory entry.
     """
 
     def __init__(self, root: Path, *, create: bool = True) -> None:
@@ -1415,10 +1420,9 @@ class StateStore:
         if self.root == Path(self.root.anchor):
             _fail("unsafe-state-root", "state root cannot be a filesystem root")
         self._ancestor_fds: list[int] = []
-        self.parent_fd = -1
+        self._chain_names: list[str | None] = []
+        self._chain_signals: list[tuple[int, int, int, int, int, int]] = []
         self.root_fd = -1
-        self.root_name = self.root.name
-        self.root_identity: tuple[int, int] | None = None
         self.lock_fd = -1
         self.lock_identity: tuple[int, int, int] | None = None
         try:
@@ -1431,6 +1435,8 @@ class StateStore:
         flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
         current = os.open(self.root.anchor, flags)
         self._ancestor_fds.append(current)
+        self._chain_names.append(None)
+        self._chain_signals.append(self._directory_signal(os.fstat(current), self.root.anchor))
         parts = self.root.parts[1:]
         for index, component in enumerate(parts):
             final = index == len(parts) - 1
@@ -1445,8 +1451,12 @@ class StateStore:
                 except FileExistsError:
                     pass
                 child = os.open(component, flags, dir_fd=current)
+            child_signal = self._directory_signal(
+                os.fstat(child), Path(self.root.anchor, *parts[: index + 1])
+            )
+            self._chain_names.append(component)
+            self._chain_signals.append(child_signal)
             if final:
-                self.parent_fd = current
                 self.root_fd = child
             else:
                 self._ancestor_fds.append(child)
@@ -1455,8 +1465,7 @@ class StateStore:
             _fail("unsafe-state-root", f"could not open state root: {self.root}")
         root_stat = os.fstat(self.root_fd)
         _validate_private_stat(root_stat, self.root, directory=True)
-        self.root_identity = (root_stat.st_dev, root_stat.st_ino)
-        self._bind_root("opening")
+        self._bind_state_chain("opening")
 
     def close(self) -> None:
         if self.lock_fd >= 0:
@@ -1471,33 +1480,105 @@ class StateStore:
                 os.close(fd)
                 seen.add(fd)
         self._ancestor_fds.clear()
-        self.parent_fd = -1
+        self._chain_names.clear()
+        self._chain_signals.clear()
 
-    def _bind_root(self, phase: str) -> None:
-        assert self.root_identity is not None
-        opened = os.fstat(self.root_fd)
+    @staticmethod
+    def _directory_signal(
+        info: os.stat_result, path: Path | str
+    ) -> tuple[int, int, int, int, int, int]:
+        """Return only object-identity, type, and access-policy signals."""
+
+        if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+            _fail("unsafe-state-chain", f"state path component is not a directory: {path}")
+        return (
+            info.st_dev,
+            info.st_ino,
+            stat.S_IFMT(info.st_mode),
+            info.st_uid,
+            info.st_gid,
+            stat.S_IMODE(info.st_mode),
+        )
+
+    def _bind_state_chain(self, phase: str) -> None:
+        """Revalidate every retained directory and its parent-visible name."""
+
+        chain_fds = [*self._ancestor_fds, self.root_fd]
+        if not (
+            len(chain_fds) == len(self._chain_names) == len(self._chain_signals)
+            and self.root_fd >= 0
+        ):
+            _fail("invalid-state-chain", "state directory binding is incomplete")
+        for index, (fd, name, expected) in enumerate(
+            zip(chain_fds, self._chain_names, self._chain_signals, strict=True)
+        ):
+            component_path = Path(self.root.anchor, *self.root.parts[1 : index + 1])
+            try:
+                opened = os.fstat(fd)
+            except OSError as exc:
+                _fail(
+                    "state-chain-revalidation-failed",
+                    f"could not inspect retained state path component during {phase}: "
+                    f"{component_path}: {exc}",
+                )
+            opened_signal = self._directory_signal(opened, component_path)
+            if opened_signal[:3] != expected[:3]:
+                _fail(
+                    "state-chain-replaced",
+                    f"state path component identity changed during {phase}: {component_path}",
+                )
+            if opened_signal[3:] != expected[3:]:
+                _fail(
+                    "state-chain-policy-changed",
+                    f"state path component access policy changed during {phase}: {component_path}",
+                )
+            if index == 0:
+                continue
+            assert name is not None
+            try:
+                named = os.stat(name, dir_fd=chain_fds[index - 1], follow_symlinks=False)
+            except (FileNotFoundError, NotADirectoryError):
+                _fail(
+                    "state-chain-replaced",
+                    f"state path component disappeared during {phase}: {component_path}",
+                )
+            except PermissionError as exc:
+                _fail(
+                    "state-chain-unreadable",
+                    f"state path component became unreadable during {phase}: "
+                    f"{component_path}: {exc}",
+                )
+            except OSError as exc:
+                _fail(
+                    "state-chain-revalidation-failed",
+                    f"could not revalidate state path component during {phase}: "
+                    f"{component_path}: {exc}",
+                )
+            named_signal = self._directory_signal(named, component_path)
+            if named_signal[:3] != expected[:3]:
+                _fail(
+                    "state-chain-replaced",
+                    f"state path component name was rebound during {phase}: {component_path}",
+                )
+            if named_signal[3:] != expected[3:]:
+                _fail(
+                    "state-chain-policy-changed",
+                    f"state path component name policy changed during {phase}: {component_path}",
+                )
         try:
-            named = os.stat(self.root_name, dir_fd=self.parent_fd, follow_symlinks=False)
-        except FileNotFoundError:
-            _fail("state-root-replaced", f"state root disappeared during {phase}")
-        for info in (opened, named):
-            _validate_private_stat(info, self.root, directory=True)
-        opened_identity = (opened.st_dev, opened.st_ino)
-        named_identity = (named.st_dev, named.st_ino)
-        if opened_identity != self.root_identity or named_identity != self.root_identity:
-            _fail("state-root-replaced", f"state root identity changed during {phase}")
-        # Directory link counts legitimately change when this transaction adds a
-        # child directory.  Bind the open object to its live name and require a
-        # positive, mutually equal link count without treating child churn as
-        # replacement.
-        if opened.st_nlink <= 0 or named.st_nlink <= 0:
-            _fail("state-root-unlinked", f"state root link binding changed during {phase}")
+            final_root = os.fstat(self.root_fd)
+        except OSError as exc:
+            _fail(
+                "state-chain-revalidation-failed",
+                f"could not inspect state root during {phase}: {self.root}: {exc}",
+            )
+        _validate_private_stat(final_root, self.root, directory=True)
 
     def acquire_lock(self, *, create: bool = True) -> None:
         flags = os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC
         if create:
             flags |= os.O_CREAT
-        self._bind_root("lock preflight")
+        self._bind_state_chain("lock preflight")
         try:
             self.lock_fd = os.open(LOCK_FILE, flags, 0o600, dir_fd=self.root_fd)
         except FileNotFoundError:
@@ -1509,7 +1590,7 @@ class StateStore:
         self.lock_identity = (before.st_dev, before.st_ino, before.st_nlink)
         self._bind_lock("before acquisition")
         fcntl.flock(self.lock_fd, fcntl.LOCK_EX)
-        self._bind_root("after lock acquisition")
+        self._bind_state_chain("after lock acquisition")
         self._bind_lock("after acquisition")
 
     def _bind_lock(self, phase: str) -> None:
@@ -1530,7 +1611,7 @@ class StateStore:
             _fail("lock-replaced", f"state lock identity changed {phase}")
 
     def finish(self) -> None:
-        self._bind_root("transaction completion")
+        self._bind_state_chain("transaction completion")
         self._bind_lock("at transaction completion")
 
     def relative(self, path: Path) -> Path:
@@ -1777,7 +1858,7 @@ class StateStore:
                     offset += os.write(fd, payload[offset:])
                 os.fsync(fd)
                 temp_info = os.fstat(fd)
-                self._bind_root("before publication")
+                self._bind_state_chain("before publication")
                 if self.lock_fd >= 0:
                     self._bind_lock("before publication")
                 named_temp = os.stat(temporary, dir_fd=parent_fd, follow_symlinks=False)
@@ -1849,7 +1930,7 @@ def _ensure_private_dir(path: Path) -> None:
     if store is not None:
         relative = store.relative(path)
         if relative == Path("."):
-            store._bind_root("directory validation")
+            store._bind_state_chain("directory validation")
         else:
             with store.open_dir(relative, create=True):
                 pass
@@ -2074,6 +2155,8 @@ def _validate_wal_commit(commit: Mapping[str, Any], intent: Mapping[str, Any]) -
 
 
 def _apply_wal_intent(store: StateStore, intent: Mapping[str, Any]) -> None:
+    if intent["operation"] == "complete-audit":
+        _validate_complete_audit_intent_receipts(store, intent)
     for raw_write in intent["writes"]:
         write = _require_object(raw_write, "wal.write")
         target = Path(write["path"])
@@ -2114,6 +2197,7 @@ def _commit_wal(store: StateStore, intent: Mapping[str, Any]) -> None:
         "intent_digest": intent["intent_digest"],
     }
     commit = {**body, "commit_digest": _digest(body)}
+    store._bind_state_chain("before transaction commit")
     store.write_json(commit_path, commit, immutable=True)
 
 
@@ -3070,6 +3154,31 @@ def _validate_audit_summary(value: Any, field: str) -> dict[str, Any]:
     return summary
 
 
+def _validate_receipt_backed_audit_counts(
+    summary: Mapping[str, Any],
+    stage_receipts: Sequence[Mapping[str, Any]],
+    dormancy_receipts: Sequence[Mapping[str, Any]],
+) -> None:
+    """Bind immutable case counts to the exact validated audit receipts."""
+
+    expected = {
+        "cases_created": sum(receipt["action"] == "created" for receipt in stage_receipts),
+        "cases_updated": sum(receipt["action"] == "updated" for receipt in stage_receipts),
+        "cases_unchanged": sum(receipt["action"] == "unchanged" for receipt in stage_receipts),
+        "cases_dormant": sum(len(receipt["changed"]) for receipt in dormancy_receipts),
+    }
+    mismatches = [
+        f"{field}={summary[field]} (expected {count})"
+        for field, count in expected.items()
+        if summary[field] != count
+    ]
+    if mismatches:
+        _fail(
+            "audit-summary-mismatch",
+            "audit summary does not match its exact receipts: " + ", ".join(mismatches),
+        )
+
+
 def _receipt_files(root: Path, category: str, anchor: str | None) -> list[dict[str, str]]:
     directory = root / "receipts" / category
     if not _state_exists(directory):
@@ -3291,6 +3400,52 @@ def _receipt_objects(root: Path, category: str, anchor: str | None) -> list[dict
     return result
 
 
+def _validate_complete_audit_intent_receipts(store: StateStore, intent: Mapping[str, Any]) -> None:
+    """Reject a persisted completion intent whose snapshot misstates its receipts."""
+
+    snapshots: list[dict[str, Any]] = []
+    for index, raw_write in enumerate(_require_list(intent["writes"], "wal.writes")):
+        write = _require_object(raw_write, f"wal.writes[{index}]")
+        after = _require_object(write["after"], f"wal.writes[{index}].after")
+        if after.get("kind") != "daily-completed-snapshot":
+            continue
+        if write["scope"] != "state":
+            _fail("invalid-wal", "complete-audit snapshot writes must remain in state")
+        _validate_completed_snapshot(after)
+        snapshots.append(after)
+    if not snapshots:
+        _fail("invalid-wal", "complete-audit intent has no completed snapshot after-image")
+    snapshot = snapshots[0]
+    if any(item != snapshot for item in snapshots[1:]):
+        _fail("invalid-wal", "complete-audit intent has conflicting snapshot after-images")
+
+    anchor = snapshot["previous_snapshot_digest"]
+    stage_refs = _normalize_receipt_refs(snapshot["stage_receipts"], "snapshot.stage_receipts")
+    dormancy_refs = _normalize_receipt_refs(
+        snapshot["dormancy_receipts"], "snapshot.dormancy_receipts"
+    )
+    if stage_refs != _receipt_files(store.root, "stage", anchor):
+        _fail("invalid-wal", "complete-audit snapshot does not bind every stage receipt")
+    if dormancy_refs != _receipt_files(store.root, "dormancy", anchor):
+        _fail("invalid-wal", "complete-audit snapshot does not bind every dormancy receipt")
+    receipt_objects = {
+        category: _receipt_objects(store.root, category, anchor)
+        for category in ("stage", "dormancy")
+    }
+    started = _parse_time(snapshot["started_at"], "snapshot.started_at")
+    ended = _parse_time(snapshot["ended_at"], "snapshot.ended_at")
+    for category in ("stage", "dormancy"):
+        for receipt in receipt_objects[category]:
+            created = _parse_time(receipt["created_at"], "receipt.created_at")
+            if not started <= created <= ended:
+                _fail("invalid-wal", "complete-audit receipt falls outside its snapshot window")
+    _validate_receipt_backed_audit_counts(
+        _require_object(snapshot["audit_summary"], "snapshot.audit_summary"),
+        receipt_objects["stage"],
+        receipt_objects["dormancy"],
+    )
+
+
 def _verify_receipt_delta_coverage(root: Path, anchor: str | None) -> None:
     if anchor is None:
         simulated: dict[str, str] = {}
@@ -3379,9 +3534,37 @@ def complete_audit(
     natural_key = f"{mode}:{audit_id}"
     request = {"audit": audit, "mode": mode}
     with _state_lock(state_root) as store:
-        _recover_pending_wal(store)
         intent_path, _ = _wal_paths("complete-audit", natural_key)
+
+        def validate_audit_receipts() -> None:
+            actual_stage = _receipt_files(state_root, "stage", anchor)
+            actual_dormancy = _receipt_files(state_root, "dormancy", anchor)
+            if provided_stage != actual_stage:
+                _fail("incomplete-audit", "audit receipt does not include every stage receipt")
+            if provided_dormancy != actual_dormancy:
+                _fail("incomplete-audit", "audit receipt does not include every dormancy receipt")
+            receipt_objects = {
+                category: _receipt_objects(state_root, category, anchor)
+                for category in ("stage", "dormancy")
+            }
+            for category in ("stage", "dormancy"):
+                for persisted_receipt in receipt_objects[category]:
+                    created_at = _parse_time(persisted_receipt["created_at"], "receipt.created_at")
+                    if (
+                        not _parse_time(started_at, "started_at")
+                        <= created_at
+                        <= _parse_time(ended_at, "ended_at")
+                    ):
+                        _fail("clock-order", "audit receipts must fall within audit start/end")
+            _validate_receipt_backed_audit_counts(
+                summary,
+                receipt_objects["stage"],
+                receipt_objects["dormancy"],
+            )
+
         if store.exists(intent_path):
+            validate_audit_receipts()
+            _recover_pending_wal(store)
             return _run_transaction(
                 store,
                 operation="complete-audit",
@@ -3391,6 +3574,8 @@ def complete_audit(
                 writes=[],
                 result={},
             )
+        _recover_pending_wal(store)
+        validate_audit_receipts()
         immutable_history = (
             Path("historical") / "completed" / f"{audit_id}.json"
             if historical_replay
@@ -3417,19 +3602,6 @@ def complete_audit(
             _fail(
                 "audit-anchor-drift", "audit receipt does not bind the current completed snapshot"
             )
-        if provided_stage != _receipt_files(state_root, "stage", anchor):
-            _fail("incomplete-audit", "audit receipt does not include every stage receipt")
-        if provided_dormancy != _receipt_files(state_root, "dormancy", anchor):
-            _fail("incomplete-audit", "audit receipt does not include every dormancy receipt")
-        for category in ("stage", "dormancy"):
-            for persisted_receipt in _receipt_objects(state_root, category, anchor):
-                created_at = _parse_time(persisted_receipt["created_at"], "receipt.created_at")
-                if (
-                    not _parse_time(started_at, "started_at")
-                    <= created_at
-                    <= _parse_time(ended_at, "ended_at")
-                ):
-                    _fail("clock-order", "audit receipts must fall within audit start/end")
         if anchor is not None:
             previous = _load_json(state_root / LIVE_POINTER)
             _validate_completed_snapshot(previous)
