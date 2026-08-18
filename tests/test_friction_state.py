@@ -5197,6 +5197,48 @@ def test_selection_preflight_binds_exact_draft_and_current_case_bytes(tmp_path: 
     )
 
 
+def test_selection_preflight_exact_retry_survives_weekly_plan_and_preserves_first_writer(
+    tmp_path: Path,
+) -> None:
+    case = _candidate()
+    root, stage = _stage(tmp_path, case)
+    completed = _complete_live(tmp_path, root, [stage])
+    selection = _selection(completed["snapshot_digest"], [case])
+    basis = {key: selection[key] for key in fs.SELECTION_BASIS_FIELDS}
+    draft_path = _write(tmp_path / "planned-preflight-draft.json", basis)
+    receipt = fs.preflight_selection(root, draft_path, "2026-07-11T07:59:00Z")
+    selection["resource_preflight"] = receipt["resource_preflight"]
+    selection["preflight_receipt_id"] = receipt["receipt_id"]
+    selection["preflight_receipt_digest"] = receipt["receipt_digest"]
+    selection["interaction"] = {
+        "interactive": True,
+        "actor": "Joey",
+        "approved_at": "2026-07-11T08:00:00Z",
+        "selection_basis_digest": receipt["selection_basis_digest"],
+        "preflight_receipt_id": receipt["receipt_id"],
+        "preflight_receipt_digest": receipt["receipt_digest"],
+    }
+    fs.weekly_plan(
+        root,
+        _write(tmp_path / "planned-preflight-selection.json", selection),
+        tmp_path / "planned-preflight-plan.json",
+        "2026-07-11T08:01:00Z",
+    )
+    assert (root / "publication" / "active" / f"{case['case']['id']}.json").exists()
+    assert (root / fs._wal_history_path("selection-preflight", selection["selection_id"])).exists()
+
+    assert fs.preflight_selection(root, draft_path, "2026-07-11T08:02:00Z") == receipt
+
+    conflicting_basis = json.loads(json.dumps(basis))
+    conflicting_basis["base_intent"]["base_sha"] = "b" * 40
+    conflict_path = _write(tmp_path / "planned-preflight-conflict.json", conflicting_basis)
+    before = _persistent_identity_snapshot(root)
+    with pytest.raises(fs.StateError, match="different request") as raised:
+        fs.preflight_selection(root, conflict_path, "2026-07-11T08:03:00Z")
+    assert raised.value.code == "wal-request-conflict"
+    assert _persistent_identity_snapshot(root) == before
+
+
 @pytest.mark.parametrize(
     ("checked_at", "approved_at"),
     [
@@ -8089,6 +8131,204 @@ def test_legacy_repair_approval_result_replays_active_and_retired_without_new_fi
     assert retired_retry == first
     assert "target_lifecycle_changed_at" not in retired_retry
     assert fs.audit_wal_history(root)["status"] == "clean"
+
+
+@pytest.mark.parametrize("authority_state", ["pending", "committed", "retired"])
+def test_approve_repair_exact_retry_uses_first_writer_time_after_expiry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    authority_state: str,
+) -> None:
+    proposed, approved = _repair_lifecycle_candidates()[:2]
+    root, proposed_stage = _stage(tmp_path, proposed)
+    approval, _ = _publish_and_approve_repair(
+        tmp_path,
+        root,
+        proposed,
+        approved,
+        proposed_stage,
+        approval_id=f"expired-retry-{authority_state}",
+        expires_at="2026-07-11T08:38:30Z",
+        persist=False,
+    )
+    candidate_path = _write(tmp_path / f"expired-retry-{authority_state}-candidate.json", approved)
+    approval_path = _write(tmp_path / f"expired-retry-{authority_state}-approval.json", approval)
+    approval_relative = Path("repairs") / "approvals" / f"{approval['approval_id']}.json"
+    original_write = fs.StateStore.write_json
+
+    if authority_state == "pending":
+
+        def interrupt_approval(
+            store: Any,
+            relative: Path | str,
+            value: dict[str, Any],
+            *,
+            immutable: bool = False,
+            max_bytes: int | None = None,
+        ) -> str:
+            if Path(relative) == approval_relative:
+                raise OSError("injected expired retry interruption")
+            return original_write(
+                store,
+                relative,
+                value,
+                immutable=immutable,
+                max_bytes=max_bytes,
+            )
+
+        monkeypatch.setattr(fs.StateStore, "write_json", interrupt_approval)
+        with pytest.raises(OSError, match="expired retry interruption"):
+            fs.approve_repair(
+                root,
+                candidate_path,
+                approval_path,
+                "2026-07-11T08:38:00Z",
+                interactive_confirmed=True,
+            )
+        monkeypatch.setattr(fs.StateStore, "write_json", original_write)
+        intent_relative, _ = fs._wal_paths("approve-repair", approval["approval_id"])
+        expected = fs._load_json(root / intent_relative)["result"]
+    else:
+        expected = fs.approve_repair(
+            root,
+            candidate_path,
+            approval_path,
+            "2026-07-11T08:38:00Z",
+            interactive_confirmed=True,
+        )
+        if authority_state == "retired":
+            with fs._state_lock(root, create=False) as store:
+                fs._recover_pending_wal(store, compact_committed=True)
+
+    before_retry = _persistent_identity_snapshot(root)
+    assert (
+        fs.approve_repair(
+            root,
+            candidate_path,
+            approval_path,
+            "2026-07-11T08:39:00Z",
+            interactive_confirmed=True,
+        )
+        == expected
+    )
+    if authority_state != "pending":
+        assert _persistent_identity_snapshot(root) == before_retry
+
+    before_idempotent_retry = _persistent_identity_snapshot(root)
+    assert (
+        fs.approve_repair(
+            root,
+            candidate_path,
+            approval_path,
+            "2026-07-11T08:40:00Z",
+            interactive_confirmed=True,
+        )
+        == expected
+    )
+    assert _persistent_identity_snapshot(root) == before_idempotent_retry
+
+
+def test_new_repair_approval_still_rejects_expired_window_without_mutation(
+    tmp_path: Path,
+) -> None:
+    proposed, approved = _repair_lifecycle_candidates()[:2]
+    root, proposed_stage = _stage(tmp_path, proposed)
+    approval, _ = _publish_and_approve_repair(
+        tmp_path,
+        root,
+        proposed,
+        approved,
+        proposed_stage,
+        approval_id="new-expired-approval",
+        expires_at="2026-07-11T08:38:30Z",
+        persist=False,
+    )
+    before = _persistent_identity_snapshot(root)
+
+    with pytest.raises(fs.StateError, match="remain unexpired") as raised:
+        fs.approve_repair(
+            root,
+            _write(tmp_path / "new-expired-candidate.json", approved),
+            _write(tmp_path / "new-expired-approval.json", approval),
+            "2026-07-11T08:39:00Z",
+            interactive_confirmed=True,
+        )
+
+    assert raised.value.code == "repair-approval-clock-order"
+    assert _persistent_identity_snapshot(root) == before
+
+
+def test_pending_approve_repair_rejects_expired_first_writer_time_without_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proposed, approved = _repair_lifecycle_candidates()[:2]
+    root, proposed_stage = _stage(tmp_path, proposed)
+    approval, _ = _publish_and_approve_repair(
+        tmp_path,
+        root,
+        proposed,
+        approved,
+        proposed_stage,
+        approval_id="tampered-expired-first-writer",
+        expires_at="2026-07-11T08:38:30Z",
+        persist=False,
+    )
+    candidate_path = _write(tmp_path / "tampered-expired-candidate.json", approved)
+    approval_path = _write(tmp_path / "tampered-expired-approval.json", approval)
+    approval_relative = Path("repairs") / "approvals" / f"{approval['approval_id']}.json"
+    original_write = fs.StateStore.write_json
+
+    def interrupt_approval(
+        store: Any,
+        relative: Path | str,
+        value: dict[str, Any],
+        *,
+        immutable: bool = False,
+        max_bytes: int | None = None,
+    ) -> str:
+        if Path(relative) == approval_relative:
+            raise OSError("injected captured-at interruption")
+        return original_write(
+            store,
+            relative,
+            value,
+            immutable=immutable,
+            max_bytes=max_bytes,
+        )
+
+    monkeypatch.setattr(fs.StateStore, "write_json", interrupt_approval)
+    with pytest.raises(OSError, match="captured-at interruption"):
+        fs.approve_repair(
+            root,
+            candidate_path,
+            approval_path,
+            "2026-07-11T08:38:00Z",
+            interactive_confirmed=True,
+        )
+    monkeypatch.setattr(fs.StateStore, "write_json", original_write)
+    intent_relative, commit_relative = fs._wal_paths("approve-repair", approval["approval_id"])
+    intent_path = root / intent_relative
+    intent = fs._load_json(intent_path)
+    intent["captured_at"] = approval["expires_at"]
+    intent_body = {key: value for key, value in intent.items() if key != "intent_digest"}
+    intent["intent_digest"] = fs._digest(intent_body)
+    intent_path.write_bytes(fs._canonical_bytes(intent))
+    before = _persistent_identity_snapshot(root)
+
+    with pytest.raises(fs.StateError, match="remain unexpired") as raised:
+        fs.approve_repair(
+            root,
+            candidate_path,
+            approval_path,
+            "2026-07-11T08:38:15Z",
+            interactive_confirmed=True,
+        )
+
+    assert raised.value.code == "repair-approval-clock-order"
+    assert _persistent_identity_snapshot(root) == before
+    assert not (root / approval_relative).exists()
+    assert not (root / commit_relative).exists()
 
 
 def test_pending_approve_repair_wal_revalidates_lifecycle_time_before_replay(

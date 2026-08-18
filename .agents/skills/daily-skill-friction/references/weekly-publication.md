@@ -47,7 +47,12 @@ atomically persists both an immutable
 `selection-preflight` WAL transaction. The returned receipt has exact fields
 `version`, `kind`, `status`, `selection_id`, `receipt_id`, `checked_at`,
 `selection_basis_digest`, `resource_preflight`, and `receipt_digest`. A failed
-preflight writes no new receipt or transaction.
+preflight writes no new receipt or transaction. An exact retry of the same
+first-writer selection basis reconstructs and returns its original receipt even
+after a Weekly plan has created active publication state; current lifecycle and
+active-publication eligibility apply only to a genuinely new selection ID. The
+same selection ID with a different basis remains a read-only first-writer
+conflict.
 
 Only after that success may Joey create the approved `publication-selection`.
 It consists of the unchanged basis fields plus `resource_preflight`,

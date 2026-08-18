@@ -4504,12 +4504,13 @@ def _reconstruct_checkpoint_result(
                 "repair approval authority matches neither legacy nor current WAL result",
             )
         result = matching_results[0]
-        _validate_published_closure_authority(
+        closure, _ = _validate_published_closure_authority(
             store,
             approval["publication"],
             approval["source"],
             recover_publication=recover_publication,
         )
+        _validate_repair_approval_times(approval, closure, checkpoint["captured_at"])
         _validate_approve_repair_checkpoint_projection(
             checkpoint,
             approval_path,
@@ -5971,7 +5972,7 @@ def _preflight_existing_transaction_domain_read_only(
     *,
     operation: str,
     natural_key: str,
-) -> None:
+) -> dict[str, Any] | None:
     """Validate an existing active or retired domain authority without mutation."""
 
     intent_path, commit_path = _wal_paths(operation, natural_key)
@@ -5983,15 +5984,14 @@ def _preflight_existing_transaction_domain_read_only(
         if has_commit:
             _fail("invalid-wal-layout", "WAL commit exists without its intent")
         if not has_history:
-            return
+            return None
         checkpoint = _load_wal_checkpoint_binding_read_only(store, operation, natural_key)
         assert checkpoint is not None
-        _reconstruct_checkpoint_result(
+        return _reconstruct_checkpoint_result(
             store,
             checkpoint,
             recover_publication=False,
         )
-        return
     intent = store.read_json_without_publication_recovery(
         intent_path,
         max_bytes=MAX_WAL_JSON_BYTES,
@@ -6040,6 +6040,7 @@ def _preflight_existing_transaction_domain_read_only(
             checkpoint,
             recover_publication=False,
         )
+    return dict(_require_object(intent["result"], "wal.result"))
 
 
 def _run_transaction(
@@ -7894,12 +7895,13 @@ def _validate_approve_repair_intent_lifecycle(
                 "repair-approval-lifecycle-mismatch",
                 "approve-repair WAL target lifecycle_changed_at must equal repair approved_at",
             )
-    _validate_published_closure_authority(
+    closure, _ = _validate_published_closure_authority(
         store,
         approval["publication"],
         approval["source"],
         recover_publication=recover_publication,
     )
+    _validate_repair_approval_times(approval, closure, intent["captured_at"])
 
 
 def _validate_stage_intent_repair_approval_lifecycle(
@@ -8119,15 +8121,12 @@ def approve_repair(
             approval["source"],
             recover_publication=False,
         )
-        _validate_repair_approval_times(approval, preflight_closure, now_value)
-        _preflight_existing_transaction_domain_read_only(
+        existing_result = _preflight_existing_transaction_domain_read_only(
             store,
             operation="approve-repair",
             natural_key=approval_id,
         )
-        _read_marker(state_root)
-        _recover_pending_wal(store)
-        if _transaction_record_exists(store, "approve-repair", approval_id):
+        if existing_result is not None:
             return _run_transaction(
                 store,
                 operation="approve-repair",
@@ -8137,6 +8136,9 @@ def approve_repair(
                 writes=[],
                 result={},
             )
+        _validate_repair_approval_times(approval, preflight_closure, now_value)
+        _read_marker(state_root)
+        _recover_pending_wal(store)
         marker = _read_marker(state_root)
         if marker is None or marker.get("mode") != "live":
             _fail("not-live-state", "repair approval requires live state")
@@ -9806,6 +9808,27 @@ def preflight_selection(state_root: Path, selection_draft_path: Path, now: str) 
             natural_key=selection_id,
             request={"selection_basis": basis},
         )
+        existing_result = _preflight_existing_transaction_domain_read_only(
+            store,
+            operation="selection-preflight",
+            natural_key=selection_id,
+        )
+        if existing_result is not None:
+            resource = _require_object(
+                existing_result.get("resource_preflight"),
+                "selection.preflight_receipt.resource_preflight",
+            )
+            _validate_selection_resource(resource, basis)
+            _validate_selection_preflight_receipt(existing_result, basis, resource)
+            return _run_transaction(
+                store,
+                operation="selection-preflight",
+                natural_key=selection_id,
+                request={"selection_basis": basis},
+                captured_at=now_value,
+                writes=[],
+                result={},
+            )
         _read_marker(state_root)
         _recover_pending_wal(store)
         marker = _read_marker(state_root)

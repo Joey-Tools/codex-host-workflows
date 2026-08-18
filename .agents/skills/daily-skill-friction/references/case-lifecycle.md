@@ -113,7 +113,12 @@ exceed seven days. The approved target's canonical `lifecycle_changed_at` must
 also equal `approved_at` exactly. This protects the semantic lifecycle decision
 time bound into the target digest; a same-outcome update only to
 `currentness_checked_at` remains benign metadata and does not move that decision
-time.
+time. The invocation-time expiry check governs only creation of a new approval
+transaction. An exact retry of an already pending, committed, or retired first
+writer revalidates the original transaction's persisted `captured_at` against the
+same window and may finish or return that original result after wall-clock expiry;
+it does not create a new approval. A later stage consumption still must occur
+before `expires_at`.
 
 Only after Joey makes that exact decision, run:
 
