@@ -70,7 +70,7 @@ GIT_CONFIG_SECTION_PATTERN = re.compile(
     r"^\[\s*([A-Za-z0-9][A-Za-z0-9.-]*)"
     r'(?:\s+"((?:[^"\\]|\\["\\])*)")?\s*\](?:\s*[#;].*)?$'
 )
-GIT_CONFIG_VARIABLE_PATTERN = re.compile(r"^([A-Za-z][A-Za-z0-9-]*)(?:\s*=.*)?$")
+GIT_CONFIG_VARIABLE_PATTERN = re.compile(r"^([A-Za-z][A-Za-z0-9-]*)(?:\s*=\s*(.*))?$")
 MAX_CONFIG_BYTES = 1024 * 1024
 MAX_STAMP_BYTES = 1024 * 1024
 MAX_COMMAND_DETAIL = 2000
@@ -286,6 +286,7 @@ class GitTopologyGuard:
     refs_binding: Binding | None
     info_binding: Binding | None
     local_config_snapshot: FileSnapshot | None
+    worktree_config_absent: bool | None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2080,7 +2081,7 @@ def _publish_missing_mirror_guard_hook(
     expected_data: bytes,
     renamer: AtomicRenamer,
 ) -> FileSnapshot:
-    """Publish one missing hook through an owner-private no-replace stage."""
+    """Publish one missing hook through a private-named prevalidated stage."""
 
     hook_path = hooks_path / hook_name
     stage = f".{hook_name}.stage-{os.getpid()}-{secrets.token_hex(8)}"
@@ -2114,7 +2115,7 @@ def _publish_missing_mirror_guard_hook(
             dir_fd=hooks_fd,
         )
         stage_created = True
-        os.fchmod(stage_fd, 0o600)
+        os.fchmod(stage_fd, 0o755)
         remaining = memoryview(expected_data)
         while remaining:
             written = os.write(stage_fd, remaining)
@@ -2129,7 +2130,7 @@ def _publish_missing_mirror_guard_hook(
             label=f"mirror guard private stage {hooks_path / stage}",
         )
         assert staged is not None
-        if staged.data != expected_data or stat.S_IMODE(staged.binding.mode) != 0o600:
+        if staged.data != expected_data or stat.S_IMODE(staged.binding.mode) != 0o755:
             raise SetupError(f"mirror guard private stage did not verify: {hooks_path / stage}")
         owned_snapshot = staged
         if (
@@ -2151,16 +2152,17 @@ def _publish_missing_mirror_guard_hook(
                 ) from error
             raise
         moved = True
-        os.fchmod(stage_fd, 0o755)
         os.fsync(stage_fd)
-        owned_snapshot = FileSnapshot(
-            binding=_binding_from_fd(
-                stage_fd,
-                label=f"published mirror guard hook {hook_path}",
-                sensitive_leaf=True,
-            ),
-            data=expected_data,
+        published_binding = _binding_from_fd(
+            stage_fd,
+            label=f"published mirror guard hook {hook_path}",
+            sensitive_leaf=True,
         )
+        if published_binding != staged.binding:
+            raise SetupError(
+                f"mirror guard hook identity or access policy changed during publish: {hook_path}"
+            )
+        owned_snapshot = FileSnapshot(binding=published_binding, data=expected_data)
         if stat.S_IMODE(owned_snapshot.binding.mode) != 0o755:
             raise SetupError(f"published mirror guard hook mode did not verify: {hook_path}")
         installed = _snapshot_at(
@@ -3059,6 +3061,51 @@ def _require_missing_git_admin_entry(parent_fd: int, name: str, *, label: str) -
     raise SetupError(f"{label} is present")
 
 
+def _require_missing_git_worktree_config(parent_fd: int, git_dir: Path) -> bool:
+    """Bind ``config.worktree`` absence without following a hostile leaf."""
+
+    name = "config.worktree"
+    path = git_dir / name
+    try:
+        metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return True
+    except PermissionError as error:
+        raise SetupError(f"Git worktree config absence is unreadable: {path}") from error
+    except OSError as error:
+        raise SetupError(
+            f"Git worktree config absence could not be inspected: {path}: "
+            f"{error.strerror or type(error).__name__}"
+        ) from error
+    if stat.S_ISLNK(metadata.st_mode):
+        raise SetupError(f"Git worktree config leaf is a symlink: {path}")
+    if not stat.S_ISREG(metadata.st_mode):
+        raise SetupError(f"Git worktree config leaf is not a regular file: {path}")
+
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+    flags |= getattr(os, "O_NONBLOCK", 0)
+    try:
+        descriptor = os.open(name, flags, dir_fd=parent_fd)
+    except PermissionError as error:
+        raise SetupError(f"Git worktree config regular file is unreadable: {path}") from error
+    except FileNotFoundError as error:
+        raise SetupError(
+            f"Git worktree config leaf changed while being inspected: {path}"
+        ) from error
+    except OSError as error:
+        raise SetupError(
+            f"Git worktree config regular file could not be opened without following links: "
+            f"{path}: {error.strerror or type(error).__name__}"
+        ) from error
+    try:
+        rebound = os.fstat(descriptor)
+        if not stat.S_ISREG(rebound.st_mode) or _binding_tuple(rebound) != _binding_tuple(metadata):
+            raise SetupError(f"Git worktree config leaf changed while being opened: {path}")
+    finally:
+        os.close(descriptor)
+    raise SetupError(f"Git worktree config regular file is present: {path}")
+
+
 def _packed_refs_contains_replace_ref(data: bytes) -> bool:
     for line in data.splitlines():
         if not line or line.startswith((b"#", b"^")):
@@ -3069,7 +3116,11 @@ def _packed_refs_contains_replace_ref(data: bytes) -> bool:
     return False
 
 
-def _git_local_config_keys(data: bytes, *, label: str) -> tuple[str, ...]:
+def _git_local_config_entries(
+    data: bytes,
+    *,
+    label: str,
+) -> tuple[tuple[str, str | None], ...]:
     """Parse the closed key grammar needed to reject executable Git config.
 
     The parser intentionally accepts less than Git. Unsupported syntax fails
@@ -3083,7 +3134,7 @@ def _git_local_config_keys(data: bytes, *, label: str) -> tuple[str, ...]:
     if "\0" in text:
         raise SetupError(f"{label} contains a NUL byte")
     section: str | None = None
-    keys: list[str] = []
+    entries: list[tuple[str, str | None]] = []
     for line_number, raw_line in enumerate(text.splitlines(), start=1):
         stripped = raw_line.strip()
         if not stripped or stripped.startswith(("#", ";")):
@@ -3107,8 +3158,8 @@ def _git_local_config_keys(data: bytes, *, label: str) -> tuple[str, ...]:
         match = GIT_CONFIG_VARIABLE_PATTERN.fullmatch(stripped)
         if match is None:
             raise SetupError(f"{label} has unsupported variable syntax at line {line_number}")
-        keys.append(f"{section}.{match.group(1).lower()}")
-    return tuple(keys)
+        entries.append((f"{section}.{match.group(1).lower()}", match.group(2)))
+    return tuple(entries)
 
 
 def _git_config_key_is_unsafe(key: str) -> bool:
@@ -3128,7 +3179,10 @@ def _git_config_key_is_unsafe(key: str) -> bool:
         "hookspath",
         "pager",
         "sshcommand",
+        "worktree",
     }:
+        return True
+    if section == "extensions" and leaf == "worktreeconfig":
         return True
     if section == "diff" and leaf in {"command", "external", "textconv"}:
         return True
@@ -3158,16 +3212,14 @@ def _git_config_key_is_unsafe(key: str) -> bool:
 
 
 def _validate_git_local_config(snapshot: FileSnapshot, *, label: str) -> None:
-    unsafe = sorted(
-        {
-            key
-            for key in _git_local_config_keys(snapshot.data, label=label)
-            if _git_config_key_is_unsafe(key)
-        }
-    )
+    entries = _git_local_config_entries(snapshot.data, label=label)
+    unsafe = {key for key, _value in entries if _git_config_key_is_unsafe(key)}
+    core_bare_values = [value for key, value in entries if key == "core.bare"]
+    if core_bare_values and core_bare_values != ["false"]:
+        unsafe.add("core.bare")
     if unsafe:
         raise SetupError(
-            f"{label} selects executable or redirected Git behavior: {', '.join(unsafe)}"
+            f"{label} selects executable or redirected Git behavior: {', '.join(sorted(unsafe))}"
         )
 
 
@@ -3232,6 +3284,12 @@ def _inspect_git_topology_replacements(
                     f"Git local config changed during delegated operation: "
                     f"{repository / '.git' / 'config'}"
                 )
+        worktree_config_absent = _require_missing_git_worktree_config(
+            git_fd,
+            repository / ".git",
+        )
+        if expected is not None and expected.worktree_config_absent is not True:
+            raise SetupError("Git worktree config absence baseline is invalid")
 
         refs_opened = _open_optional_child_directory(
             git_fd,
@@ -3344,6 +3402,8 @@ def _inspect_git_topology_replacements(
                 f"Git local config changed while it was being inspected: "
                 f"{repository / '.git' / 'config'}"
             )
+        if not _require_missing_git_worktree_config(git_fd, repository / ".git"):
+            raise SetupError("Git worktree config absence revalidation failed")
         return GitTopologyGuard(
             repository=repository,
             repository_binding=repository_binding,
@@ -3351,6 +3411,7 @@ def _inspect_git_topology_replacements(
             refs_binding=refs_binding,
             info_binding=info_binding,
             local_config_snapshot=local_config,
+            worktree_config_absent=worktree_config_absent,
         )
     finally:
         if info_opened is not None:
@@ -5149,7 +5210,7 @@ def _bind_helper_git_topology(
             guards.append(_inspect_git_topology_replacements(repository))
             continue
         if occupancy.status == "missing" and allow_missing:
-            guards.append(GitTopologyGuard(repository, None, None, None, None, None))
+            guards.append(GitTopologyGuard(repository, None, None, None, None, None, None))
             continue
         raise SetupError(occupancy.detail)
     return tuple(guards)

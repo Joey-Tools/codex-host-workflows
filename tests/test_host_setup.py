@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import datetime as dt
+import errno
 import hashlib
 import json
 import os
 import plistlib
+import shlex
 import shutil
 import signal
 import stat
@@ -2168,6 +2170,40 @@ def test_mirror_guard_install_is_atomic_idempotent_and_allows_child_churn(
     assert list(hooks_dir.glob(".*.stage-*")) == []
 
 
+def test_mirror_guard_hook_is_executable_at_atomic_publish_boundary(tmp_path: Path) -> None:
+    common_dir = tmp_path / "mirror" / ".git"
+    hooks_dir = common_dir / "hooks"
+    hooks_dir.mkdir(parents=True)
+    observed: list[tuple[os.stat_result, os.stat_result]] = []
+
+    class ObservingRenamer(hs.AtomicRenamer):
+        def no_replace(self, parent_fd: int, source: str, target: str) -> None:
+            staged = os.stat(source, dir_fd=parent_fd, follow_symlinks=False)
+            assert stat.S_ISREG(staged.st_mode)
+            assert stat.S_IMODE(staged.st_mode) == 0o755
+            assert staged.st_mode & 0o111 == 0o111
+            super().no_replace(parent_fd, source, target)
+            published = os.stat(target, dir_fd=parent_fd, follow_symlinks=False)
+            observed.append((staged, published))
+
+    (snapshot,) = hs._install_managed_mirror_guard_hooks(
+        common_dir,
+        ("pre-commit",),
+        b"#!/bin/sh\nexit 1\n",
+        renamer=ObservingRenamer(),
+    )
+
+    assert len(observed) == 1
+    staged, published = observed[0]
+    assert (published.st_dev, published.st_ino) == (staged.st_dev, staged.st_ino)
+    assert stat.S_IMODE(published.st_mode) == 0o755
+    assert published.st_mode & 0o111 == 0o111
+    assert (snapshot.binding.dev, snapshot.binding.ino) == (
+        published.st_dev,
+        published.st_ino,
+    )
+
+
 @pytest.mark.parametrize(
     "hostile_kind",
     ["directory", "foreign-content", "foreign-access-policy"],
@@ -2501,6 +2537,11 @@ def test_git_and_helper_environments_disable_executable_fsmonitor(tmp_path: Path
         ('url "ssh://attacker.invalid/"', "insteadOf = git@github.com:"),
         ("credential", "helper = /tmp/hostile-credential"),
         ('remote "origin"', "uploadpack = /tmp/hostile-upload-pack"),
+        ("extensions", "worktreeConfig = true"),
+        ("core", "worktree = /tmp/hostile-worktree"),
+        ("core", "bare = true"),
+        ("core", "bare"),
+        ("core", "bare = false\n\tbare = false"),
     ],
 )
 def test_git_local_config_rejects_executable_or_redirected_behavior_before_git(
@@ -2527,6 +2568,195 @@ def test_git_local_config_rejects_executable_or_redirected_behavior_before_git(
     with pytest.raises(hs.SetupError, match="executable or redirected Git behavior"):
         hs._run_git(mirror, "status", "--porcelain=v1")
     assert started is False
+
+
+def test_standalone_git_accepts_ordinary_config_with_bound_worktree_config_absence(
+    tmp_path: Path,
+) -> None:
+    fixture = _build_host(tmp_path)
+    mirror = fixture.config.cache_root / "repos" / "alpha"
+
+    guard = hs._inspect_git_topology_replacements(mirror)
+    result = hs._run_git(mirror, "rev-parse", "--git-dir")
+
+    assert guard.worktree_config_absent is True
+    assert result.stdout.strip() == ".git"
+
+
+@pytest.mark.parametrize(
+    ("leaf_kind", "expected_error"),
+    [
+        ("symlink", "leaf is a symlink"),
+        ("directory", "leaf is not a regular file"),
+        ("regular", "regular file is present"),
+        ("unreadable", "regular file is unreadable"),
+    ],
+)
+def test_git_worktree_config_leaf_is_rejected_without_following(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    leaf_kind: str,
+    expected_error: str,
+) -> None:
+    fixture = _build_host(tmp_path)
+    mirror = fixture.config.cache_root / "repos" / "alpha"
+    worktree_config = mirror / ".git" / "config.worktree"
+    external = tmp_path / "external-worktree-config"
+    external.write_text("[core]\n\tbare = true\n", encoding="utf-8")
+    if leaf_kind == "symlink":
+        worktree_config.symlink_to(external)
+    elif leaf_kind == "directory":
+        worktree_config.mkdir()
+    else:
+        worktree_config.write_text("[core]\n\tbare = true\n", encoding="utf-8")
+
+    if leaf_kind == "unreadable":
+        real_open = hs.os.open
+
+        def deny_worktree_config_open(
+            path: os.PathLike[str] | str,
+            flags: int,
+            mode: int = 0o777,
+            *,
+            dir_fd: int | None = None,
+        ) -> int:
+            if path == "config.worktree" and dir_fd is not None:
+                raise PermissionError(errno.EACCES, "injected unreadable worktree config")
+            if dir_fd is None:
+                return real_open(path, flags, mode)
+            return real_open(path, flags, mode, dir_fd=dir_fd)
+
+        monkeypatch.setattr(hs.os, "open", deny_worktree_config_open)
+
+    started = False
+
+    def forbidden_run(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        nonlocal started
+        started = True
+        raise AssertionError("Git must not start when config.worktree exists")
+
+    monkeypatch.setattr(hs.CommandRunner, "run", forbidden_run)
+    with pytest.raises(hs.SetupError, match=expected_error):
+        hs._run_git(mirror, "status", "--porcelain=v1")
+
+    assert started is False
+    if leaf_kind == "symlink":
+        assert worktree_config.is_symlink()
+        assert external.read_text(encoding="utf-8") == "[core]\n\tbare = true\n"
+
+
+def test_enabled_worktree_config_filter_is_blocked_before_git_or_helper_execution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _build_host(tmp_path)
+    active = _active(fixture)
+    manifest = hs._load_main_manifest(active)
+    repo = manifest.repos[0]
+    mirror = manifest.repo_path(repo)
+    attack_probe = tmp_path / "attack-probe"
+    updater = tmp_path / "alpha-updater"
+    for destination in (attack_probe, updater):
+        subprocess.run(
+            [hs.GIT_EXECUTABLE, "clone", repo.url, str(destination)],
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+    updater.joinpath(".gitattributes").write_text(
+        "tracked.txt filter=hostile\n",
+        encoding="utf-8",
+    )
+    updater.joinpath("tracked.txt").write_text("remote update\n", encoding="utf-8")
+    _commit_and_push(updater, Path(repo.url), "tracked hostile filter fixture")
+
+    marker = tmp_path / "worktree-filter-invoked"
+    process = tmp_path / "hostile-filter-process"
+    process.write_text(
+        f"#!/bin/sh\nprintf invoked > {shlex.quote(str(marker))}\nexit 1\n",
+        encoding="utf-8",
+    )
+    process.chmod(0o755)
+
+    def install_hostile_worktree_config(repository: Path) -> None:
+        local_config = repository / ".git" / "config"
+        local_config.write_text(
+            local_config.read_text(encoding="utf-8") + "\n[extensions]\n\tworktreeConfig = true\n",
+            encoding="utf-8",
+        )
+        repository.joinpath(".git", "config.worktree").write_text(
+            f'[filter "hostile"]\n\tprocess = "{process}"\n'
+            f'\tsmudge = "{process}"\n\trequired = true\n',
+            encoding="utf-8",
+        )
+
+    install_hostile_worktree_config(attack_probe)
+    _git(attack_probe, "fetch", "origin")
+    unguarded = subprocess.run(
+        [hs.GIT_EXECUTABLE, "merge", "--ff-only", "@{u}"],
+        cwd=attack_probe,
+        check=False,
+        text=True,
+        capture_output=True,
+        env={**os.environ, "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1"},
+    )
+    assert unguarded.returncode != 0, unguarded
+    assert marker.read_text(encoding="utf-8") == "invoked"
+    marker.unlink()
+
+    install_hostile_worktree_config(mirror)
+    git_started = False
+
+    def forbidden_git_start(
+        _runner: hs.CommandRunner,
+        argv: Sequence[str],
+        **_kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
+        nonlocal git_started
+        git_started = True
+        raise AssertionError(f"protected Git child started: {argv}")
+
+    monkeypatch.setattr(hs.CommandRunner, "run", forbidden_git_start)
+    with pytest.raises(hs.SetupError, match="extensions.worktreeconfig"):
+        hs._run_git(mirror, "fetch", "origin")
+    runner = FakeRunner()
+    with pytest.raises(hs.SetupError, match="extensions.worktreeconfig"):
+        hs._run_helper(
+            active,
+            manifest,
+            ["prefetch", "--repo", repo.name, "--stamp", "hostile-worktree-config"],
+            runner,
+        )
+
+    assert not marker.exists()
+    assert git_started is False
+    assert runner.calls == []
+
+
+def test_git_worktree_config_creation_during_command_fails_post_revalidation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _build_host(tmp_path)
+    mirror = fixture.config.cache_root / "repos" / "alpha"
+    worktree_config = mirror / ".git" / "config.worktree"
+    started = False
+
+    def create_during_git(
+        _runner: hs.CommandRunner,
+        argv: Sequence[str],
+        **_kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
+        nonlocal started
+        started = True
+        worktree_config.write_text("[core]\n\tbare = true\n", encoding="utf-8")
+        return subprocess.CompletedProcess(list(argv), 0, "", "")
+
+    monkeypatch.setattr(hs.CommandRunner, "run", create_during_git)
+    with pytest.raises(hs.SetupError, match="regular file is present"):
+        hs._run_git(mirror, "status", "--porcelain=v1")
+
+    assert started
 
 
 def test_helper_rejects_local_config_drift_after_child_without_executing_marker(
