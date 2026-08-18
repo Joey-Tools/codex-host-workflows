@@ -46,6 +46,14 @@ The Weekly automation is `automations/weekly-skill-friction-publication/automati
 /Users/hoteng/.local/share/uv/python/cpython-3.14.2-macos-aarch64-none/bin/python3.14 -I -B -S /Users/hoteng/Program/GitHub/Joey-Tools/codex-workspace/.codex-local/daily-skill-friction/repos/codex-host-workflows/scripts/host_setup.py doctor --weekly --no-launchctl
 ```
 
+Both Automations run in the stable local `codex-workspace` project so the
+host-only `.agents/skills/daily-skill-friction` locator resolves through the
+managed `.codex-local` mirror. A Codex-generated worktree would neither copy
+the untracked locator nor contain its relative `.codex-local` target. The
+skills and prompts therefore enforce the stronger behavioral boundary: Daily
+writes only control state, Weekly writes only approved ledger worktrees, and
+neither Automation may edit the workspace repository itself.
+
 `doctor --weekly` requires `weekly-pair-receipt` to match the exact SHA-256, `ended_at`, manifest SHA-256, and repository set of both current stamps, and requires the receipt to be within the same 60-minute window. Each scheduled helper call writes to an unpredictable one-shot stamp name. The wrapper validates that exact output, publishes the two canonical stamps transactionally, writes the receipt only after both publications validate, and retires one-shot files on both success and failure. Production freshness age is sampled again after the final evidence rebind, so a slow validation cannot cross the 60-minute boundary and still report ready. A partial, failed, concurrent, or later single-stamp refresh therefore cannot receive an old pair's endorsement.
 
 ## Filesystem and service safety

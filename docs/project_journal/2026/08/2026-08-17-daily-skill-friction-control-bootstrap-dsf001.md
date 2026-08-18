@@ -47,6 +47,7 @@ superseded_by:
 - Weekly plan and manifest outputs must remain outside the managed state-root namespace during normal execution and persisted WAL recovery; non-regular external JSON inputs, including FIFOs without writers, are opened non-blockingly and rejected before they can stall the control path.
 - The redesigned Daily path is evidence-only. Publication and repair happen in the explicit Weekly path, with separate approval boundaries for creating changes, pushing, and opening a PR.
 - The existing private overlay remains independently installed and is not absorbed into this host manifest. Host-only control can be removed without changing overlay installation; each later squash commit must describe the concrete friction it addresses so a no-longer-needed repair can be identified and reverted.
+- Daily and Weekly run from the stable local `codex-workspace` project, not an app-generated worktree: the host-only skill locator is intentionally untracked and points into that workspace's `.codex-local` mirror, so it would be absent or broken in a generated worktree. Their skill contracts prohibit workspace writes; this local-mode choice can be revisited only if skill discovery gains a verified host-wide or per-worktree locator.
 
 ## Next Steps
 
