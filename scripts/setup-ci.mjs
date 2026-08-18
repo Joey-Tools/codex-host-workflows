@@ -76,6 +76,22 @@ const TOOL_IGNORES = {
 };
 
 const PACKAGE_MANAGER = 'pnpm@11.5.2';
+const CHECKOUT_ACTION = 'actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0';
+const SETUP_NODE_ACTION = 'actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0';
+const SETUP_PYTHON_ACTION =
+  'actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0';
+const SETUP_GO_ACTION = 'actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0';
+const PNPM_SETUP_ACTION = 'pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10';
+const SETUP_UV_ACTION = 'astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0';
+const RUST_TOOLCHAIN_ACTION =
+  'dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable';
+const NODE_VERSION = '24.19.0';
+const PYTHON_VERSION = '3.12.12';
+const UV_VERSION = '0.10.7';
+const GO_VERSION = '1.26.6';
+const RUST_TOOLCHAIN_VERSION = '1.97.1';
+const ACTIONLINT_VERSION = 'v1.7.12';
+const SHFMT_VERSION = 'v3.13.1';
 
 class UsageError extends Error {
   constructor(message) {
@@ -663,22 +679,21 @@ function nodeToolingJob(selected) {
     name: Node tooling
     runs-on: ubuntu-latest
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v6
+${checkoutStep()}
       - name: Set up pnpm
-        uses: pnpm/action-setup@v6
+        uses: ${PNPM_SETUP_ACTION}
         with:
           run_install: false
       - name: Set up Node
         if: \${{ hashFiles('pnpm-lock.yaml') == '' }}
-        uses: actions/setup-node@v6
+        uses: ${SETUP_NODE_ACTION}
         with:
-          node-version: 24
+          node-version: '${NODE_VERSION}'
       - name: Set up Node with pnpm cache
         if: \${{ hashFiles('pnpm-lock.yaml') != '' }}
-        uses: actions/setup-node@v6
+        uses: ${SETUP_NODE_ACTION}
         with:
-          node-version: 24
+          node-version: '${NODE_VERSION}'
           cache: pnpm
       - name: Install dependencies
         run: |
@@ -695,14 +710,15 @@ function pythonJob() {
     name: Python
     runs-on: ubuntu-latest
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v6
+${checkoutStep()}
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: ${SETUP_PYTHON_ACTION}
         with:
-          python-version: '3.12'
+          python-version: '${PYTHON_VERSION}'
       - name: Set up uv
-        uses: astral-sh/setup-uv@v8.1.0
+        uses: ${SETUP_UV_ACTION}
+        with:
+          version: '${UV_VERSION}'
       - name: Install dependencies
         run: uv sync --group dev
       - name: Check Python formatting
@@ -734,8 +750,7 @@ function swiftJob() {
     name: Swift
     runs-on: macos-latest
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v6
+${checkoutStep()}
       - name: Install Swift tooling
         run: brew install swiftlint swift-format
       - name: Run Swift checks
@@ -760,12 +775,11 @@ function goJob() {
     name: Go
     runs-on: ubuntu-latest
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v6
+${checkoutStep()}
       - name: Set up Go
-        uses: actions/setup-go@v6
+        uses: ${SETUP_GO_ACTION}
         with:
-          go-version: stable
+          go-version: '${GO_VERSION}'
       - name: Run Go checks
         run: |
           if [ ! -f go.mod ]; then
@@ -794,11 +808,11 @@ function rustJob() {
     name: Rust
     runs-on: ubuntu-latest
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v6
+${checkoutStep()}
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: ${RUST_TOOLCHAIN_ACTION}
         with:
+          toolchain: '${RUST_TOOLCHAIN_VERSION}'
           components: rustfmt, clippy
       - name: Run Rust checks
         run: |
@@ -814,23 +828,25 @@ function rustJob() {
 
 function repoHygieneJob(selected) {
   const needsGoInstall = selected.has('github-actions') || selected.has('bash');
-  const steps = ['      - name: Check out repository\n        uses: actions/checkout@v6'];
+  const steps = [checkoutStep()];
 
   if (needsGoInstall) {
     steps.push(`      - name: Set up Go for lint tools
-        uses: actions/setup-go@v6
+        uses: ${SETUP_GO_ACTION}
         with:
-          go-version: stable`);
+          go-version: '${GO_VERSION}'`);
   }
 
   const installLines = [];
   if (selected.has('github-actions')) {
-    installLines.push('go install github.com/rhysd/actionlint/cmd/actionlint@latest');
+    installLines.push(
+      `go install github.com/rhysd/actionlint/cmd/actionlint@${ACTIONLINT_VERSION}`,
+    );
   }
   if (selected.has('bash')) {
     installLines.push('sudo apt-get update');
     installLines.push('sudo apt-get install -y shellcheck');
-    installLines.push('go install mvdan.cc/sh/v3/cmd/shfmt@latest');
+    installLines.push(`go install mvdan.cc/sh/v3/cmd/shfmt@${SHFMT_VERSION}`);
   }
   if (installLines.length > 0) {
     steps.push(`      - name: Install repository lint tools
@@ -882,6 +898,13 @@ ${steps.join('\n')}`;
 function step(name, run) {
   return `      - name: ${name}
         run: ${run}`;
+}
+
+function checkoutStep() {
+  return `      - name: Check out repository
+        uses: ${CHECKOUT_ACTION}
+        with:
+          persist-credentials: false`;
 }
 
 function editorConfig() {

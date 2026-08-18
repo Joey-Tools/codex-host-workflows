@@ -60,7 +60,10 @@ describe('setup-ci file plan', () => {
     assert.equal(packagePatch.devDependencies['@types/node'], '^24.13.1');
     assert.equal(packagePatch.devDependencies.vitest, '^4.1.8');
     assert.equal(packagePatch.devDependencies['markdownlint-cli2'], '^0.22.1');
-    assert.match(workflow, /uses: pnpm\/action-setup@v6/);
+    assert.match(
+      workflow,
+      /uses: pnpm\/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6\.0\.10/,
+    );
     assert.doesNotMatch(workflow, /version: 11/);
     assert.match(workflow, /if: \$\{\{ hashFiles\('pnpm-lock\.yaml'\) == '' \}\}/);
     assert.match(workflow, /if: \$\{\{ hashFiles\('pnpm-lock\.yaml'\) != '' \}\}/);
@@ -108,7 +111,7 @@ describe('setup-ci file plan', () => {
     assert.match(config, /"MD013": false,/);
     assert.match(
       config,
-      /"globs": \["\*\*\/\*\.md", "!node_modules", "!dist", "!build", "!out", "!target"\],/,
+      /"globs": \["\*\*\/\*\.md", "!\.venv", "!node_modules", "!dist", "!build", "!out", "!target"\],/,
     );
   });
 
@@ -116,10 +119,56 @@ describe('setup-ci file plan', () => {
     const plan = buildFilePlan({ tools: ['python'], benchmark: false });
     const workflow = plan.files.find((file) => file.path === '.github/workflows/ci.yml').content;
 
-    assert.match(workflow, /uses: astral-sh\/setup-uv@v8\.1\.0/);
-    assert.match(workflow, /python-version: '3\.12'/);
+    assert.match(
+      workflow,
+      /uses: astral-sh\/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8\.1\.0/,
+    );
+    assert.match(workflow, /python-version: '3\.12\.12'/);
+    assert.match(workflow, /version: '0\.10\.7'/);
     assert.match(workflow, /if \[ ! -d tests \]; then/);
     assert.match(workflow, /No tests\/ directory found; skipping pytest\./);
+  });
+
+  it('pins external Actions, checkout credentials, runtimes, and Go-installed tools', () => {
+    const plan = buildFilePlan({ tools: TOOL_ORDER, benchmark: false });
+    const workflow = plan.files.find((file) => file.path === '.github/workflows/ci.yml').content;
+    const actionRefs = [...workflow.matchAll(/^\s*uses:\s+([^@\s]+)@([^\s#]+)/gm)];
+
+    assert(actionRefs.length > 0);
+    for (const [, action, ref] of actionRefs) {
+      assert.match(ref, /^[0-9a-f]{40}$/, `${action} must use a full commit SHA`);
+    }
+
+    const checkoutCount = actionRefs.filter(([, action]) => action === 'actions/checkout').length;
+    const hardenedCheckoutCount = [
+      ...workflow.matchAll(
+        /uses: actions\/checkout@[0-9a-f]{40} # v6\.1\.0\n\s+with:\n\s+persist-credentials: false/g,
+      ),
+    ].length;
+    assert.equal(hardenedCheckoutCount, checkoutCount);
+
+    assert.match(workflow, /node-version: '24\.19\.0'/);
+    assert.match(workflow, /python-version: '3\.12\.12'/);
+    assert.match(workflow, /version: '0\.10\.7'/);
+    assert.match(workflow, /go-version: '1\.26\.6'/);
+    assert.match(workflow, /toolchain: '1\.97\.1'/);
+    assert.match(workflow, /actionlint@v1\.7\.12/);
+    assert.match(workflow, /shfmt@v3\.13\.1/);
+    assert.doesNotMatch(workflow, /go install [^\n]+@latest/);
+  });
+
+  it('round-trips the checked-in generated workflow', async () => {
+    const plan = buildFilePlan({
+      tools: ['python', 'bash', 'github-actions', 'markdown'],
+      benchmark: false,
+    });
+    const generated = plan.files.find((file) => file.path === '.github/workflows/ci.yml').content;
+    const checkedIn = await fs.readFile(
+      path.join(import.meta.dirname, '..', '.github', 'workflows', 'ci.yml'),
+      'utf8',
+    );
+
+    assert.equal(checkedIn, generated);
   });
 
   it('disables SwiftLint cache in generated CI', () => {
