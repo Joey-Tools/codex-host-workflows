@@ -4,7 +4,7 @@ title: Daily Skill Friction Control Bootstrap
 status: active
 created: 2026-08-17
 updated: 2026-08-18
-branch: codex/daily-skill-friction-control
+branch: master
 pr:
 supersedes: []
 superseded_by:
