@@ -193,6 +193,10 @@ path, and never combine `--historical` with the Weekly variant.
   committed, obtain and persist a separate exact repair approval. Stage only its
   bound next revision; that stage consumes the approval once in the same WAL
   transaction as the case and receipt.
+- Keep that consumed approval bound to the same ordered repair identities and
+  active repair through implementation, observation, and terminal handling. Only
+  the sealed `closed`-to-`proposed` reopen may select a different repair, and it
+  requires a fresh publication and repair approval before implementation.
 - Begin a repair only after that exact approved case revision has a committed
   stage transaction.
 - Every repair commit must identify the concrete problem with the safe trailer

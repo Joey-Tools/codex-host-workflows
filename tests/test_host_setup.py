@@ -1791,6 +1791,52 @@ def test_reload_receipt_write_rejects_concurrent_valid_replacement(tmp_path: Pat
     assert active.reload_receipt.read_bytes() == replacement
 
 
+def test_no_launchctl_reload_receipt_tamper_cannot_publish_ready_state(tmp_path: Path) -> None:
+    fixture = _build_host(tmp_path)
+
+    class ReceiptTamperingFileOps(hs.FileOps):
+        def begin_replace(
+            self,
+            path: Path,
+            data: bytes,
+            *,
+            mode: int,
+            expected: hs.FileSnapshot | None,
+            max_bytes: int,
+        ) -> hs.ReplacementTransaction:
+            transaction = super().begin_replace(
+                path,
+                data,
+                mode=mode,
+                expected=expected,
+                max_bytes=max_bytes,
+            )
+            if path == fixture.config.reload_receipt:
+                path.write_bytes(hs._reload_receipt_payload(fixture.config, {}))
+                transaction.new_snapshot = hs._read_owned_regular_file(
+                    path,
+                    max_bytes=hs.MAX_CONFIG_BYTES,
+                    label="tampered LaunchAgent reload receipt",
+                )
+            return transaction
+
+    with pytest.raises(hs.SetupError, match="exact requested payload"):
+        hs.apply_setup(
+            fixture.config,
+            fixture.home,
+            FakeRunner(),
+            ensure=False,
+            no_launchctl=True,
+            file_ops=ReceiptTamperingFileOps(),
+        )
+
+    active = _active(fixture)
+    assert not active.reload_receipt.exists()
+    assert hs.status_setup(active, fixture.home, FakeRunner(), no_launchctl=True)["status"] != (
+        "ready"
+    )
+
+
 def test_plist_source_drift_after_plan_fails_before_service_reload(tmp_path: Path) -> None:
     fixture = _build_host(tmp_path)
     _apply_ready(fixture)
@@ -2161,6 +2207,115 @@ def test_atomic_replacement_preserves_foreign_race_targets(tmp_path: Path) -> No
     retained = list(parent.glob(".managed.json.stage-*"))
     assert len(retained) == 1
     assert retained[0].read_bytes() == b"replacement"
+
+
+def test_atomic_new_install_rejects_staged_content_tamper(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parent = tmp_path / "new-stage-content-race"
+    parent.mkdir()
+    target = parent / "managed.json"
+    original_snapshot_at = hs._snapshot_at
+    tampered = False
+
+    def tamper_before_staged_snapshot(
+        parent_fd: int,
+        name: str,
+        *,
+        max_bytes: int,
+        label: str,
+        missing_ok: bool = False,
+    ) -> hs.FileSnapshot | None:
+        nonlocal tampered
+        if label == "replacement staged file" and not tampered:
+            tampered = True
+            descriptor = os.open(
+                name,
+                os.O_WRONLY | os.O_TRUNC | os.O_CLOEXEC | os.O_NOFOLLOW,
+                dir_fd=parent_fd,
+            )
+            try:
+                assert os.write(descriptor, b"foreign") == len(b"foreign")
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+        return original_snapshot_at(
+            parent_fd,
+            name,
+            max_bytes=max_bytes,
+            label=label,
+            missing_ok=missing_ok,
+        )
+
+    monkeypatch.setattr(hs, "_snapshot_at", tamper_before_staged_snapshot)
+    with pytest.raises(hs.SetupError, match="staged content did not match"):
+        hs.FileOps().begin_replace(
+            target,
+            b"managed",
+            mode=0o600,
+            expected=None,
+            max_bytes=100,
+        )
+
+    assert tampered
+    assert not target.exists()
+    assert list(parent.glob(".managed.json.stage-*")) == []
+
+
+def test_atomic_replacement_rejects_staged_content_tamper_and_preserves_original(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parent = tmp_path / "replacement-stage-content-race"
+    parent.mkdir()
+    target = parent / "managed.json"
+    target.write_bytes(b"original")
+    original = hs._read_owned_regular_file(target, max_bytes=100, label="original target")
+    original_snapshot_at = hs._snapshot_at
+    tampered = False
+
+    def tamper_before_staged_snapshot(
+        parent_fd: int,
+        name: str,
+        *,
+        max_bytes: int,
+        label: str,
+        missing_ok: bool = False,
+    ) -> hs.FileSnapshot | None:
+        nonlocal tampered
+        if label == "replacement staged file" and not tampered:
+            tampered = True
+            descriptor = os.open(
+                name,
+                os.O_WRONLY | os.O_TRUNC | os.O_CLOEXEC | os.O_NOFOLLOW,
+                dir_fd=parent_fd,
+            )
+            try:
+                assert os.write(descriptor, b"foreign") == len(b"foreign")
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+        return original_snapshot_at(
+            parent_fd,
+            name,
+            max_bytes=max_bytes,
+            label=label,
+            missing_ok=missing_ok,
+        )
+
+    monkeypatch.setattr(hs, "_snapshot_at", tamper_before_staged_snapshot)
+    with pytest.raises(hs.SetupError, match="staged content did not match"):
+        hs.FileOps().begin_replace(
+            target,
+            b"managed",
+            mode=0o600,
+            expected=original,
+            max_bytes=100,
+        )
+
+    assert tampered
+    assert target.read_bytes() == b"original"
+    assert hs._read_owned_regular_file(target, max_bytes=100, label="preserved target") == original
+    assert list(parent.glob(".managed.json.stage-*")) == []
 
 
 def test_rollback_exchange_retains_a_second_foreign_replacement(tmp_path: Path) -> None:

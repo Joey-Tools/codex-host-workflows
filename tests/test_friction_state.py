@@ -5596,6 +5596,22 @@ def test_closed_case_reopens_only_for_a_later_same_cause_recurrence(tmp_path: Pa
     )
     assert receipt["action"] == "updated"
     assert fs._load_json(root / receipt["case_path"])["case"]["status"] == "proposed"
+    reapproved = json.loads(json.dumps(reopened))
+    reapproved["case"]["revision"] += 1
+    reapproved["case"]["status"] = "approved"
+    reapproved["case"]["lifecycle_changed_at"] = "2026-06-22T12:00:00Z"
+    reapproved["case"]["repairs"][-1]["state"] = "open"
+    reapproved["case"]["repairs"][-1]["pull_request_url"] = (
+        "https://github.com/Joey-Tools/example/pull/2"
+    )
+    reapproved["control"]["semantic_digest"] = fs.semantic_digest(reapproved["case"])
+    with pytest.raises(fs.StateError, match="exact repair approval") as fresh_approval:
+        fs.stage_candidate(
+            _write(tmp_path / "reapproved.json", reapproved),
+            root,
+            "2026-07-10T14:00:00Z",
+        )
+    assert fresh_approval.value.code == "missing-repair-approval"
 
     other_root, _ = _stage_repair_lifecycle(tmp_path / "invalid-reopen", lifecycle)
     not_later = _closed_reopen_candidate(closed, observed_at="2026-06-20T12:00:00Z")
@@ -5996,6 +6012,17 @@ def test_repair_approval_binds_exact_scope_survives_currentness_and_is_consumed_
     )
     assert consumption["stage_receipt_id"] == staged["receipt_id"]
     assert consumption["semantic_digest"] == fs._case_tuple(current)["semantic_digest"]
+    assert consumption["repair_binding"] == {
+        "active_repair_id": "R1",
+        "repair_ids": ["R1"],
+        "repair_identity_digest": fs._digest(
+            {"repairs": fs._repair_identity_projection(current["case"]["repairs"])}
+        ),
+    }
+    binding = fs._load_json(root / fs._repair_binding_relative(current["case"]["id"]))
+    assert binding["target"] == fs._case_tuple(current)
+    assert binding["repair_binding"] == consumption["repair_binding"]
+    assert binding["consumption_digest"] == consumption["consumption_digest"]
     assert (
         fs.stage_candidate(
             _write(tmp_path / "current-approved.json", current),
@@ -6008,6 +6035,111 @@ def test_repair_approval_binds_exact_scope_survives_currentness_and_is_consumed_
         with pytest.raises(fs.StateError, match="already consumed") as used:
             fs._load_unconsumed_repair_approval(store, proposed, current, "2026-07-11T09:00:00Z")
     assert used.value.code == "repair-approval-used"
+
+
+def test_consumed_repair_binding_rejects_replacement_supersession_and_later_install(
+    tmp_path: Path,
+) -> None:
+    proposed, approved = _repair_lifecycle_candidates()[:2]
+    root, proposed_stage = _stage(tmp_path, proposed)
+    _publish_and_approve_repair(tmp_path, root, proposed, approved, proposed_stage)
+    fs.stage_candidate(
+        _write(tmp_path / "approved.json", approved),
+        root,
+        "2026-07-11T08:39:00Z",
+    )
+
+    replacement = json.loads(json.dumps(approved))
+    replacement["case"]["revision"] += 1
+    replacement["case"]["repairs"][0]["id"] = "R2"
+    replacement["case"]["repairs"][0]["pull_request_url"] = (
+        "https://github.com/Joey-Tools/example/pull/2"
+    )
+    replacement["control"]["semantic_digest"] = fs.semantic_digest(replacement["case"])
+    with pytest.raises(fs.StateError, match="freezes every ordered repair identity") as replaced:
+        fs.stage_candidate(
+            _write(tmp_path / "replacement.json", replacement),
+            root,
+            "2026-07-11T09:00:00Z",
+        )
+    assert replaced.value.code == "consumed-repair-binding-change"
+
+    superseded = json.loads(json.dumps(approved))
+    superseded["case"]["revision"] += 1
+    superseded["case"]["repairs"][0]["state"] = "superseded"
+    superseded["case"]["repairs"].append(
+        {
+            "id": "R2",
+            "repository": "Joey-Tools/example",
+            "action": "amend",
+            "state": "planned",
+            "problem_statement": (
+                "The proposed replacement changes the exact repair that Joey approved."
+            ),
+            "change_summary": "Replace the approved repair with a different amendment.",
+            "pull_request_url": None,
+            "commit": None,
+            "commit_trailer": f"Friction-Case: {approved['case']['id']}",
+            "installed_on": None,
+            "removed_on": None,
+            "replaces_repair_id": None,
+        }
+    )
+    superseded["control"]["semantic_digest"] = fs.semantic_digest(superseded["case"])
+    with pytest.raises(fs.StateError, match="freezes the repair list") as appended:
+        fs.stage_candidate(
+            _write(tmp_path / "superseded-r1.json", superseded),
+            root,
+            "2026-07-11T09:01:00Z",
+        )
+    assert appended.value.code == "consumed-repair-binding-change"
+
+    implemented_r2 = json.loads(json.dumps(superseded))
+    implemented_r2["case"]["status"] = "implemented"
+    implemented_r2["case"]["lifecycle_changed_at"] = "2026-06-03T12:00:00Z"
+    implemented_r2["case"]["repairs"][1].update(
+        {
+            "state": "merged",
+            "pull_request_url": "https://github.com/Joey-Tools/example/pull/2",
+            "commit": "b" * 40,
+            "installed_on": "2026-06-03",
+        }
+    )
+    implemented_r2["control"]["semantic_digest"] = fs.semantic_digest(implemented_r2["case"])
+    with pytest.raises(fs.StateError, match="freezes the repair list") as installed:
+        fs.stage_candidate(
+            _write(tmp_path / "implemented-r2.json", implemented_r2),
+            root,
+            "2026-07-11T09:02:00Z",
+        )
+    assert installed.value.code == "consumed-repair-binding-change"
+    persisted = fs._load_json(root / fs._case_relative_path(approved))
+    assert persisted["case"] == approved["case"]
+
+
+def test_consumed_repair_binding_allows_the_approved_repair_lifecycle(
+    tmp_path: Path,
+) -> None:
+    proposed, approved, implemented, observing, closed = _repair_lifecycle_candidates()
+    root, proposed_stage = _stage(tmp_path, proposed)
+    _publish_and_approve_repair(tmp_path, root, proposed, approved, proposed_stage)
+    fs.stage_candidate(
+        _write(tmp_path / "approved.json", approved),
+        root,
+        "2026-07-11T08:39:00Z",
+    )
+    binding_path = root / fs._repair_binding_relative(approved["case"]["id"])
+    binding_bytes = binding_path.read_bytes()
+
+    for index, candidate in enumerate((implemented, observing, closed), start=2):
+        receipt = fs.stage_candidate(
+            _write(tmp_path / f"{candidate['case']['status']}.json", candidate),
+            root,
+            f"2026-07-11T09:0{index}:00Z",
+        )
+        assert receipt["action"] == "updated"
+        assert binding_path.read_bytes() == binding_bytes
+        assert fs._load_json(root / receipt["case_path"])["case"] == candidate["case"]
 
 
 def test_repair_approval_rejects_forged_stale_and_unrelated_semantic_changes(
@@ -6106,7 +6238,8 @@ def test_repair_approval_requires_strict_post_closure_time_and_next_revision(
 def test_repair_approval_consumption_recovers_atomically(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    proposed, approved = _repair_lifecycle_candidates()[:2]
+    lifecycle = _repair_lifecycle_candidates()
+    proposed, approved = lifecycle[:2]
     root, proposed_stage = _stage(tmp_path, proposed)
     approval, _ = _publish_and_approve_repair(tmp_path, root, proposed, approved, proposed_stage)
     case_relative = fs._case_relative_path(approved)
@@ -6142,6 +6275,22 @@ def test_repair_approval_consumption_recovers_atomically(
     assert recovered["repair_approval"]["approval_id"] == approval["approval_id"]
     assert fs._load_json(root / case_relative)["case"]["status"] == "approved"
     assert (root / "repairs" / "consumptions" / f"{approval['approval_id']}.json").exists()
+    binding_path = root / fs._repair_binding_relative(approved["case"]["id"])
+    binding_bytes = binding_path.read_bytes()
+    with fs._state_lock(root, create=False) as store:
+        binding = fs._load_active_repair_binding(store, approved["case"]["id"])
+    assert binding is not None
+    assert binding["repair_binding"]["active_repair_id"] == "R1"
+
+    implemented = lifecycle[2]
+    implemented_path = _write(tmp_path / "recover-implemented.json", implemented)
+    implemented_receipt = fs.stage_candidate(
+        implemented_path,
+        root,
+        "2026-07-11T09:02:00Z",
+    )
+    assert fs.stage_candidate(implemented_path, root, "2026-07-11T10:02:00Z") == implemented_receipt
+    assert binding_path.read_bytes() == binding_bytes
 
 
 def test_repair_approval_authority_recovers_before_becoming_usable(

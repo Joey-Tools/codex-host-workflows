@@ -128,6 +128,18 @@ expired receipt, or already consumed authority fails closed. Recovery or exact
 replay completes or returns the same committed transaction rather than consuming
 the decision again.
 
+That same transaction also persists the ordered repair-identity digest, the exact
+active repair ID, and a per-case binding back to the immutable consumption and
+approval. From `approved` through `implemented`, `observing`, and terminal
+handling, the helper must recover and revalidate that binding before every stage.
+It may advance only the selected repair's ordinary `planned`/`open`/`merged`
+provenance and the otherwise-valid case lifecycle, effectiveness, evidence, and
+currentness fields. It must not replace or supersede the selected repair, append a
+repair, or mutate prior repair history. The sealed `closed`-to-`proposed` reopen
+below is the sole version-1 release from that binding, and its new active repair
+still needs a fresh exact publication and repair approval before returning to
+`approved`.
+
 ## Dormancy
 
 Retain every case. After 30 days with no lifecycle state change, use the state
@@ -157,6 +169,13 @@ disappears or assumptions change, make a forward removal or superseding change
 linked to the same case. Do not blindly revert an unrelated aggregate commit.
 Review open conditions monthly and whenever a recorded `revisit_when` condition
 becomes true.
+
+The version-1 control lifecycle does not yet expose a separately approved
+`proposed` path for a forward removal after repair approval. A standalone ledger
+shape may validate, but the helper must reject a direct staged replacement,
+supersession, or appended removal from an approval-bound case. Add an explicit
+return-to-`proposed` authority path and fresh exact approval contract before using
+such a change operationally.
 
 ## Effectiveness
 
@@ -194,5 +213,7 @@ repair, append exactly one new `planned` repair whose action is `install` or
 effectiveness method, and reset effectiveness to `not-started` with no evaluation.
 The scheduled Daily may stage this proposal but must not approve the repair or
 skip the later separate repair decision. This is the only closed-to-active
-transition. A separate schema-valid closed-to-`superseded` transition remains
-terminal; a `superseded` case cannot reopen or mutate.
+transition. Schema validity alone does not authorize a direct
+closed-to-`superseded` repair replacement: the control helper rejects that change
+while the consumed binding remains active. A `superseded` case cannot reopen or
+mutate.

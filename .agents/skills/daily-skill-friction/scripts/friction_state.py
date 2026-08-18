@@ -119,6 +119,7 @@ STATUSES = {
     "dormant",
 }
 INITIAL_CASE_STATUSES = {"watching", "proposed"}
+APPROVAL_BOUND_CASE_STATUSES = {"approved", "implemented", "observing", "closed"}
 SUPPORT_RESULTS = {"novel", "repeated"}
 URGENCIES = {"normal", "high-signal"}
 SCOPES = {"repo-local", "cross-workflow", "global-invariant"}
@@ -172,6 +173,15 @@ REPAIR_STATE_TRANSITIONS = {
     "merged": {"merged", "superseded"},
     "superseded": {"superseded"},
 }
+REPAIR_IDENTITY_FIELDS = (
+    "id",
+    "repository",
+    "action",
+    "problem_statement",
+    "change_summary",
+    "commit_trailer",
+    "replaces_repair_id",
+)
 FORBIDDEN_FIELD_WORDS = {
     "secret",
     "secrets",
@@ -750,6 +760,13 @@ def _sha_digest(value: Any, field: str) -> str:
     result = _require_string(value, field)
     if DIGEST_RE.fullmatch(result) is None:
         _fail("invalid-digest", f"{field} must be sha256:<64 lowercase hex>")
+    return result
+
+
+def _raw_sha256(value: Any, field: str) -> str:
+    result = _require_string(value, field)
+    if HEX64_RE.fullmatch(result) is None:
+        _fail("invalid-digest", f"{field} must be raw SHA-256")
     return result
 
 
@@ -6462,6 +6479,85 @@ def _validate_closed_reopen(old_case: Mapping[str, Any], new_case: Mapping[str, 
     return True
 
 
+def _repair_identity_projection(repairs: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Project the ordered repair identities that one approval selected."""
+
+    return [{field: repair[field] for field in REPAIR_IDENTITY_FIELDS} for repair in repairs]
+
+
+def _repair_binding_projection(case: Mapping[str, Any]) -> dict[str, Any]:
+    """Bind one exact active repair and the immutable ordered repair list."""
+
+    repairs = _require_list(case.get("repairs"), "case.repairs")
+    normalized = [_require_object(repair, "case.repair") for repair in repairs]
+    active = [repair for repair in normalized if repair.get("state") != "superseded"]
+    if len(active) != 1:
+        _fail(
+            "invalid-repair-binding",
+            "an approval-bound case must have exactly one active repair",
+        )
+    repair_ids = [_bounded_string(repair.get("id"), "repair.id", 2, 12) for repair in normalized]
+    identity_projection = _repair_identity_projection(normalized)
+    return {
+        "active_repair_id": active[0]["id"],
+        "repair_ids": repair_ids,
+        "repair_identity_digest": _digest({"repairs": identity_projection}),
+    }
+
+
+def _validate_approval_bound_repair_delta(
+    old_case: Mapping[str, Any],
+    new_case: Mapping[str, Any],
+    *,
+    closed_reopen: bool,
+) -> None:
+    """Keep the consumed repair selection fixed until a sealed reopen."""
+
+    if old_case["status"] not in APPROVAL_BOUND_CASE_STATUSES or closed_reopen:
+        return
+    old_repairs = _require_list(old_case["repairs"], "old.repairs")
+    new_repairs = _require_list(new_case["repairs"], "new.repairs")
+    if len(new_repairs) != len(old_repairs):
+        _fail(
+            "consumed-repair-binding-change",
+            "consumed repair approval freezes the repair list until a sealed proposed transition",
+        )
+    old_normalized = [_require_object(repair, "old.repair") for repair in old_repairs]
+    new_normalized = [_require_object(repair, "new.repair") for repair in new_repairs]
+    if _repair_identity_projection(new_normalized) != _repair_identity_projection(old_normalized):
+        _fail(
+            "consumed-repair-binding-change",
+            "consumed repair approval freezes every ordered repair identity",
+        )
+    old_active = [
+        (index, repair)
+        for index, repair in enumerate(old_normalized)
+        if repair["state"] != "superseded"
+    ]
+    new_active = [
+        (index, repair)
+        for index, repair in enumerate(new_normalized)
+        if repair["state"] != "superseded"
+    ]
+    if (
+        len(old_active) != 1
+        or len(new_active) != 1
+        or new_active[0][0] != old_active[0][0]
+        or new_active[0][1]["id"] != old_active[0][1]["id"]
+    ):
+        _fail(
+            "consumed-repair-binding-change",
+            "the repair selected by consumed approval cannot be superseded or replaced",
+        )
+    active_index = old_active[0][0]
+    for index, old_repair in enumerate(old_normalized):
+        if index != active_index and new_normalized[index] != old_repair:
+            _fail(
+                "consumed-repair-binding-change",
+                "prior repair history is frozen while a consumed approval remains active",
+            )
+
+
 def _validate_case_delta(existing: Mapping[str, Any], candidate: Mapping[str, Any]) -> str:
     old_case = existing["case"]
     new_case = candidate["case"]
@@ -6556,23 +6652,19 @@ def _validate_case_delta(existing: Mapping[str, Any], candidate: Mapping[str, An
         _fail("lineage-mutation", "control.source_lineage is exact-prefix append-only")
     old_repairs = old_case["repairs"]
     new_repairs = new_case["repairs"]
+    _validate_approval_bound_repair_delta(
+        old_case,
+        new_case,
+        closed_reopen=closed_reopen,
+    )
     if len(new_repairs) < len(old_repairs):
         _fail("repair-history-removal", "existing repair history cannot be removed")
-    immutable = {
-        "id",
-        "repository",
-        "action",
-        "problem_statement",
-        "change_summary",
-        "commit_trailer",
-        "replaces_repair_id",
-    }
     durable = {"pull_request_url", "commit", "installed_on", "removed_on"}
     for index, old_repair in enumerate(old_repairs):
         new_repair = new_repairs[index]
         if new_repair["id"] != old_repair["id"]:
             _fail("repair-history-reorder", "repair history cannot be reordered or replaced")
-        for field in immutable:
+        for field in REPAIR_IDENTITY_FIELDS:
             if new_repair[field] != old_repair[field]:
                 _fail("repair-field-mutation", f"repair {old_repair['id']} {field} is immutable")
         if new_repair["state"] not in REPAIR_STATE_TRANSITIONS[old_repair["state"]]:
@@ -6721,6 +6813,16 @@ def _case_tuple(wrapper: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _normalize_case_tuple_value(value: Any, field: str) -> dict[str, Any]:
+    item = _require_object(value, field)
+    _exact_fields(item, field, {"case_id", "revision", "semantic_digest"})
+    return {
+        "case_id": _validate_case_id(item.get("case_id"), f"{field}.case_id"),
+        "revision": _require_int(item.get("revision"), f"{field}.revision", minimum=1),
+        "semantic_digest": _sha_digest(item.get("semantic_digest"), f"{field}.semantic_digest"),
+    }
+
+
 def _validate_repair_approval_delta(source: Mapping[str, Any], target: Mapping[str, Any]) -> None:
     """Allow approval to authorize only the exact repair/lifecycle transition."""
 
@@ -6808,17 +6910,8 @@ def _normalize_repair_approval(value: Mapping[str, Any]) -> dict[str, Any]:
     approved_at = _timestamp(interaction.get("approved_at"), "repair_approval.approved_at")
     expires_at = _timestamp(value.get("expires_at"), "repair_approval.expires_at")
 
-    def normalize_tuple(raw: Any, field: str) -> dict[str, Any]:
-        item = _require_object(raw, field)
-        _exact_fields(item, field, {"case_id", "revision", "semantic_digest"})
-        return {
-            "case_id": _validate_case_id(item.get("case_id"), f"{field}.case_id"),
-            "revision": _require_int(item.get("revision"), f"{field}.revision", minimum=1),
-            "semantic_digest": _sha_digest(item.get("semantic_digest"), f"{field}.semantic_digest"),
-        }
-
-    source = normalize_tuple(value.get("source"), "repair_approval.source")
-    target = normalize_tuple(value.get("target"), "repair_approval.target")
+    source = _normalize_case_tuple_value(value.get("source"), "repair_approval.source")
+    target = _normalize_case_tuple_value(value.get("target"), "repair_approval.target")
     if source["case_id"] != target["case_id"] or target["revision"] != source["revision"] + 1:
         _fail("invalid-repair-approval", "repair approval source/target tuple is inconsistent")
     publication = _require_object(value.get("publication"), "repair_approval.publication")
@@ -7142,6 +7235,231 @@ def _load_unconsumed_repair_approval(
     return {**approval, "approval_digest": approval_digest}, consumption_relative
 
 
+def _normalize_repair_binding_projection(value: Any, field: str) -> dict[str, Any]:
+    binding = _require_object(value, field)
+    _exact_fields(
+        binding,
+        field,
+        {"active_repair_id", "repair_ids", "repair_identity_digest"},
+    )
+    active_repair_id = _bounded_string(
+        binding.get("active_repair_id"), f"{field}.active_repair_id", 2, 12
+    )
+    if REPAIR_ID_RE.fullmatch(active_repair_id) is None:
+        _fail("invalid-repair-binding", "active repair binding has an invalid repair ID")
+    repair_ids = [
+        _bounded_string(repair_id, f"{field}.repair_ids[]", 2, 12)
+        for repair_id in _require_list(binding.get("repair_ids"), f"{field}.repair_ids")
+    ]
+    if (
+        not repair_ids
+        or len(repair_ids) > 64
+        or len(repair_ids) != len(set(repair_ids))
+        or any(REPAIR_ID_RE.fullmatch(repair_id) is None for repair_id in repair_ids)
+        or active_repair_id not in repair_ids
+    ):
+        _fail("invalid-repair-binding", "repair binding has an invalid ordered repair list")
+    identity_digest = _raw_sha256(
+        binding.get("repair_identity_digest"), f"{field}.repair_identity_digest"
+    )
+    return {
+        "active_repair_id": active_repair_id,
+        "repair_ids": repair_ids,
+        "repair_identity_digest": identity_digest,
+    }
+
+
+def _repair_binding_relative(case_id: str) -> Path:
+    return Path("repairs") / "bindings" / f"{_validate_case_id(case_id)}.json"
+
+
+def _load_repair_approval_consumption(store: StateStore, approval_id: str) -> dict[str, Any]:
+    relative = Path("repairs") / "consumptions" / f"{approval_id}.json"
+    consumption = store.read_json(relative)[0]
+    _exact_fields(
+        consumption,
+        "repair_approval_consumption",
+        {
+            "version",
+            "kind",
+            "approval_id",
+            "approval_digest",
+            "case_id",
+            "revision",
+            "semantic_digest",
+            "repair_binding",
+            "consumed_at",
+            "stage_receipt_id",
+            "consumption_digest",
+        },
+    )
+    body = {key: value for key, value in consumption.items() if key != "consumption_digest"}
+    normalized = {
+        "version": consumption.get("version"),
+        "kind": consumption.get("kind"),
+        "approval_id": _safe_object_id(
+            consumption.get("approval_id"), "repair_consumption.approval_id"
+        ),
+        "approval_digest": _raw_sha256(
+            consumption.get("approval_digest"), "repair_consumption.approval_digest"
+        ),
+        "case_id": _validate_case_id(consumption.get("case_id"), "repair_consumption.case_id"),
+        "revision": _require_int(
+            consumption.get("revision"), "repair_consumption.revision", minimum=1
+        ),
+        "semantic_digest": _sha_digest(
+            consumption.get("semantic_digest"), "repair_consumption.semantic_digest"
+        ),
+        "repair_binding": _normalize_repair_binding_projection(
+            consumption.get("repair_binding"), "repair_consumption.repair_binding"
+        ),
+        "consumed_at": _timestamp(consumption.get("consumed_at"), "repair_consumption.consumed_at"),
+        "stage_receipt_id": _safe_object_id(
+            consumption.get("stage_receipt_id"), "repair_consumption.stage_receipt_id"
+        ),
+        "consumption_digest": _raw_sha256(
+            consumption.get("consumption_digest"), "repair_consumption.consumption_digest"
+        ),
+    }
+    if (
+        normalized["version"] != VERSION
+        or normalized["kind"] != "repair-approval-consumption"
+        or normalized["approval_id"] != approval_id
+        or normalized["consumption_digest"] != _digest(body)
+    ):
+        _fail("invalid-repair-consumption", "repair approval consumption is invalid")
+    return normalized
+
+
+def _load_active_repair_binding(store: StateStore, case_id: str) -> dict[str, Any] | None:
+    relative = _repair_binding_relative(case_id)
+    if not store.exists(relative):
+        return None
+    binding = store.read_json(relative)[0]
+    _exact_fields(
+        binding,
+        "active_repair_binding",
+        {
+            "version",
+            "kind",
+            "case_id",
+            "approval_id",
+            "approval_digest",
+            "target",
+            "repair_binding",
+            "consumption_digest",
+            "binding_digest",
+        },
+    )
+    body = {key: value for key, value in binding.items() if key != "binding_digest"}
+    normalized = {
+        "version": binding.get("version"),
+        "kind": binding.get("kind"),
+        "case_id": _validate_case_id(binding.get("case_id"), "repair_binding.case_id"),
+        "approval_id": _safe_object_id(binding.get("approval_id"), "repair_binding.approval_id"),
+        "approval_digest": _raw_sha256(
+            binding.get("approval_digest"), "repair_binding.approval_digest"
+        ),
+        "target": _normalize_case_tuple_value(binding.get("target"), "repair_binding.target"),
+        "repair_binding": _normalize_repair_binding_projection(
+            binding.get("repair_binding"), "repair_binding.repair_binding"
+        ),
+        "consumption_digest": _raw_sha256(
+            binding.get("consumption_digest"), "repair_binding.consumption_digest"
+        ),
+        "binding_digest": _raw_sha256(
+            binding.get("binding_digest"), "repair_binding.binding_digest"
+        ),
+    }
+    if (
+        normalized["version"] != VERSION
+        or normalized["kind"] != "active-repair-approval-binding"
+        or normalized["case_id"] != case_id
+        or normalized["target"]["case_id"] != case_id
+        or normalized["binding_digest"] != _digest(body)
+    ):
+        _fail("invalid-repair-binding", "active repair approval binding is invalid")
+
+    approval_relative = Path("repairs") / "approvals" / f"{normalized['approval_id']}.json"
+    approval_record = store.read_json(approval_relative)[0]
+    approval_digest = _raw_sha256(
+        approval_record.get("approval_digest"), "repair_binding.approval_record_digest"
+    )
+    approval_body = {
+        key: value for key, value in approval_record.items() if key != "approval_digest"
+    }
+    approval = _normalize_repair_approval(approval_body)
+    if (
+        approval_digest != _digest(approval)
+        or approval_digest != normalized["approval_digest"]
+        or approval["approval_id"] != normalized["approval_id"]
+        or approval["target"] != normalized["target"]
+    ):
+        _fail("invalid-repair-binding", "active binding does not match its repair approval")
+    authority_intent = _require_committed_transaction(
+        store, "approve-repair", normalized["approval_id"]
+    )
+    if authority_intent["result"].get("approval_digest") != normalized["approval_digest"]:
+        _fail("missing-authority-transaction", "active binding has no exact approval WAL")
+
+    consumption = _load_repair_approval_consumption(store, normalized["approval_id"])
+    consumption_target = {
+        "case_id": consumption["case_id"],
+        "revision": consumption["revision"],
+        "semantic_digest": consumption["semantic_digest"],
+    }
+    if (
+        consumption["approval_digest"] != normalized["approval_digest"]
+        or consumption_target != normalized["target"]
+        or consumption["repair_binding"] != normalized["repair_binding"]
+        or consumption["consumption_digest"] != normalized["consumption_digest"]
+    ):
+        _fail("invalid-repair-binding", "active binding does not match its consumption")
+    receipt_relative = Path("receipts") / "stage" / f"{consumption['stage_receipt_id']}.json"
+    receipt = store.read_json(receipt_relative)[0]
+    _validate_persisted_receipt(receipt, "stage", consumption["stage_receipt_id"])
+    if (
+        receipt["case_id"] != case_id
+        or receipt["revision"] != normalized["target"]["revision"]
+        or receipt["semantic_digest"] != normalized["target"]["semantic_digest"]
+        or receipt["repair_approval"]
+        != {
+            "approval_id": normalized["approval_id"],
+            "approval_digest": normalized["approval_digest"],
+        }
+    ):
+        _fail("invalid-repair-binding", "active binding does not match its stage receipt")
+    return normalized
+
+
+def _validate_persisted_repair_binding(
+    store: StateStore,
+    existing: Mapping[str, Any],
+    candidate: Mapping[str, Any],
+) -> None:
+    old_case = _require_object(existing.get("case"), "existing.case")
+    case_id = _validate_case_id(old_case.get("id"))
+    binding = _load_active_repair_binding(store, case_id)
+    if old_case["status"] not in APPROVAL_BOUND_CASE_STATUSES:
+        return
+    if binding is None:
+        _fail(
+            "missing-repair-binding",
+            "approval-bound case has no durable consumed repair binding",
+        )
+    if _repair_binding_projection(old_case) != binding["repair_binding"]:
+        _fail(
+            "consumed-repair-binding-change",
+            "current repair history no longer matches its consumed approval binding",
+        )
+    if not (old_case["status"] == "closed" and candidate["case"]["status"] == "proposed"):
+        if _repair_binding_projection(candidate["case"]) != binding["repair_binding"]:
+            _fail(
+                "consumed-repair-binding-change",
+                "candidate repair history no longer matches its consumed approval binding",
+            )
+
+
 def stage_candidate(candidate_path: Path, state_root: Path, now: str) -> dict[str, Any]:
     now_value = _timestamp(now, "now")
     candidate, candidate_file_sha = _load_json_with_digest(candidate_path)
@@ -7164,6 +7482,7 @@ def stage_candidate(candidate_path: Path, state_root: Path, now: str) -> dict[st
         existing_path = _find_case(state_root, summary["case_id"])
         repair_approval: dict[str, Any] | None = None
         consumption_relative: Path | None = None
+        active_binding_relative: Path | None = None
         if existing_path is None:
             if summary["status"] not in INITIAL_CASE_STATUSES:
                 _fail(
@@ -7179,6 +7498,7 @@ def stage_candidate(candidate_path: Path, state_root: Path, now: str) -> dict[st
             existing = _load_json(existing_path)
             validate_candidate(existing)
             action = _validate_case_delta(existing, candidate)
+            _validate_persisted_repair_binding(store, existing, candidate)
             if (
                 existing["case"]["status"] == "proposed"
                 and candidate["case"]["status"] == "approved"
@@ -7187,6 +7507,7 @@ def stage_candidate(candidate_path: Path, state_root: Path, now: str) -> dict[st
                 repair_approval, consumption_relative = _load_unconsumed_repair_approval(
                     store, existing, candidate, now_value
                 )
+                active_binding_relative = _repair_binding_relative(summary["case_id"])
             if existing["case"]["status"] != candidate["case"]["status"] and not (
                 _parse_time(existing["case"]["lifecycle_changed_at"], "old.lifecycle")
                 < _parse_time(candidate["case"]["lifecycle_changed_at"], "new.lifecycle")
@@ -7245,6 +7566,8 @@ def stage_candidate(candidate_path: Path, state_root: Path, now: str) -> dict[st
             writes.append(marker_write)
         if repair_approval is not None:
             assert consumption_relative is not None
+            assert active_binding_relative is not None
+            repair_binding = _repair_binding_projection(candidate["case"])
             consumption_body = {
                 "version": VERSION,
                 "kind": "repair-approval-consumption",
@@ -7253,11 +7576,24 @@ def stage_candidate(candidate_path: Path, state_root: Path, now: str) -> dict[st
                 "case_id": summary["case_id"],
                 "revision": summary["revision"],
                 "semantic_digest": summary["semantic_digest"],
+                "repair_binding": repair_binding,
                 "consumed_at": now_value,
                 "stage_receipt_id": receipt_id,
             }
             consumption = {**consumption_body, "consumption_digest": _digest(consumption_body)}
             writes.append(_planned_write(store, consumption_relative, consumption, immutable=True))
+            binding_body = {
+                "version": VERSION,
+                "kind": "active-repair-approval-binding",
+                "case_id": summary["case_id"],
+                "approval_id": repair_approval["approval_id"],
+                "approval_digest": repair_approval["approval_digest"],
+                "target": _case_tuple(candidate),
+                "repair_binding": repair_binding,
+                "consumption_digest": consumption["consumption_digest"],
+            }
+            binding = {**binding_body, "binding_digest": _digest(binding_body)}
+            writes.append(_planned_write(store, active_binding_relative, binding, immutable=False))
         writes.extend(
             [
                 _planned_write(

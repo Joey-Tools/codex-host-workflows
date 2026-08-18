@@ -2661,6 +2661,10 @@ class FileOps:
                 label="replacement staged file",
             )
             assert staged is not None
+            if staged.data != data:
+                raise SetupError(
+                    f"replacement staged content did not match the requested data: {path}"
+                )
             if stat.S_IMODE(staged.binding.mode) != mode:
                 raise SetupError(
                     f"replacement staged mode changed after descriptor validation: {path}"
@@ -5557,6 +5561,28 @@ def _build_exclude_content(config: HostConfig) -> tuple[FileSnapshot | None, byt
     return snapshot, f"{content}{separator}{_exclude_block()}".encode(), mode
 
 
+def _verify_exact_replacement(
+    transaction: ReplacementTransaction,
+    *,
+    expected_data: bytes,
+    expected_mode: int,
+    max_bytes: int,
+    label: str,
+) -> FileSnapshot:
+    installed = _read_owned_regular_file(
+        transaction.path,
+        max_bytes=max_bytes,
+        label=label,
+    )
+    if installed != transaction.new_snapshot:
+        raise SetupError(f"{label} changed after atomic replacement")
+    if installed.data != expected_data:
+        raise SetupError(f"{label} did not match the exact requested payload")
+    if stat.S_IMODE(installed.binding.mode) != expected_mode:
+        raise SetupError(f"{label} did not retain the exact requested access mode")
+    return installed
+
+
 def _install_exclude(
     config: HostConfig,
     file_ops: FileOps,
@@ -5573,6 +5599,13 @@ def _install_exclude(
         max_bytes=MAX_CONFIG_BYTES,
     )
     journal.add_file(transaction)
+    _verify_exact_replacement(
+        transaction,
+        expected_data=desired,
+        expected_mode=mode,
+        max_bytes=MAX_CONFIG_BYTES,
+        label="managed Git exclusion",
+    )
     if _check_exclude(config).status != "ready":
         raise SetupError("managed Git exclusion did not become effective")
     return True
@@ -5743,7 +5776,13 @@ def _write_reload_receipt(
         max_bytes=MAX_CONFIG_BYTES,
     )
     journal.add_file(transaction)
-    return transaction.new_snapshot
+    return _verify_exact_replacement(
+        transaction,
+        expected_data=desired,
+        expected_mode=0o600,
+        max_bytes=MAX_CONFIG_BYTES,
+        label="LaunchAgent reload receipt",
+    )
 
 
 def _bind_helper_git_topology(
@@ -6585,6 +6624,13 @@ def _publish_captured_stamp(
         max_bytes=MAX_STAMP_BYTES,
     )
     journal.add_file(transaction)
+    _verify_exact_replacement(
+        transaction,
+        expected_data=captured.canonical_payload,
+        expected_mode=0o600,
+        max_bytes=MAX_STAMP_BYTES,
+        label=f"{captured.canonical_stamp} canonical stamp",
+    )
 
 
 def _cleanup_captured_stamp(
@@ -6899,6 +6945,13 @@ def prefetch_weekly(
             max_bytes=MAX_STAMP_BYTES,
         )
         journal.add_file(transaction)
+        _verify_exact_replacement(
+            transaction,
+            expected_data=payload,
+            expected_mode=0o600,
+            max_bytes=MAX_STAMP_BYTES,
+            label="weekly pair receipt",
+        )
         receipt_check = _validate_stable_weekly_pair(
             refreshed,
             control_evidence,
