@@ -912,10 +912,10 @@ def test_launch_agent_clean_launcher_drops_inherited_tool_control_environment(
         "SSH_AUTH_SOCK": "/tmp/test-agent.sock",
         "PYTHONHOME": "/tmp/hostile-python-home",
         "PYTHONPATH": "/tmp/hostile-python-path",
-        "DYLD_INSERT_LIBRARIES": "/tmp/hostile-inject.dylib",
         "GIT_EXEC_PATH": "/tmp/hostile-git-exec",
         "BASH_ENV": str(hostile_startup),
         "ENV": str(hostile_startup),
+        "__CF_USER_TEXT_ENCODING": "hostile-platform-metadata",
         "BASH_FUNC_[%%": f'() {{ /usr/bin/touch "{startup_marker}"; return 1; }}',
     }
     probe = (
@@ -939,24 +939,26 @@ def test_launch_agent_clean_launcher_drops_inherited_tool_control_environment(
     )
     observed = json.loads(result.stdout)
     environment = observed["environment"]
-    assert environment["PATH"] == hs.TRUSTED_SYSTEM_PATH
-    assert environment["HOME"] == str(config.account_home)
-    assert environment["LANG"] == hs.TRUSTED_LOCALE
-    assert environment["TMPDIR"] == hs.TRUSTED_TMPDIR
-    assert environment["SSH_AUTH_SOCK"] == "/tmp/test-agent.sock"
+    platform_encoding = environment.pop("__CF_USER_TEXT_ENCODING", None)
+    if sys.platform == "darwin" and platform_encoding is not None:
+        encoding_user, encoding_zero, encoding_script = platform_encoding.split(":")
+        assert encoding_user.startswith("0x")
+        int(encoding_user, 16)
+        assert encoding_zero == "0"
+        int(encoding_script)
+    else:
+        assert platform_encoding is None
+    assert environment == {
+        "HOME": str(config.account_home),
+        "LANG": hs.TRUSTED_LOCALE,
+        "PATH": hs.TRUSTED_SYSTEM_PATH,
+        "SSH_AUTH_SOCK": "/tmp/test-agent.sock",
+        "TMPDIR": hs.TRUSTED_TMPDIR,
+    }
     assert not startup_marker.exists()
     assert observed["isolated"] == 1
     assert observed["no_site"] == 1
     assert observed["no_user_site"] == 1
-    for hostile_key in (
-        "PYTHONHOME",
-        "PYTHONPATH",
-        "DYLD_INSERT_LIBRARIES",
-        "GIT_EXEC_PATH",
-        "BASH_ENV",
-        "ENV",
-    ):
-        assert hostile_key not in environment
 
 
 def test_foreign_locator_and_launch_agent_fail_closed(tmp_path: Path) -> None:

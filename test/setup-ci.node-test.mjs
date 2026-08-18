@@ -203,9 +203,23 @@ describe('setup-ci file plan', () => {
     );
 
     assert.match(workflow, /Host control \(macOS 15, Python 3\.12\.10\)/);
+    assert.doesNotMatch(workflow, /uses: actions\/setup-python@/);
+    assert.doesNotMatch(workflow, /UV_PYTHON_DOWNLOADS: never/);
+    assert.match(workflow, /UV_MANAGED_PYTHON: 'true'/);
+    assert.equal(
+      (workflow.match(/UV_PYTHON_INSTALL_DIR: \$\{\{ runner\.temp \}\}\/uv-python-dir/g) ?? [])
+        .length,
+      5,
+    );
+    assert.match(workflow, /run: install -d -m 0700 "\$UV_PYTHON_INSTALL_DIR"/);
     assert.match(workflow, /python-version: '3\.12\.10'/);
-    assert.match(workflow, /uv sync --locked --group dev --python 3\.12\.10/);
+    assert.match(workflow, /uv python install --managed-python '3\.12\.10'/);
+    assert.match(workflow, /uv sync --locked --group dev --managed-python --python '3\.12\.10'/);
     assert.doesNotMatch(workflow, /3\.12\.12/);
+    assert.ok(
+      workflow.indexOf('- name: Prepare trusted Python directory') <
+        workflow.indexOf('- name: Set up uv'),
+    );
   });
 
   it('disables SwiftLint cache in generated CI', () => {

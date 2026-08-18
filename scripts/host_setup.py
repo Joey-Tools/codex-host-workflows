@@ -18,7 +18,10 @@ isolation flags, and the identity/content/access policy of its nominal executabl
 path, but it cannot retrospectively prove which vnode the loader consumed before
 Python started. Delegated helper code is therefore never reopened by pathname:
 one stable owned-file snapshot is compiled and executed from its exact in-memory
-bytes in a forked child of this interpreter.
+bytes in a forked child of this interpreter. The fixed system shell, `/usr/bin/env`,
+and the OS loader stages that start a LaunchAgent environment trampoline are the
+same kind of pre-execution trust root; the closed environment applies only after
+`env -i` has taken effect for the Python child.
 """
 
 from __future__ import annotations

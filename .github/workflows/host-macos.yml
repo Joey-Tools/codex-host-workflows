@@ -20,32 +20,44 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 30
     env:
-      UV_PYTHON_DOWNLOADS: never
+      UV_MANAGED_PYTHON: 'true'
     steps:
       - name: Check out repository
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
 
-      - name: Set up Python
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
-        with:
-          python-version: '3.12.10'
+      - name: Prepare trusted Python directory
+        env:
+          UV_PYTHON_INSTALL_DIR: ${{ runner.temp }}/uv-python-dir
+        run: install -d -m 0700 "$UV_PYTHON_INSTALL_DIR"
 
       - name: Set up uv
         uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        env:
+          UV_PYTHON_INSTALL_DIR: ${{ runner.temp }}/uv-python-dir
         with:
           version: '0.10.7'
+          python-version: '3.12.10'
+
+      - name: Install trusted Python
+        env:
+          UV_PYTHON_INSTALL_DIR: ${{ runner.temp }}/uv-python-dir
+        run: uv python install --managed-python '3.12.10'
 
       - name: Report host toolchain
+        env:
+          UV_PYTHON_INSTALL_DIR: ${{ runner.temp }}/uv-python-dir
         run: |
           sw_vers
           uname -m
-          python --version
+          uv python find --managed-python '3.12.10'
           uv --version
 
       - name: Install locked development dependencies
-        run: uv sync --locked --group dev --python 3.12.10
+        env:
+          UV_PYTHON_INSTALL_DIR: ${{ runner.temp }}/uv-python-dir
+        run: uv sync --locked --group dev --managed-python --python '3.12.10'
 
       - name: Check host-control formatting
         run: uv run ruff format --check scripts/host_setup.py tests/test_host_setup.py
