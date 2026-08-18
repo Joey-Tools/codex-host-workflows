@@ -2643,6 +2643,15 @@ class FileOps:
                 stage_fd = None
                 stream.write(data)
                 stream.flush()
+                try:
+                    os.fchmod(stream.fileno(), mode)
+                except OSError as error:
+                    raise SetupError(f"could not set replacement mode: {path}") from error
+                actual_mode = stat.S_IMODE(os.fstat(stream.fileno()).st_mode)
+                if actual_mode != mode:
+                    raise SetupError(
+                        f"replacement staged mode did not match the requested mode: {path}"
+                    )
                 os.fsync(stream.fileno())
             staged = _snapshot_at(
                 parent_fd,
@@ -2651,6 +2660,10 @@ class FileOps:
                 label="replacement staged file",
             )
             assert staged is not None
+            if stat.S_IMODE(staged.binding.mode) != mode:
+                raise SetupError(
+                    f"replacement staged mode changed after descriptor validation: {path}"
+                )
             if current is None:
                 try:
                     self.renamer.no_replace(parent_fd, stage, path.name)

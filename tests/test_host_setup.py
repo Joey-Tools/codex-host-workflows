@@ -2154,6 +2154,44 @@ def test_chained_replacements_remain_fully_rollbackable(tmp_path: Path) -> None:
     assert list(parent.glob(".receipt.json.stage-*")) == []
 
 
+def test_atomic_replacement_enforces_requested_mode_under_restrictive_umask(
+    tmp_path: Path,
+) -> None:
+    parent = tmp_path / "replacement-mode"
+    parent.mkdir()
+    existing = parent / "existing.plist"
+    existing.write_bytes(b"old")
+    existing.chmod(0o644)
+    original = hs._read_owned_regular_file(existing, max_bytes=100, label="existing plist")
+    installed = parent / "installed.plist"
+
+    previous_umask = os.umask(0o077)
+    try:
+        replaced = hs.FileOps().begin_replace(
+            existing,
+            b"new",
+            mode=0o644,
+            expected=original,
+            max_bytes=100,
+        )
+        created = hs.FileOps().begin_replace(
+            installed,
+            b"new",
+            mode=0o644,
+            expected=None,
+            max_bytes=100,
+        )
+    finally:
+        os.umask(previous_umask)
+
+    replaced.commit()
+    created.commit()
+    assert stat.S_IMODE(existing.stat().st_mode) == 0o644
+    assert stat.S_IMODE(installed.stat().st_mode) == 0o644
+    assert stat.S_IMODE(replaced.new_snapshot.binding.mode) == 0o644
+    assert stat.S_IMODE(created.new_snapshot.binding.mode) == 0o644
+
+
 def test_retirement_restores_foreign_replacement_and_stage_collision_is_preserved(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
