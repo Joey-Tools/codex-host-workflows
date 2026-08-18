@@ -881,6 +881,25 @@ def _tree_bytes(root: Path) -> dict[str, tuple[int, bytes]]:
     return result
 
 
+def _persistent_identity_snapshot(
+    root: Path,
+) -> dict[str, tuple[int, int, int, int, bytes | None]]:
+    """Bind path inventory, object identity, access mode, and regular bytes."""
+
+    result: dict[str, tuple[int, int, int, int, bytes | None]] = {}
+    for path in [root, *sorted(root.rglob("*"))]:
+        info = path.lstat()
+        payload = path.read_bytes() if stat.S_ISREG(info.st_mode) else None
+        result[str(path.relative_to(root))] = (
+            stat.S_IFMT(info.st_mode),
+            info.st_dev,
+            info.st_ino,
+            stat.S_IMODE(info.st_mode),
+            payload,
+        )
+    return result
+
+
 @pytest.mark.parametrize(
     ("command", "input_flag"),
     [
@@ -964,6 +983,55 @@ def test_semantic_digest_matches_ledger_fixture_and_live_validator() -> None:
     case_path = PurePosixPath(f"cases/2026/{case['id']}.json")
     assert ledger.validate_case(case, case_path) == []
     assert ledger.semantic_case_digest(case) == fs.semantic_digest(case)
+
+
+@pytest.mark.parametrize(
+    ("observed_at", "causal_at", "last_seen"),
+    [
+        (
+            "2026-06-10T12:00:00.000Z",
+            "2026-06-10T12:00:00Z",
+            "2026-06-10T12:00:00.000000Z",
+        ),
+        (
+            "2026-06-10T12:00:00.1Z",
+            "2026-06-10T12:00:00.100000Z",
+            "2026-06-10T12:00:00.100Z",
+        ),
+    ],
+)
+def test_equivalent_utc_fraction_forms_compare_as_instants_with_ledger_parity(
+    observed_at: str,
+    causal_at: str,
+    last_seen: str,
+) -> None:
+    wrapper = _candidate()
+    case = wrapper["case"]
+    case["evidence"][0]["observed_at"] = observed_at
+    case["causal"]["first_observed_at"] = causal_at
+    case["evidence_last_seen"] = last_seen
+    case["currentness_checked_at"] = causal_at
+    case["lifecycle"]["created_at"] = last_seen
+    case["lifecycle_changed_at"] = observed_at
+    wrapper["control"]["semantic_digest"] = fs.semantic_digest(case)
+
+    assert fs.validate_candidate(wrapper)["semantic_digest"] == fs.semantic_digest(case)
+    ledger = _load_ledger_validator()
+    path = PurePosixPath(f"cases/{fs._case_year(case['id']):04d}/{case['id']}.json")
+    assert ledger.validate_case(case, path) == []
+
+
+def test_equivalent_dormancy_fraction_forms_compare_as_instants() -> None:
+    wrapper = _candidate(status="dormant", lifecycle_at="2026-06-02T12:00:00.1Z")
+    case = wrapper["case"]
+    case["lifecycle"]["dormant_since"] = "2026-06-02T12:00:00.100000Z"
+    case["lifecycle"]["dormant_from_status"] = "watching"
+    wrapper["control"]["semantic_digest"] = fs.semantic_digest(case)
+
+    fs.validate_candidate(wrapper)
+    ledger = _load_ledger_validator()
+    path = PurePosixPath(f"cases/{fs._case_year(case['id']):04d}/{case['id']}.json")
+    assert ledger.validate_case(case, path) == []
 
 
 def test_frozen_ledger_authority_identity_and_local_vector_do_not_skip() -> None:
@@ -1863,7 +1931,7 @@ def test_finalize_requires_exact_receipts_rejects_drift_and_is_idempotent(tmp_pa
     )
     assert allowed["status"] == "finalized"
     rebound_output = tmp_path / "checked-manifest.json"
-    with pytest.raises(fs.StateError, match="different plan/prepared/output") as raised:
+    with pytest.raises(fs.StateError, match="different request") as raised:
         fs.finalize_publication(
             root,
             plan_path,
@@ -1923,6 +1991,65 @@ def test_finalize_requires_exact_receipts_rejects_drift_and_is_idempotent(tmp_pa
         "2026-07-12T08:06:00Z",
     )
     assert closure_result["status"] == "closed"
+
+
+def test_finalize_public_conflict_does_not_repair_prior_external_output(
+    tmp_path: Path,
+) -> None:
+    root, _, _ = _finalize_one(tmp_path, _candidate())
+    plan_path = tmp_path / "plan.json"
+    prepared_path = tmp_path / "prepared.json"
+    original_output = tmp_path / "manifest.json"
+    conflicting_output = tmp_path / "conflicting-manifest.json"
+    original_output.unlink()
+    marker = root / fs.STATE_MARKER
+    marker_helper = root / f".{fs.STATE_MARKER}.tmp-1-0000000000000000"
+    os.link(marker, marker_helper)
+    marker_identity = (marker.stat().st_dev, marker.stat().st_ino)
+    assert marker.stat().st_nlink == marker_helper.stat().st_nlink == 2
+
+    before = _persistent_identity_snapshot(root)
+    with pytest.raises(fs.StateError) as raised:
+        fs.finalize_publication(
+            root,
+            plan_path,
+            prepared_path,
+            conflicting_output,
+            "2026-07-11T08:33:00Z",
+        )
+    assert raised.value.code == "wal-request-conflict"
+    assert _persistent_identity_snapshot(root) == before
+    assert (marker.stat().st_dev, marker.stat().st_ino) == marker_identity
+    assert (marker_helper.stat().st_dev, marker_helper.stat().st_ino) == marker_identity
+    assert marker.stat().st_nlink == marker_helper.stat().st_nlink == 2
+    assert not original_output.exists()
+    assert not conflicting_output.exists()
+
+
+def test_complete_audit_never_creates_missing_lock_before_binding_rejection(
+    tmp_path: Path,
+) -> None:
+    root, stage = _stage(tmp_path, _candidate())
+    _complete_live(tmp_path, root, [stage])
+    conflicting_audit = fs._load_json(tmp_path / "audit.json")
+    conflicting_audit["summary"]["next_watchpoint"] = (
+        "Recheck the exact repository-local authority after its next update."
+    )
+    receipt_path = _write(tmp_path / "conflicting-audit.json", conflicting_audit)
+    lock_path = root / fs.LOCK_FILE
+    lock_path.unlink()
+    before = _persistent_identity_snapshot(root)
+
+    with pytest.raises(fs.StateError) as raised:
+        fs.complete_audit(
+            root,
+            receipt_path,
+            "2026-07-10T12:32:00Z",
+            historical_replay=False,
+        )
+    assert raised.value.code == "initialization-in-progress"
+    assert _persistent_identity_snapshot(root) == before
+    assert not lock_path.exists()
 
 
 def test_finalize_external_output_cannot_target_managed_state_without_side_effects(
@@ -2122,13 +2249,14 @@ def test_pending_complete_audit_wal_revalidates_its_persisted_receipt_counts(
 
     corrected = json.loads(json.dumps(audit))
     corrected["summary"] = _audit_summary(candidates_considered=1, cases_created=1)
-    with pytest.raises(fs.StateError, match="does not match its exact receipts"):
+    with pytest.raises(fs.StateError, match="different request") as corrected_conflict:
         fs.complete_audit(
             root,
             _write(tmp_path / "corrected-legacy-count.json", corrected),
             "2026-07-10T12:32:00Z",
             historical_replay=False,
         )
+    assert corrected_conflict.value.code == "wal-request-conflict"
     assert _tree_bytes(root) == before
 
     another_case = _candidate(occurrences=[_occurrence(0, root="root:generic-recovery")])
@@ -2698,7 +2826,7 @@ def test_commit_wal_postpublication_failures_roll_back_exact_owned_leaf(
         if (
             failure_point == "temporary-cleanup"
             and published
-            and temporary_cleanup_failures < 2
+            and temporary_cleanup_failures < 1
             and os.fsdecode(path).startswith(f".{commit_leaf}.tmp-")
         ):
             injected = True
@@ -2919,15 +3047,19 @@ def test_global_wal_layout_preflight_precedes_pending_replay(tmp_path: Path) -> 
     assert not pending_commit.exists()
 
 
-def test_global_wal_recovery_accepts_committed_and_pending_pairs(tmp_path: Path) -> None:
+def test_global_wal_recovery_accepts_retired_history_and_one_pending_pair(
+    tmp_path: Path,
+) -> None:
     first = _candidate()
     root, _ = _stage(tmp_path, first)
     second = _candidate(occurrences=[_occurrence(0, root="root:mixed-wal")])
     _stage(tmp_path, second, now="2026-07-10T12:01:00Z")
     wal_directory = root / "wal" / "stage"
     commits = sorted(wal_directory.glob("*.commit.json"))
-    assert len(commits) == 2
-    pending_commit = commits[-1]
+    assert len(commits) == 1
+    history = sorted((root / "wal-history" / "stage").glob("*.json"))
+    assert len(history) == 1
+    pending_commit = commits[0]
     pending_intent = pending_commit.with_name(
         pending_commit.name.replace(".commit.json", ".intent.json")
     )
@@ -2937,8 +3069,1067 @@ def test_global_wal_recovery_accepts_committed_and_pending_pairs(tmp_path: Path)
         fs._recover_pending_wal(store)
 
     assert pending_intent.exists() and pending_commit.exists()
-    assert len(list(wal_directory.glob("*.intent.json"))) == 2
-    assert len(list(wal_directory.glob("*.commit.json"))) == 2
+    assert len(list(wal_directory.glob("*.intent.json"))) == 1
+    assert len(list(wal_directory.glob("*.commit.json"))) == 1
+    assert history[0].exists()
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    ["checkpoint-before-usage", "usage-before-commit-unlink", "commit-before-intent-unlink"],
+)
+def test_wal_compaction_crash_boundaries_converge(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
+) -> None:
+    root, _ = _stage(tmp_path, _candidate())
+    second = _candidate(occurrences=[_occurrence(1, root="root:compaction-retry")])
+    original_write = fs.StateStore.write_json
+    original_unlink = fs.StateStore.unlink_exact
+    injected = False
+
+    def fail_usage(
+        store: Any,
+        relative: Path | str,
+        value: dict[str, Any],
+        *,
+        immutable: bool = False,
+        max_bytes: int | None = None,
+    ) -> str:
+        nonlocal injected
+        if (
+            boundary == "checkpoint-before-usage"
+            and not injected
+            and store.root == root
+            and Path(relative) == fs.WAL_HISTORY_USAGE
+        ):
+            injected = True
+            raise OSError("injected usage interruption")
+        return original_write(
+            store,
+            relative,
+            value,
+            immutable=immutable,
+            max_bytes=max_bytes,
+        )
+
+    def fail_cleanup(
+        store: Any,
+        relative: Path | str,
+        expected_digest: str,
+        *,
+        expected_identity: tuple[int, int] | None = None,
+    ) -> None:
+        nonlocal injected
+        path = Path(relative)
+        wanted = (
+            boundary == "usage-before-commit-unlink" and path.name.endswith(".commit.json")
+        ) or (boundary == "commit-before-intent-unlink" and path.name.endswith(".intent.json"))
+        if not injected and store.root == root and wanted:
+            injected = True
+            raise OSError("injected cleanup interruption")
+        original_unlink(
+            store,
+            relative,
+            expected_digest,
+            expected_identity=expected_identity,
+        )
+
+    monkeypatch.setattr(fs.StateStore, "write_json", fail_usage)
+    monkeypatch.setattr(fs.StateStore, "unlink_exact", fail_cleanup)
+    with pytest.raises(OSError, match="injected"):
+        _stage(tmp_path, second, now="2026-07-10T12:02:00Z")
+    assert injected
+    assert len(list((root / "wal-history" / "stage").glob("*.json"))) == 1
+
+    monkeypatch.setattr(fs.StateStore, "write_json", original_write)
+    monkeypatch.setattr(fs.StateStore, "unlink_exact", original_unlink)
+    recovered = _stage(tmp_path, second, now="2026-07-10T12:02:00Z")[1]
+    assert recovered["action"] in {"created", "updated"}
+    assert fs.audit_wal_history(root)["record_count"] == 1
+    assert len(list((root / "wal" / "stage").glob("*.intent.json"))) == 1
+    assert len(list((root / "wal" / "stage").glob("*.commit.json"))) == 1
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    ["checkpoint-pre-link", "checkpoint-post-link", "usage-pre-link"],
+)
+def test_wal_history_publication_temporary_crashes_converge_and_audit_clean(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
+) -> None:
+    root, _ = _stage(tmp_path, _candidate())
+    second = _candidate(occurrences=[_occurrence(1, root="root:history-temp-retry")])
+    original_link = fs.os.link
+    original_replace = fs.os.replace
+    original_unlink = fs.os.unlink
+    suffix = f".tmp-{fs.WAL_HISTORY_FIXED_TEMP_PID}-{fs.WAL_HISTORY_FIXED_TEMP_NONCE}"
+    injected = False
+
+    def crash_link(source: str, target: str, *args: Any, **kwargs: Any) -> None:
+        nonlocal injected
+        if (
+            boundary == "checkpoint-pre-link"
+            and source.endswith(suffix)
+            and fs.WAL_HISTORY_LEAF_RE.fullmatch(target) is not None
+        ):
+            injected = True
+            raise OSError("injected checkpoint pre-link crash")
+        original_link(source, target, *args, **kwargs)
+
+    def crash_replace(source: str, target: str, *args: Any, **kwargs: Any) -> None:
+        nonlocal injected
+        if (
+            boundary == "usage-pre-link"
+            and source == fs._wal_history_fixed_temp_name("usage.json")
+            and target == "usage.json"
+        ):
+            injected = True
+            raise OSError("injected usage pre-link crash")
+        original_replace(source, target, *args, **kwargs)
+
+    def preserve_crash_temporary(
+        path: str,
+        *args: Any,
+        **kwargs: Any,
+    ) -> None:
+        nonlocal injected
+        usage_name = fs._wal_history_fixed_temp_name("usage.json")
+        preserve = (
+            boundary.startswith("checkpoint") and path.endswith(suffix) and path != usage_name
+        ) or (boundary == "usage-pre-link" and path == usage_name)
+        if preserve:
+            if boundary == "checkpoint-post-link":
+                injected = True
+            raise OSError("injected history temporary cleanup crash")
+        original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(fs.os, "link", crash_link)
+    monkeypatch.setattr(fs.os, "replace", crash_replace)
+    monkeypatch.setattr(fs.os, "unlink", preserve_crash_temporary)
+    with pytest.raises(OSError, match="injected"):
+        _stage(tmp_path, second, now="2026-07-10T12:01:00Z")
+    assert injected
+
+    history_directory = root / "wal-history" / "stage"
+    checkpoint_temps = (
+        list(history_directory.glob(f".*{suffix}")) if history_directory.exists() else []
+    )
+    usage_temp = root / "wal-history" / fs._wal_history_fixed_temp_name("usage.json")
+    if boundary == "checkpoint-pre-link":
+        assert len(checkpoint_temps) == 1
+        assert checkpoint_temps[0].stat().st_nlink == 1
+        assert len(list(history_directory.glob("[0-9a-f]*.json"))) == 0
+    elif boundary == "checkpoint-post-link":
+        assert len(checkpoint_temps) == 1
+        checkpoint = next(history_directory.glob("[0-9a-f]*.json"))
+        assert checkpoint_temps[0].stat().st_ino == checkpoint.stat().st_ino
+        assert checkpoint.stat().st_nlink == 2
+    else:
+        assert usage_temp.exists() and usage_temp.stat().st_nlink == 1
+        assert len(list(history_directory.glob("[0-9a-f]*.json"))) == 1
+
+    monkeypatch.setattr(fs.os, "link", original_link)
+    monkeypatch.setattr(fs.os, "replace", original_replace)
+    monkeypatch.setattr(fs.os, "unlink", original_unlink)
+    crash_audit = fs.audit_wal_history(root)
+    assert crash_audit["status"] == "clean"
+    assert crash_audit["record_count"] == (0 if boundary == "checkpoint-pre-link" else 1)
+    result = _stage(tmp_path, second, now="2026-07-10T12:01:00Z")[1]
+    assert result["action"] == "created"
+    assert fs.audit_wal_history(root)["status"] == "clean"
+    assert not [path for path in (root / "wal-history").rglob(".*") if ".tmp-" in path.name]
+
+
+@pytest.mark.parametrize(
+    ("name", "code"),
+    [
+        (".usage.json.tmp-2-0000000000000000", "foreign-helper-temp"),
+        (".usage.json.tmp-malformed", "malformed-helper-temp"),
+    ],
+)
+def test_wal_history_audit_rejects_foreign_or_malformed_temporaries(
+    tmp_path: Path,
+    name: str,
+    code: str,
+) -> None:
+    root, _ = _stage(tmp_path, _candidate())
+    history = root / "wal-history"
+    history.mkdir(mode=0o700, exist_ok=True)
+    temporary = history / name
+    temporary.write_bytes(b"{}\n")
+    temporary.chmod(0o600)
+
+    with pytest.raises(fs.StateError) as raised:
+        fs.audit_wal_history(root)
+    assert raised.value.code == code
+    assert temporary.exists()
+
+
+def test_wal_history_audit_distinguishes_unreadable_fixed_temporary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, _ = _stage(tmp_path, _candidate())
+    history = root / "wal-history"
+    history.mkdir(mode=0o700, exist_ok=True)
+    name = fs._wal_history_fixed_temp_name("usage.json")
+    temporary = history / name
+    temporary.write_bytes(b"{}\n")
+    temporary.chmod(0o600)
+    original_open = fs.os.open
+
+    def deny_fixed_temp(
+        path: Any,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        if path == name and dir_fd is not None:
+            raise PermissionError(fs.errno.EACCES, "injected unreadable history temp", path)
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(fs.os, "open", deny_fixed_temp)
+    with pytest.raises(fs.StateError) as raised:
+        fs.audit_wal_history(root)
+    assert raised.value.code == "helper-temp-unreadable"
+    assert temporary.exists()
+
+
+def test_wal_history_record_limit_precedes_every_history_payload_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, _ = _stage(tmp_path, _candidate())
+    with fs._state_lock(root, create=False) as store:
+        for operation in ("stage", "dormancy"):
+            with store.open_dir(Path("wal-history") / operation, create=True):
+                pass
+    for operation, key in (("stage", "1" * 64), ("dormancy", "2" * 64)):
+        directory = root / "wal-history" / operation
+        leaf = directory / f"{key}.json"
+        leaf.write_bytes(b"not json\n")
+        leaf.chmod(0o600)
+    monkeypatch.setattr(fs, "MAX_WAL_HISTORY_RECORDS", 1)
+    original_read = fs.StateStore.read_json_without_publication_recovery_with_identity
+    history_reads: list[Path] = []
+
+    def track_history_read(
+        store: Any,
+        relative: Path | str,
+        *,
+        max_bytes: int | None = None,
+        fixed_helper_name: str | None = None,
+    ) -> tuple[dict[str, Any], str, tuple[int, int], int]:
+        path = Path(relative)
+        if path.parts and path.parts[0] == "wal-history":
+            history_reads.append(path)
+        return original_read(
+            store,
+            relative,
+            max_bytes=max_bytes,
+            fixed_helper_name=fixed_helper_name,
+        )
+
+    monkeypatch.setattr(
+        fs.StateStore,
+        "read_json_without_publication_recovery_with_identity",
+        track_history_read,
+    )
+    with pytest.raises(fs.StateError) as raised:
+        fs.audit_wal_history(root)
+    assert raised.value.code == "wal-history-count-limit"
+    assert history_reads == []
+
+
+@pytest.mark.parametrize("lookup", ["committed", "conflict"])
+def test_retired_exact_lookup_applies_history_limit_before_target_payload_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    lookup: str,
+) -> None:
+    first = _candidate(
+        case_id=fs.new_case_id("2026-06-01T12:00:00Z"),
+        occurrences=[_occurrence(0, root="root:history-limit-target")],
+    )
+    second = _candidate(
+        case_id=fs.new_case_id("2026-06-02T12:00:00Z"),
+        occurrences=[_occurrence(1, root="root:history-limit-other")],
+    )
+    root, _ = _stage(tmp_path, first)
+    _stage(tmp_path, second, now="2026-07-10T12:01:00Z")
+    checkpoint_path = next((root / "wal-history" / "stage").glob("[0-9a-f]*.json"))
+    checkpoint = fs._load_json(checkpoint_path)
+    extra_path = checkpoint_path.with_name(f"{'f' * 64}.json")
+    assert extra_path != checkpoint_path
+    extra_path.write_bytes(b"not json\n")
+    extra_path.chmod(0o600)
+    monkeypatch.setattr(fs, "MAX_WAL_HISTORY_RECORDS", 1)
+
+    original_read = fs.StateStore.read_json_without_publication_recovery_with_identity
+    history_reads: list[Path] = []
+
+    def track_history_read(
+        store: Any,
+        relative: Path | str,
+        *,
+        max_bytes: int | None = None,
+        fixed_helper_name: str | None = None,
+    ) -> tuple[dict[str, Any], str, tuple[int, int], int]:
+        path = Path(relative)
+        if path.parts and path.parts[0] == "wal-history":
+            history_reads.append(path)
+        return original_read(
+            store,
+            relative,
+            max_bytes=max_bytes,
+            fixed_helper_name=fixed_helper_name,
+        )
+
+    monkeypatch.setattr(
+        fs.StateStore,
+        "read_json_without_publication_recovery_with_identity",
+        track_history_read,
+    )
+    before = _persistent_identity_snapshot(root)
+    with fs._state_lock(root, create=False) as store:
+        with pytest.raises(fs.StateError) as raised:
+            if lookup == "committed":
+                fs._require_committed_transaction(
+                    store,
+                    "stage",
+                    checkpoint["natural_key"],
+                )
+            else:
+                fs._preflight_transaction_binding_read_only(
+                    store,
+                    operation="stage",
+                    natural_key=checkpoint["natural_key"],
+                    request={"candidate_file_sha256": "e" * 64},
+                )
+    assert raised.value.code == "wal-history-count-limit"
+    assert history_reads == []
+    assert _persistent_identity_snapshot(root) == before
+
+
+def test_wal_history_temporary_limit_precedes_every_temporary_recovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, _ = _stage(tmp_path, _candidate())
+    directory = root / "wal-history" / "stage"
+    with fs._state_lock(root, create=False) as store:
+        with store.open_dir(Path("wal-history") / "stage", create=True):
+            pass
+    for key in ("1" * 64, "2" * 64):
+        leaf = f"{key}.json"
+        temporary = directory / fs._wal_history_fixed_temp_name(leaf)
+        temporary.write_bytes(b"{}\n")
+        temporary.chmod(0o600)
+    monkeypatch.setattr(fs, "MAX_WAL_HISTORY_RECORDS", 1)
+    original_recover = fs.StateStore.recover_wal_history_temporary
+    recoveries: list[Path] = []
+
+    def track_recovery(
+        store: Any,
+        relative: Path | str,
+        *,
+        recover: bool = True,
+    ) -> None:
+        recoveries.append(Path(relative))
+        original_recover(store, relative, recover=recover)
+
+    monkeypatch.setattr(fs.StateStore, "recover_wal_history_temporary", track_recovery)
+    with pytest.raises(fs.StateError) as raised:
+        fs.audit_wal_history(root)
+    assert raised.value.code == "wal-history-count-limit"
+    assert recoveries == []
+
+
+def test_old_checkpoint_requires_bounded_chain_membership_before_lookup_or_audit(
+    tmp_path: Path,
+) -> None:
+    root, _ = _stage(tmp_path, _candidate())
+    _stage(
+        tmp_path,
+        _candidate(occurrences=[_occurrence(1, root="root:membership-source")]),
+        now="2026-07-10T12:01:00Z",
+    )
+    directory = root / "wal-history" / "stage"
+    source = fs._load_json(next(directory.glob("[0-9a-f]*.json")))
+    forged_key = "schema-valid-orphan-checkpoint"
+    forged = dict(source)
+    forged["natural_key"] = forged_key
+    forged["request_digest"] = "e" * 64
+    body = {key: value for key, value in forged.items() if key != "checkpoint_digest"}
+    forged["checkpoint_digest"] = fs._digest(body)
+    forged_path = root / fs._wal_history_path("stage", forged_key)
+    forged_path.write_bytes(fs._canonical_bytes(forged))
+    forged_path.chmod(0o600)
+
+    before_lookup = _persistent_identity_snapshot(root)
+    with fs._state_lock(root, create=False) as store:
+        with pytest.raises(fs.StateError) as lookup:
+            fs._require_committed_transaction(store, "stage", forged_key)
+    assert lookup.value.code == "invalid-wal-history-usage"
+    assert _persistent_identity_snapshot(root) == before_lookup
+
+    usage = root / fs.WAL_HISTORY_USAGE
+    usage_temporary = usage.parent / fs._wal_history_fixed_temp_name(usage.name)
+    usage_temporary.write_bytes(usage.read_bytes())
+    usage_temporary.chmod(0o600)
+    before_audit = _persistent_identity_snapshot(root)
+    with pytest.raises(fs.StateError) as audit:
+        fs.audit_wal_history(root)
+    assert audit.value.code == "invalid-wal-history-usage"
+    assert _persistent_identity_snapshot(root) == before_audit
+    assert usage_temporary.exists()
+
+
+def test_retired_lookup_revalidates_every_non_target_checkpoint_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, _ = _stage(tmp_path, _candidate())
+    for index in (1, 2):
+        _stage(
+            tmp_path,
+            _candidate(occurrences=[_occurrence(index, root=f"root:stable-chain-{index}")]),
+            now=f"2026-07-10T12:0{index}:00Z",
+        )
+    checkpoints = sorted((root / "wal-history" / "stage").glob("[0-9a-f]*.json"))
+    assert len(checkpoints) == 2
+    target = fs._load_json(checkpoints[0])
+    victim = checkpoints[1]
+    replacement = tmp_path / "replacement-checkpoint.json"
+    replacement.write_bytes(victim.read_bytes())
+    replacement.chmod(0o600)
+    original_usage_read = fs._read_wal_history_usage_binding_read_only
+    injected = False
+
+    def replace_non_target(store: Any) -> tuple[dict[str, Any], str | None, Any, int]:
+        nonlocal injected
+        value = original_usage_read(store)
+        if not injected:
+            injected = True
+            os.replace(replacement, victim)
+        return value
+
+    monkeypatch.setattr(fs, "_read_wal_history_usage_binding_read_only", replace_non_target)
+    with fs._state_lock(root, create=False) as store:
+        with pytest.raises(fs.StateError) as raised:
+            fs._require_committed_transaction(store, "stage", target["natural_key"])
+    assert injected
+    assert raised.value.code == "wal-history-changed"
+
+
+def test_audit_phase_one_preserves_authority_helper_when_external_is_not_repairable(
+    tmp_path: Path,
+) -> None:
+    root, _, _ = _finalize_one(tmp_path, _candidate())
+    checkpoint_path = next((root / "wal-history" / "weekly-plan").glob("*.json"))
+    checkpoint = fs._load_json(checkpoint_path)
+    authority_path = next(
+        root / authority["path"]
+        for authority in checkpoint["authorities"]
+        if Path(authority["path"]).parts[:2] == ("publication", "plans")
+    )
+    authority_helper = authority_path.parent / (f".{authority_path.name}.tmp-1-{'1' * 16}")
+    os.link(authority_path, authority_helper)
+    external_plan = tmp_path / "plan.json"
+    external_plan.unlink()
+    before = _persistent_identity_snapshot(root)
+
+    with pytest.raises(fs.StateError) as raised:
+        fs.audit_wal_history(root)
+    assert raised.value.code == "wal-history-external-drift"
+    assert _persistent_identity_snapshot(root) == before
+    assert authority_helper.exists() and authority_helper.stat().st_nlink == 2
+    assert not external_plan.exists()
+
+
+@pytest.mark.parametrize("remove_commit", [False, True])
+def test_audit_repairs_external_only_from_checkpoint_before_usage_full_wal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    remove_commit: bool,
+) -> None:
+    case = _candidate()
+    root, stage = _stage(tmp_path, case)
+    completed = _complete_live(tmp_path, root, [stage])
+    selection = _approved_selection(tmp_path, root, completed["snapshot_digest"], [case])
+    plan_path = tmp_path / "plan.json"
+    fs.weekly_plan(
+        root,
+        _write(tmp_path / "selection.json", selection),
+        plan_path,
+        "2026-07-11T08:01:00Z",
+    )
+    expected_plan = plan_path.read_bytes()
+    plan = fs._load_json(plan_path)
+    prepared_path = _write(tmp_path / "prepared.json", _prepared_receipt(plan))
+    original_write = fs.StateStore.write_json
+    injected = False
+
+    def fail_usage(
+        store: Any,
+        relative: Path | str,
+        value: dict[str, Any],
+        *,
+        immutable: bool = False,
+        max_bytes: int | None = None,
+    ) -> str:
+        nonlocal injected
+        if not injected and store.root == root and Path(relative) == fs.WAL_HISTORY_USAGE:
+            injected = True
+            raise OSError("injected checkpoint-before-usage crash")
+        return original_write(
+            store,
+            relative,
+            value,
+            immutable=immutable,
+            max_bytes=max_bytes,
+        )
+
+    monkeypatch.setattr(fs.StateStore, "write_json", fail_usage)
+    with pytest.raises(OSError, match="checkpoint-before-usage"):
+        fs.finalize_publication(
+            root,
+            plan_path,
+            prepared_path,
+            tmp_path / "manifest.json",
+            "2026-07-11T08:32:00Z",
+        )
+    assert injected
+    monkeypatch.setattr(fs.StateStore, "write_json", original_write)
+    weekly_checkpoint = next((root / "wal-history" / "weekly-plan").glob("*.json"))
+    weekly = fs._load_json(weekly_checkpoint)
+    intent_path, commit_path = fs._wal_paths("weekly-plan", weekly["natural_key"])
+    assert (root / intent_path).exists() and (root / commit_path).exists()
+    if remove_commit:
+        (root / commit_path).unlink()
+    plan_path.unlink()
+
+    if remove_commit:
+        before = _persistent_identity_snapshot(root)
+        with fs._state_lock(root, create=False) as store:
+            with pytest.raises(fs.StateError) as ordinary_recovery:
+                fs._recover_pending_wal(store, compact_committed=False)
+        assert ordinary_recovery.value.code == "invalid-wal-history-usage"
+        assert _persistent_identity_snapshot(root) == before
+        assert not plan_path.exists()
+        with pytest.raises(fs.StateError) as raised:
+            fs.audit_wal_history(root)
+        assert raised.value.code == "invalid-wal-history-usage"
+        assert _persistent_identity_snapshot(root) == before
+        assert not plan_path.exists()
+        return
+    result = fs.audit_wal_history(root)
+    assert result["status"] == "clean"
+    assert plan_path.read_bytes() == expected_plan
+    assert not (root / intent_path).exists()
+    assert not (root / commit_path).exists()
+
+
+def test_fixed_publication_collision_never_unlinks_unowned_temporary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, _ = _stage(tmp_path, _candidate())
+    fixed_name = fs._wal_history_fixed_temp_name("usage.json")
+    foreign_payload = b"foreign fixed temporary\n"
+    original_open = fs.os.open
+    inserted_identity: tuple[int, int] | None = None
+
+    def collide(
+        path: Any,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal inserted_identity
+        if path == fixed_name and flags & fs.os.O_EXCL and inserted_identity is None:
+            foreign_fd = original_open(
+                path,
+                fs.os.O_WRONLY | fs.os.O_CREAT | fs.os.O_EXCL | fs.os.O_CLOEXEC,
+                0o600,
+                dir_fd=dir_fd,
+            )
+            try:
+                fs.os.write(foreign_fd, foreign_payload)
+                fs.os.fsync(foreign_fd)
+                info = fs.os.fstat(foreign_fd)
+                inserted_identity = (info.st_dev, info.st_ino)
+            finally:
+                fs.os.close(foreign_fd)
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(fs.os, "open", collide)
+    with fs._state_lock(root, create=False) as store:
+        store._fixed_publication_temporary = (fs.WAL_HISTORY_USAGE, fixed_name)
+        try:
+            with pytest.raises(FileExistsError):
+                store.write_json(fs.WAL_HISTORY_USAGE, fs._new_wal_history_usage())
+        finally:
+            store._fixed_publication_temporary = None
+    temporary = root / "wal-history" / fixed_name
+    assert inserted_identity is not None
+    assert (temporary.stat().st_dev, temporary.stat().st_ino) == inserted_identity
+    assert temporary.read_bytes() == foreign_payload
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    ["checkpoint-before-usage", "usage-before-commit-unlink", "commit-before-intent-unlink"],
+)
+def test_mixed_legacy_backlog_retires_existing_checkpoint_before_new_sequence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
+) -> None:
+    original_recover = fs._recover_pending_wal
+
+    def preserve_legacy_backlog(
+        store: Any,
+        *,
+        compact_committed: bool = False,
+        retain_transaction: tuple[str, str] | None = None,
+    ) -> None:
+        del compact_committed
+        original_recover(
+            store,
+            compact_committed=False,
+            retain_transaction=retain_transaction,
+        )
+
+    monkeypatch.setattr(fs, "_recover_pending_wal", preserve_legacy_backlog)
+    earlier = _candidate(
+        case_id=fs.new_case_id("2026-06-01T12:00:00Z"),
+        occurrences=[_occurrence(0, root="root:legacy-backlog-earlier")],
+    )
+    later = _candidate(
+        case_id=fs.new_case_id("2026-06-02T12:00:00Z"),
+        occurrences=[_occurrence(1, root="root:legacy-backlog-later")],
+    )
+    root, _ = _stage(tmp_path, earlier)
+    _stage(tmp_path, later, now="2026-07-10T12:01:00Z")
+    monkeypatch.setattr(fs, "_recover_pending_wal", original_recover)
+
+    intents = [
+        fs._load_json(path) for path in sorted((root / "wal" / "stage").glob("*.intent.json"))
+    ]
+    keys_by_case = {intent["result"]["case_id"]: intent["natural_key"] for intent in intents}
+    retained_key = keys_by_case[earlier["case"]["id"]]
+    interrupted_key = keys_by_case[later["case"]["id"]]
+    assert retained_key < interrupted_key
+
+    original_write = fs.StateStore.write_json
+    original_unlink = fs.StateStore.unlink_exact
+    injected = False
+
+    def fail_usage(
+        store: Any,
+        relative: Path | str,
+        value: dict[str, Any],
+        *,
+        immutable: bool = False,
+        max_bytes: int | None = None,
+    ) -> str:
+        nonlocal injected
+        if (
+            boundary == "checkpoint-before-usage"
+            and not injected
+            and store.root == root
+            and Path(relative) == fs.WAL_HISTORY_USAGE
+        ):
+            injected = True
+            raise OSError("injected mixed-backlog usage interruption")
+        return original_write(
+            store,
+            relative,
+            value,
+            immutable=immutable,
+            max_bytes=max_bytes,
+        )
+
+    def fail_cleanup(
+        store: Any,
+        relative: Path | str,
+        expected_digest: str,
+        *,
+        expected_identity: tuple[int, int] | None = None,
+    ) -> None:
+        nonlocal injected
+        path = Path(relative)
+        wanted = (
+            boundary == "usage-before-commit-unlink" and path.name.endswith(".commit.json")
+        ) or (boundary == "commit-before-intent-unlink" and path.name.endswith(".intent.json"))
+        if not injected and store.root == root and wanted:
+            injected = True
+            raise OSError("injected mixed-backlog cleanup interruption")
+        original_unlink(
+            store,
+            relative,
+            expected_digest,
+            expected_identity=expected_identity,
+        )
+
+    monkeypatch.setattr(fs.StateStore, "write_json", fail_usage)
+    monkeypatch.setattr(fs.StateStore, "unlink_exact", fail_cleanup)
+    with fs._state_lock(root, create=False) as store:
+        with pytest.raises(OSError, match="injected mixed-backlog"):
+            fs._recover_pending_wal(
+                store,
+                compact_committed=True,
+                retain_transaction=("stage", retained_key),
+            )
+    assert injected
+    interrupted_history = root / fs._wal_history_path("stage", interrupted_key)
+    retained_history = root / fs._wal_history_path("stage", retained_key)
+    assert interrupted_history.exists()
+    assert not retained_history.exists()
+
+    monkeypatch.setattr(fs.StateStore, "write_json", original_write)
+    monkeypatch.setattr(fs.StateStore, "unlink_exact", original_unlink)
+    next_key = "different-next-natural-key"
+    next_authority = Path("receipts") / "stage" / f"{next_key}.json"
+    next_receipt = {"version": fs.VERSION, "kind": "synthetic-stage-receipt", "status": "next"}
+    with fs._state_lock(root, create=False) as store:
+        next_result = {**next_receipt, "path": str(root / next_authority)}
+        assert (
+            fs._run_transaction(
+                store,
+                operation="stage",
+                natural_key=next_key,
+                request={"operation": next_key},
+                captured_at="2026-07-10T12:02:00Z",
+                writes=[
+                    fs._planned_write(
+                        store,
+                        next_authority,
+                        next_receipt,
+                        immutable=True,
+                    )
+                ],
+                result=next_result,
+            )
+            == next_result
+        )
+
+    history = {
+        checkpoint["natural_key"]: checkpoint
+        for checkpoint in (
+            fs._load_json(path) for path in (root / "wal-history" / "stage").glob("*.json")
+        )
+    }
+    assert history[interrupted_key]["sequence"] == 1
+    assert history[retained_key]["sequence"] == 2
+    assert fs.audit_wal_history(root)["record_count"] == 2
+    next_intent, next_commit = fs._wal_paths("stage", next_key)
+    assert (root / next_intent).exists() and (root / next_commit).exists()
+
+
+def test_wal_request_conflict_does_not_compact_another_committed_pair(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_recover = fs._recover_pending_wal
+
+    def preserve_committed_pairs(
+        store: Any,
+        *,
+        compact_committed: bool = False,
+        retain_transaction: tuple[str, str] | None = None,
+    ) -> None:
+        del compact_committed
+        original_recover(
+            store,
+            compact_committed=False,
+            retain_transaction=retain_transaction,
+        )
+
+    monkeypatch.setattr(fs, "_recover_pending_wal", preserve_committed_pairs)
+    first = _candidate(
+        case_id=fs.new_case_id("2026-06-01T12:00:00Z"),
+        occurrences=[_occurrence(0, root="root:conflict-other-pair")],
+    )
+    current = _candidate(
+        case_id=fs.new_case_id("2026-06-02T12:00:00Z"),
+        occurrences=[_occurrence(1, root="root:conflict-current-pair")],
+    )
+    root, _ = _stage(tmp_path, first)
+    _stage(tmp_path, current, now="2026-07-10T12:01:00Z")
+    monkeypatch.setattr(fs, "_recover_pending_wal", original_recover)
+
+    intents = [
+        fs._load_json(path) for path in sorted((root / "wal" / "stage").glob("*.intent.json"))
+    ]
+    current_intent = next(
+        intent for intent in intents if intent["result"]["case_id"] == current["case"]["id"]
+    )
+    current_key = current_intent["natural_key"]
+    current_intent_path, _ = fs._wal_paths("stage", current_key)
+    active_final = root / current_intent_path
+    active_temporary = active_final.parent / (f".{active_final.name}.tmp-1-{'0' * 16}")
+    fs.os.link(active_final, active_temporary)
+
+    before = _persistent_identity_snapshot(root)
+    with fs._state_lock(root, create=False) as store:
+        with pytest.raises(fs.StateError) as raised:
+            fs._run_transaction(
+                store,
+                operation="stage",
+                natural_key=current_key,
+                request={"candidate_file_sha256": "f" * 64, "anchor": "conflict"},
+                captured_at="2026-07-10T12:02:00Z",
+                writes=[],
+                result={},
+            )
+    assert raised.value.code == "wal-request-conflict"
+    assert _persistent_identity_snapshot(root) == before
+    assert len(list((root / "wal" / "stage").glob("*.intent.json"))) == 2
+    assert len(list((root / "wal" / "stage").glob("*.commit.json"))) == 2
+    assert not (root / "wal-history").exists()
+
+
+def test_retired_wal_request_conflict_preserves_history_publication_temporaries(
+    tmp_path: Path,
+) -> None:
+    first = _candidate(
+        case_id=fs.new_case_id("2026-06-01T12:00:00Z"),
+        occurrences=[_occurrence(0, root="root:retired-conflict")],
+    )
+    second = _candidate(
+        case_id=fs.new_case_id("2026-06-02T12:00:00Z"),
+        occurrences=[_occurrence(1, root="root:retired-conflict-other")],
+    )
+    root, _ = _stage(tmp_path, first)
+    _stage(tmp_path, second, now="2026-07-10T12:01:00Z")
+
+    checkpoint_path = next((root / "wal-history" / "stage").glob("[0-9a-f]*.json"))
+    checkpoint = fs._load_json(checkpoint_path)
+    checkpoint_temporary = checkpoint_path.parent / fs._wal_history_fixed_temp_name(
+        checkpoint_path.name
+    )
+    fs.os.link(checkpoint_path, checkpoint_temporary)
+    usage = root / fs.WAL_HISTORY_USAGE
+    usage_temporary = usage.parent / fs._wal_history_fixed_temp_name(usage.name)
+    usage_temporary.write_bytes(usage.read_bytes())
+    usage_temporary.chmod(0o600)
+
+    before = _persistent_identity_snapshot(root)
+    with fs._state_lock(root, create=False) as store:
+        with pytest.raises(fs.StateError) as raised:
+            fs._run_transaction(
+                store,
+                operation="stage",
+                natural_key=checkpoint["natural_key"],
+                request={"candidate_file_sha256": "e" * 64, "anchor": "retired-conflict"},
+                captured_at="2026-07-10T12:02:00Z",
+                writes=[],
+                result={},
+            )
+    assert raised.value.code == "wal-request-conflict"
+    assert _persistent_identity_snapshot(root) == before
+    assert checkpoint_temporary.exists() and checkpoint_temporary.stat().st_nlink == 2
+    assert usage_temporary.exists() and usage_temporary.stat().st_nlink == 1
+    assert len(list((root / "wal" / "stage").glob("*.intent.json"))) == 1
+    assert len(list((root / "wal" / "stage").glob("*.commit.json"))) == 1
+
+
+def test_wal_compaction_keeps_ordinary_history_reads_constant(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root: Path | None = None
+    for index in range(12):
+        candidate = _candidate(occurrences=[_occurrence(index, root=f"root:history-{index}")])
+        root, _ = _stage(
+            tmp_path,
+            candidate,
+            now=f"2026-07-10T12:{index:02d}:00Z",
+        )
+    assert root is not None
+    usage = fs._load_json(root / fs.WAL_HISTORY_USAGE)
+    assert usage["record_count"] == 11
+    history_paths = sorted((root / "wal-history" / "stage").glob("*.json"))
+    assert len(history_paths) == 11
+    active_intent = next((root / "wal" / "stage").glob("*.intent.json"))
+    checkpoint = fs._load_json(history_paths[0])
+
+    def nested_keys(value: Any) -> set[str]:
+        if isinstance(value, dict):
+            return set(value) | {key for child in value.values() for key in nested_keys(child)}
+        if isinstance(value, list):
+            return {key for child in value for key in nested_keys(child)}
+        return set()
+
+    assert "after" not in nested_keys(checkpoint)
+    assert history_paths[0].stat().st_size < active_intent.stat().st_size
+
+    history_reads: list[str] = []
+    history_lists: list[str] = []
+    original_read = fs.StateStore.read_bytes_with_identity
+    original_list = fs.StateStore.list_names
+
+    def count_read(
+        store: Any, relative: Path | str, *, max_bytes: int | None = None
+    ) -> tuple[bytes, str, tuple[int, int]]:
+        path = Path(relative)
+        if path.parts and path.parts[0] == "wal-history":
+            history_reads.append(path.as_posix())
+        return original_read(store, relative, max_bytes=max_bytes)
+
+    def count_list(store: Any, relative: Path | str) -> list[str]:
+        path = Path(relative)
+        if path.parts and path.parts[0] == "wal-history":
+            history_lists.append(path.as_posix())
+        return original_list(store, relative)
+
+    monkeypatch.setattr(fs.StateStore, "read_bytes_with_identity", count_read)
+    monkeypatch.setattr(fs.StateStore, "list_names", count_list)
+    candidate = _candidate(occurrences=[_occurrence(12, root="root:history-12")])
+    _stage(tmp_path, candidate, now="2026-07-10T12:12:00Z")
+
+    record_reads = [path for path in history_reads if path != fs.WAL_HISTORY_USAGE.as_posix()]
+    assert len(set(record_reads)) == 1
+    assert history_lists == []
+
+
+def test_explicit_wal_history_audit_detects_foreign_and_orphan_leaves(
+    tmp_path: Path,
+) -> None:
+    root, _ = _stage(tmp_path, _candidate())
+    _stage(
+        tmp_path,
+        _candidate(occurrences=[_occurrence(1, root="root:history-audit")]),
+        now="2026-07-10T12:01:00Z",
+    )
+    assert fs.audit_wal_history(root)["status"] == "clean"
+    directory = root / "wal-history" / "stage"
+    foreign = directory / "README"
+    foreign.write_bytes(b"foreign\n")
+    foreign.chmod(0o600)
+    with pytest.raises(fs.StateError, match="unexpected history leaf"):
+        fs.audit_wal_history(root)
+    foreign.unlink()
+
+    orphan = directory / f"{'f' * 64}.json"
+    orphan.write_bytes(b"{}\n")
+    orphan.chmod(0o600)
+    with pytest.raises(fs.StateError):
+        fs.audit_wal_history(root)
+
+
+@pytest.mark.parametrize(
+    ("constant", "value", "code"),
+    [
+        ("MAX_WAL_HISTORY_RECORDS", 0, "wal-history-count-limit"),
+        ("MAX_WAL_HISTORY_BYTES", 1, "wal-history-byte-limit"),
+    ],
+)
+def test_wal_checkpoint_capacity_blocks_before_intent_or_after_images(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    constant: str,
+    value: int,
+    code: str,
+) -> None:
+    monkeypatch.setattr(fs, constant, value)
+    root = tmp_path / "state"
+    with pytest.raises(fs.StateError) as raised:
+        _stage(tmp_path, _candidate())
+    assert raised.value.code == code
+    assert not (root / "wal").exists()
+    assert not (root / "cases").exists()
+    assert not (root / "receipts").exists()
+
+
+@pytest.mark.parametrize(
+    ("constant", "value", "code"),
+    [
+        ("MAX_ACTIVE_WAL_TRANSACTIONS", 0, "active-wal-count-limit"),
+        ("MAX_ACTIVE_WAL_BYTES", 1, "active-wal-byte-limit"),
+    ],
+)
+def test_active_wal_bounds_fail_before_parsing_or_replay(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    constant: str,
+    value: int,
+    code: str,
+) -> None:
+    root, _ = _stage(tmp_path, _candidate())
+    monkeypatch.setattr(fs, constant, value)
+    with fs._state_lock(root, create=False) as store:
+        original_read = fs._read_fd_stable
+        reads: list[str] = []
+        recoveries: list[Path] = []
+
+        def track_read(fd: int, path: str, **kwargs: Any) -> tuple[bytes, str]:
+            reads.append(path)
+            return original_read(fd, path, **kwargs)
+
+        def track_recovery(
+            active_store: Any,
+            relative: Path | str,
+            *,
+            names: Any = None,
+        ) -> None:
+            recoveries.append(Path(relative))
+
+        monkeypatch.setattr(fs, "_read_fd_stable", track_read)
+        monkeypatch.setattr(fs.StateStore, "recover_wal_temporaries", track_recovery)
+        with pytest.raises(fs.StateError) as raised:
+            fs._recover_pending_wal(store)
+    assert raised.value.code == code
+    assert reads == []
+    assert recoveries == []
+
+
+def test_active_wal_temporary_entry_limit_precedes_payload_read_and_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, _ = _stage(tmp_path, _candidate())
+    wal_directory = root / "wal" / "stage"
+    intent = next(wal_directory.glob("*.intent.json"))
+    for index in range(3):
+        temporary = wal_directory / f".{intent.name}.tmp-1-{index + 1:016x}"
+        temporary.write_bytes(intent.read_bytes())
+        temporary.chmod(0o600)
+    monkeypatch.setattr(fs, "MAX_ACTIVE_WAL_TRANSACTIONS", 1)
+
+    before = _persistent_identity_snapshot(root)
+    with fs._state_lock(root, create=False) as store:
+        original_read = fs._read_fd_stable
+        reads: list[str] = []
+        recoveries: list[Path] = []
+
+        def track_read(fd: int, path: str, **kwargs: Any) -> tuple[bytes, str]:
+            reads.append(path)
+            return original_read(fd, path, **kwargs)
+
+        def track_recovery(
+            active_store: Any,
+            relative: Path | str,
+            *,
+            names: Any = None,
+        ) -> None:
+            recoveries.append(Path(relative))
+
+        monkeypatch.setattr(fs, "_read_fd_stable", track_read)
+        monkeypatch.setattr(fs.StateStore, "recover_wal_temporaries", track_recovery)
+        with pytest.raises(fs.StateError) as raised:
+            fs._recover_pending_wal(store)
+    assert raised.value.code == "active-wal-count-limit"
+    assert reads == []
+    assert recoveries == []
+    assert _persistent_identity_snapshot(root) == before
 
 
 def _rewrite_external_wal_as_legacy(
@@ -3093,6 +4284,187 @@ def test_pending_legacy_external_wal_fails_closed_without_rebinding(
             fs._recover_pending_wal(store)
     assert raised.value.code == "legacy-external-wal-unbound"
     assert output.exists()
+
+
+def test_interrupted_external_retirement_repairs_before_compaction_then_fails_terminal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    case = _candidate()
+    root, stage = _stage(tmp_path, case)
+    completed = _complete_live(tmp_path, root, [stage])
+    selection = _approved_selection(tmp_path, root, completed["snapshot_digest"], [case])
+    output = tmp_path / "retirement-repair-plan.json"
+    fs.weekly_plan(
+        root,
+        _write(tmp_path / "retirement-repair-selection.json", selection),
+        output,
+        "2026-07-11T08:01:00Z",
+    )
+    intent_relative, commit_relative = fs._wal_paths("weekly-plan", selection["selection_id"])
+    original_write = fs.StateStore.write_json
+    injected = False
+
+    def fail_usage(
+        store: Any,
+        relative: Path | str,
+        value: dict[str, Any],
+        *,
+        immutable: bool = False,
+        max_bytes: int | None = None,
+    ) -> str:
+        nonlocal injected
+        if not injected and store.root == root and Path(relative) == fs.WAL_HISTORY_USAGE:
+            injected = True
+            raise OSError("injected external retirement interruption")
+        return original_write(
+            store,
+            relative,
+            value,
+            immutable=immutable,
+            max_bytes=max_bytes,
+        )
+
+    monkeypatch.setattr(fs.StateStore, "write_json", fail_usage)
+    with fs._state_lock(root, create=False) as store:
+        with pytest.raises(OSError, match="external retirement interruption"):
+            fs._recover_pending_wal(store, compact_committed=True)
+    assert (root / intent_relative).exists() and (root / commit_relative).exists()
+    assert (root / fs._wal_history_path("weekly-plan", selection["selection_id"])).exists()
+
+    monkeypatch.setattr(fs.StateStore, "write_json", original_write)
+    output.unlink()
+    with fs._state_lock(root, create=False) as store:
+        fs._recover_pending_wal(store)
+    assert output.exists()
+    assert not (root / intent_relative).exists()
+    assert not (root / commit_relative).exists()
+
+    output.unlink()
+    with fs._state_lock(root, create=False) as store:
+        with pytest.raises(fs.StateError) as raised:
+            fs._require_committed_transaction(store, "weekly-plan", selection["selection_id"])
+    assert raised.value.code == "wal-history-external-drift"
+    assert not output.exists()
+
+
+def test_external_retirement_revalidates_content_after_fsync(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    case = _candidate()
+    root, stage = _stage(tmp_path, case)
+    completed = _complete_live(tmp_path, root, [stage])
+    selection = _approved_selection(tmp_path, root, completed["snapshot_digest"], [case])
+    output = tmp_path / "post-sync-race-plan.json"
+    fs.weekly_plan(
+        root,
+        _write(tmp_path / "post-sync-race-selection.json", selection),
+        output,
+        "2026-07-11T08:01:00Z",
+    )
+    expected_output = output.read_bytes()
+    output_identity = (output.stat().st_dev, output.stat().st_ino)
+    intent_relative, commit_relative = fs._wal_paths("weekly-plan", selection["selection_id"])
+    history_relative = fs._wal_history_path("weekly-plan", selection["selection_id"])
+    original_fsync = fs.os.fsync
+    injected = False
+
+    def mutate_after_file_fsync(fd: int) -> None:
+        nonlocal injected
+        original_fsync(fd)
+        info = fs.os.fstat(fd)
+        if not injected and (info.st_dev, info.st_ino) == output_identity:
+            injected = True
+            output.write_bytes(b'{"tampered":true}\n')
+
+    monkeypatch.setattr(fs.os, "fsync", mutate_after_file_fsync)
+    with fs._state_lock(root, create=False) as store:
+        with pytest.raises(fs.StateError) as raised:
+            fs._recover_pending_wal(store, compact_committed=True)
+    assert injected
+    assert raised.value.code == "object-changed-after-sync"
+    assert (root / intent_relative).exists()
+    assert (root / commit_relative).exists()
+    assert not (root / history_relative).exists()
+
+    monkeypatch.setattr(fs.os, "fsync", original_fsync)
+    output.write_bytes(expected_output)
+    with fs._state_lock(root, create=False) as store:
+        fs._recover_pending_wal(store, compact_committed=True)
+    assert output.read_bytes() == expected_output
+    assert (root / history_relative).exists()
+    assert not (root / intent_relative).exists()
+    assert not (root / commit_relative).exists()
+
+
+def test_committed_legacy_external_wal_compacts_read_only_and_stays_fail_closed(
+    tmp_path: Path,
+) -> None:
+    case = _candidate()
+    root, stage = _stage(tmp_path, case)
+    completed = _complete_live(tmp_path, root, [stage])
+    selection = _approved_selection(tmp_path, root, completed["snapshot_digest"], [case])
+    output = tmp_path / "legacy-compact-plan.json"
+    fs.weekly_plan(
+        root,
+        _write(tmp_path / "legacy-compact-selection.json", selection),
+        output,
+        "2026-07-11T08:01:00Z",
+    )
+    intent_path, commit_path = _rewrite_external_wal_as_legacy(
+        root, "weekly-plan", selection["selection_id"]
+    )
+
+    with fs._state_lock(root, create=False) as store:
+        fs._recover_pending_wal(store, compact_committed=True)
+    assert not intent_path.exists() and not commit_path.exists()
+    history_path = root / fs._wal_history_path("weekly-plan", selection["selection_id"])
+    assert fs._load_json(history_path)["after_images"][-1]["legacy_external"] is True
+    assert fs.audit_wal_history(root)["status"] == "clean"
+
+    output.unlink()
+    with fs._state_lock(root, create=False) as store:
+        with pytest.raises(fs.StateError) as raised:
+            fs._require_committed_transaction(store, "weekly-plan", selection["selection_id"])
+    assert raised.value.code == "legacy-external-wal-unbound"
+
+
+def test_retired_checkpoint_preserves_exact_result_and_first_writer_wins(
+    tmp_path: Path,
+) -> None:
+    case = _candidate()
+    root, stage = _stage(tmp_path, case)
+    completed = _complete_live(tmp_path, root, [stage])
+    selection = _approved_selection(tmp_path, root, completed["snapshot_digest"], [case])
+    selection_path = _write(tmp_path / "retired-selection.json", selection)
+    output = tmp_path / "retired-plan.json"
+    first = fs.weekly_plan(root, selection_path, output, "2026-07-11T08:01:00Z")
+
+    _stage(
+        tmp_path,
+        _candidate(occurrences=[_occurrence(2, root="root:retire-weekly")]),
+        now="2026-07-11T08:02:00Z",
+    )
+    assert (root / fs._wal_history_path("weekly-plan", selection["selection_id"])).exists()
+    assert (
+        fs.weekly_plan(
+            root,
+            selection_path,
+            output,
+            "2026-07-11T08:03:00Z",
+        )
+        == first
+    )
+
+    conflicting_output = tmp_path / "retired-plan-conflict.json"
+    with pytest.raises(fs.StateError) as raised:
+        fs.weekly_plan(
+            root,
+            selection_path,
+            conflicting_output,
+            "2026-07-11T08:04:00Z",
+        )
+    assert raised.value.code == "wal-request-conflict"
+    assert not conflicting_output.exists()
 
 
 def test_selection_preflight_binds_exact_draft_and_current_case_bytes(tmp_path: Path) -> None:
@@ -3717,6 +5089,12 @@ def test_transaction_rejects_rebound_wal_operation_before_commit_and_recovers(
     store = fs.StateStore(root)
     store.acquire_lock()
     write = fs._planned_write(store, Path("probe.json"), {"value": 1}, immutable=False)
+    authority = fs._planned_write(
+        store,
+        Path("receipts") / "stage" / "rebound-wal-operation.json",
+        {"value": 1},
+        immutable=True,
+    )
     original_apply = fs._apply_wal_intent
     replaced = False
 
@@ -3737,7 +5115,7 @@ def test_transaction_rejects_rebound_wal_operation_before_commit_and_recovers(
                 natural_key="rebound-wal-operation",
                 request={"operation": "rebound-wal-operation"},
                 captured_at="2026-07-10T12:00:00Z",
-                writes=[write],
+                writes=[write, authority],
                 result={"status": "recovered"},
             )
         assert raised.value.code == "state-directory-replaced"
@@ -3757,7 +5135,7 @@ def test_transaction_rejects_rebound_wal_operation_before_commit_and_recovers(
             natural_key="rebound-wal-operation",
             request={"operation": "rebound-wal-operation"},
             captured_at="2026-07-10T12:00:00Z",
-            writes=[write],
+            writes=[write, authority],
             result={"status": "recovered"},
         )
         assert result == {"status": "recovered"}
@@ -3785,6 +5163,12 @@ def test_transaction_rejects_rebound_after_image_directory_and_recovery_is_deter
         Path("cases") / "2026" / "probe.json",
         {"value": 1},
         immutable=False,
+    )
+    authority = fs._planned_write(
+        store,
+        Path("receipts") / "stage" / "rebound-after-image-directory.json",
+        {"value": 1},
+        immutable=True,
     )
     original_bind = fs.StateStore._bind_state_namespace
     injected = False
@@ -3815,7 +5199,7 @@ def test_transaction_rejects_rebound_after_image_directory_and_recovery_is_deter
                 natural_key="rebound-after-image-directory",
                 request={"operation": "rebound-after-image-directory"},
                 captured_at="2026-07-10T12:00:00Z",
-                writes=[write],
+                writes=[write, authority],
                 result={"status": "recovered"},
             )
         assert raised.value.code == "state-directory-replaced"
@@ -3866,6 +5250,12 @@ def test_state_transaction_revalidates_full_ancestor_chain_before_commit(
     monkeypatch.setattr(fs, "_apply_wal_intent", displace_after_writes)
     try:
         write = fs._planned_write(store, Path("probe.json"), {"value": 1}, immutable=False)
+        authority = fs._planned_write(
+            store,
+            Path("receipts") / "stage" / "ancestor-replacement.json",
+            {"value": 1},
+            immutable=True,
+        )
         with pytest.raises(
             fs.StateError, match="name was rebound during before transaction commit"
         ):
@@ -3875,7 +5265,7 @@ def test_state_transaction_revalidates_full_ancestor_chain_before_commit(
                 natural_key="ancestor-replacement",
                 request={"operation": "ancestor-replacement"},
                 captured_at="2026-07-10T12:00:00Z",
-                writes=[write],
+                writes=[write, authority],
                 result={"status": "must-not-commit"},
             )
         _, commit_path = fs._wal_paths("stage", "ancestor-replacement")
@@ -4889,4 +6279,5 @@ def test_cli_advertises_every_control_transition() -> None:
         "weekly-plan",
         "finalize-publication",
         "close-publication",
+        "audit-wal-history",
     }

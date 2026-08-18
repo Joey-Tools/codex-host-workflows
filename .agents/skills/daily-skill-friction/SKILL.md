@@ -85,6 +85,11 @@ until an audited skill and schema update is installed:
   time. Publication approval is not repair approval. Only a later exact `stage`
   transaction may consume that authority once; scheduled Daily and Weekly runs
   must never call this mode or stage a case from `proposed` to `approved`.
+- Interactive WAL diagnostics: `audit-wal-history` performs the explicit full
+  compact-history audit described in
+  [weekly-publication.md](references/weekly-publication.md). Use it only during
+  operator-requested diagnosis or recovery review; scheduled Daily and Weekly
+  runs must never call this mode.
 
 Put durable run state under the host-local
 `/Users/hoteng/Program/GitHub/Joey-Tools/codex-workspace/.codex-local/daily-skill-friction/control-state`
@@ -102,6 +107,11 @@ Legacy state without that binding fails closed. Other platforms record the
 explicit `posix-mode-only-v1` model and do not claim extended-ACL enforcement.
 `mtime`, `ctime`, link count, and ordinary directory child churn are not access or
 content changes by themselves.
+Path-based helper cleanup assumes every same-UID writer cooperates with the
+retained `.state.lock`. Pre-unlink descriptor checks and post-unlink diagnostics
+do not claim an FD-conditional unlink guarantee against a non-cooperating
+same-UID process; treat such namespace interference as host corruption and fail
+closed when detected.
 
 ## Run The Scheduled Preflight
 

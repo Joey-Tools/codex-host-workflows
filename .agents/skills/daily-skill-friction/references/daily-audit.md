@@ -7,6 +7,13 @@ Daily audit end time that is strictly earlier than that start as the lower bound
 If it cannot be recovered, report the gap and use a bounded 24-hour fallback.
 Never use the current incomplete run as its own lower bound.
 
+Use canonical UTC RFC 3339 `Z` timestamps with zero or 1–6 fractional digits.
+When two fields must identify the same observation boundary, equality is by the
+parsed UTC instant: for example `.1Z`, `.100Z`, and `.100000Z` are equivalent,
+and `.000Z` is equivalent to the whole-second form. Preserve the supplied legal
+representation in receipts; do not reject it merely because another formatter
+would omit or pad the fraction.
+
 Historical pilot replays use an explicit frozen time range and write to an
 isolated pilot staging namespace. They must not alter live case state or generate
 publication artifacts.

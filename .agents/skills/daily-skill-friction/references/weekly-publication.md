@@ -123,6 +123,89 @@ A non-cooperating same-UID process can still replace an artifact after the
 terminal revalidation; that post-terminal host mutation is outside this local
 transaction guarantee.
 
+The state root and its path-based helper cleanup use a cooperative-writer model:
+all same-UID writers must hold the retained `.state.lock`. Only the invocation
+that actually wins creation of a new state-root directory may create its lock,
+using exclusive publication and fsyncing both lock and parent. An already
+existing root without that lock fails as incomplete initialization; the helper
+does not create a lock before discovering an existing request conflict. POSIX
+and macOS do not provide an FD-conditional `unlink`, so pre-unlink retained-FD
+identity/content/private-policy checks plus post-unlink diagnostics do not claim
+to prevent a non-cooperating same-UID process from racing a helper name. Such a
+process can corrupt the namespace and is outside the prevention boundary.
+
+Full after-image payloads live only in the active `wal/<operation>` recovery set.
+The helper accepts at most 32 active transactions and 128 MiB of aggregate active
+JSON, while retaining the 64 MiB per-intent ceiling. A retained-directory,
+streaming stat-only inventory first classifies every final/helper name and caps
+all transaction keys, namespace entries, and distinct final/helper objects before
+any active payload read, helper cleanup, or replay. Before publishing any new
+intent or after-image, the helper also proves capacity for that transaction's
+compact checkpoint. At the next successfully validated transaction boundary, it
+compacts older committed pairs into `wal-history/<operation>/<key>.json`; rejected inputs
+with an already-known exact transaction key/request do not trigger this
+maintenance. The six public approval/audit/selection/publication entry points
+whose key and request are known before recovery perform that read-only binding
+check at lock entry. Stage and dormancy derive their key from recovered live
+state, so required pending recovery can precede their binding check; after the
+key is derived, a conflict still precedes compaction or history mutation. A
+checkpoint contains request, intent, commit, result, and after-image digests and
+locators, but no `after` payload. Exact results are reconstructed from the
+operation's immutable receipt, completed snapshot, plan, manifest, closure, or
+repair-approval authority. External plans and manifests additionally bind their
+same-digest immutable state replica.
+
+Checkpoint publication is no-replace and fsynced. A small `wal-history/usage.json`
+chain records the exact sequence, record count, and aggregate checkpoint bytes.
+The limits are 100,000 records, 256 MiB aggregate, and 8 MiB per checkpoint.
+Publishing the checkpoint precedes advancing usage; exact active commit deletion
+then precedes exact active intent deletion. Recovery therefore converges from a
+full pair plus checkpoint, a usage-committed pair plus checkpoint, or the final
+intent plus checkpoint without creating an orphan commit. Ordinary commands scan
+only the bounded active set for new and active keys. A retired exact-key hit is
+the exceptional path: before accepting it, the helper read-only scans at most
+100,000 records and 256 MiB, recomputes the unique sequence and usage chain from
+genesis, re-enumerates the bounded namespace, and revalidates usage plus every
+checkpoint's digest and object identity. It requires the target path, file
+digest, and object identity to be a member of that stable committed prefix. The
+streaming namespace pass caps every final and exact fixed temporary before any
+history payload is read; at most 100,000 of each checkpoint entry kind may be
+present, plus the single usage pair. This prevents both resource-limit bypasses
+and a schema-valid copied checkpoint with a rewritten key/request and recomputed
+self-digest from becoming authority. Use
+`audit-wal-history --state-root <DIR>` for an explicit full audit of history
+layout, filenames, authority digests, the complete usage chain, and foreign or
+orphan leaves.
+
+History leaves use one fixed, closed helper temporary name per exact final leaf.
+A conflict probe validates a stable private single-link pre-publication
+temporary or same-inode two-link published pair in place without changing either
+name. After the request is known not to conflict, recovery removes that exact
+temporary before continuing and never adopts temporary content as authority. The
+explicit full audit performs one complete read-only namespace, helper-object,
+chain, domain-authority, external-after-image, and checkpoint-associated active
+WAL preflight before removing any history temporary or recovering pending WAL.
+A missing bound external after-image is repairable only when the exact full
+intent survives; an uncommitted checkpoint tail also requires its real commit,
+while a usage-committed intent-only cleanup state is authenticated by the usage
+chain. Only after that global read-only history pass does the audit converge
+valid pre-link/post-link crash states, repair eligible external output, converge
+domain/output helper aliases, and run a final strict read-only audit. Foreign,
+malformed, rebound, policy-unsafe, unreadable, or orphan history entries therefore
+fail without partial history cleanup.
+Publication cleanup also binds the exact device/inode created by that write; an
+`O_EXCL` collision or rebound fixed name is never unlinked as if it were
+helper-owned.
+
+While a full parent-bound intent survives, recovery can repair its missing exact
+external after-image from the persisted payload. Retirement verifies and fsyncs
+the external output and its immutable state replica before discarding that
+payload. Later deletion or tampering is terminal host mutation and fails closed;
+the compact history never recreates it. A committed legacy external WAL may be
+compacted only while its exact output and replica remain present. It stays
+read-only after compaction, and a pending legacy external WAL remains
+non-replayable.
+
 Only cases bound by the immutable helper preflight and a strictly later trusted
 version 1 `publication-selection` approval are eligible. Together they bind the
 stable selection and receipt IDs, basis and receipt digests, approval time, the

@@ -38,6 +38,11 @@ MAX_JSON_BYTES = 4 * 1024 * 1024
 MAX_CASE_JSON_BYTES = 256 * 1024
 MAX_PUBLICATION_JSON_BYTES = 32 * 1024 * 1024
 MAX_WAL_JSON_BYTES = 64 * 1024 * 1024
+MAX_ACTIVE_WAL_TRANSACTIONS = 32
+MAX_ACTIVE_WAL_BYTES = 128 * 1024 * 1024
+MAX_WAL_HISTORY_RECORD_BYTES = 8 * 1024 * 1024
+MAX_WAL_HISTORY_RECORDS = 100_000
+MAX_WAL_HISTORY_BYTES = 256 * 1024 * 1024
 MAX_PREPARED_COMMANDS = 8
 MAX_PREPARED_COMMAND_CHARS = 512
 MAX_PREPARED_SIGNER_CHARS = 256
@@ -91,6 +96,13 @@ GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
 SAFE_BRANCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$")
 SAFE_OBJECT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 WAL_LEAF_RE = re.compile(r"^[0-9a-f]{64}\.(?:intent|commit)\.json$")
+WAL_HISTORY_LEAF_RE = re.compile(r"^[0-9a-f]{64}\.json$")
+WAL_HISTORY_ANY_TEMP_RE = re.compile(
+    r"^\.(?:usage\.json|[0-9a-f]{64}\.json)"
+    r"\.tmp-[1-9][0-9]{0,19}-[0-9a-f]{16}$"
+)
+WAL_HISTORY_FIXED_TEMP_PID = "1"
+WAL_HISTORY_FIXED_TEMP_NONCE = "0" * 16
 WAL_TEMP_RE = re.compile(
     r"^\.(?P<leaf>[0-9a-f]{64}\.(?:intent|commit)\.json)"
     r"\.tmp-(?P<pid>[1-9][0-9]{0,19})-(?P<nonce>[0-9a-f]{16})$"
@@ -434,14 +446,17 @@ def _read_fd_stable(
     max_bytes: int = MAX_JSON_BYTES,
     expected_parent_fd: int | None = None,
     expected_name: str | None = None,
+    expected_links: int = 1,
 ) -> tuple[bytes, str]:
     """Read bounded bytes twice from one object and bind identity and policy.
 
     Identity is the open object's device/inode plus the parent entry that names it.
     Content stability is an equal second read, not mtime/ctime equality.  Access
-    policy is regular, current-user-owned, private, single-link state with no
-    Darwin extended ACL when ``private`` is true.  Timestamps are not mutation
-    evidence and are deliberately excluded.
+    policy is regular, current-user-owned, private state with the caller-selected
+    namespace link count and no Darwin extended ACL when ``private`` is true.
+    Two links are accepted only while a caller separately validates the
+    final/helper publication pair.  Timestamps are not mutation evidence and
+    are deliberately excluded.
     """
 
     before = os.fstat(fd)
@@ -454,8 +469,12 @@ def _read_fd_stable(
             _fail("unsafe-owner", f"state file is not owned by the current user: {source}")
         if stat.S_IMODE(before.st_mode) & 0o077:
             _fail("unsafe-permissions", f"state file permits group or other access: {source}")
-        if before.st_nlink != 1:
-            _fail("unsafe-link-count", f"state file must have exactly one link: {source}")
+        if before.st_nlink != expected_links:
+            expected_text = "one" if expected_links == 1 else str(expected_links)
+            _fail(
+                "unsafe-link-count",
+                f"state file must have exactly {expected_text} link(s): {source}",
+            )
         before_acl_digest = _acl_digest(fd, source, sensitive=True)
     else:
         before_acl_digest = None
@@ -800,8 +819,8 @@ def _validate_evidence(case: Mapping[str, Any]) -> dict[str, Any]:
         if item["repository"] is not None:
             repositories.add(_repository(item["repository"], f"case.evidence[{index}].repository"))
         evidence.append(item)
-    first = min(observed).isoformat().replace("+00:00", "Z")
-    last = max(observed).isoformat().replace("+00:00", "Z")
+    first = min(observed)
+    last = max(observed)
     return {
         "items": evidence,
         "roots": roots,
@@ -1434,7 +1453,13 @@ def validate_candidate(candidate: Mapping[str, Any]) -> dict[str, Any]:
     }
     _exact_fields(causal, "case.causal", causal_fields)
     _bounded_string(causal["summary"], "case.causal.summary", 16, 800)
-    if _timestamp(causal["first_observed_at"], "case.causal.first_observed_at") != stats["first"]:
+    if (
+        _parse_time(
+            _timestamp(causal["first_observed_at"], "case.causal.first_observed_at"),
+            "case.causal.first_observed_at",
+        )
+        != stats["first"]
+    ):
         _fail("causal-count-mismatch", "causal.first_observed_at must match earliest evidence")
     expected_counts = {
         "occurrence_count": len(stats["items"]),
@@ -1450,14 +1475,16 @@ def validate_candidate(candidate: Mapping[str, Any]) -> dict[str, Any]:
             _fail("causal-count-mismatch", f"case.causal.{field} exceeds 256")
         if causal[field] != expected:
             _fail("causal-count-mismatch", f"case.causal.{field} must equal {expected}")
-    if _timestamp(case["evidence_last_seen"], "case.evidence_last_seen") != stats["last"]:
+    evidence_last_seen = _parse_time(
+        _timestamp(case["evidence_last_seen"], "case.evidence_last_seen"),
+        "case.evidence_last_seen",
+    )
+    if evidence_last_seen != stats["last"]:
         _fail("clock-mismatch", "evidence_last_seen must match latest evidence")
     currentness_checked_at = _timestamp(
         case["currentness_checked_at"], "case.currentness_checked_at"
     )
-    if _parse_time(currentness_checked_at, "case.currentness_checked_at") < _parse_time(
-        stats["last"], "evidence_last_seen"
-    ):
+    if _parse_time(currentness_checked_at, "case.currentness_checked_at") < stats["last"]:
         _fail("clock-order", "currentness_checked_at cannot precede evidence_last_seen")
 
     applicability = _require_object(case["applicability"], "case.applicability")
@@ -1516,7 +1543,7 @@ def validate_candidate(candidate: Mapping[str, Any]) -> dict[str, Any]:
     changed = _timestamp(case["lifecycle_changed_at"], "case.lifecycle_changed_at")
     if _parse_time(changed, "lifecycle_changed_at") < _parse_time(created, "created_at"):
         _fail("clock-order", "lifecycle_changed_at cannot precede created_at")
-    if _parse_time(created, "created_at") < _parse_time(stats["first"], "first evidence"):
+    if _parse_time(created, "created_at") < stats["first"]:
         _fail("clock-order", "lifecycle.created_at cannot precede first evidence")
     if lifecycle["superseded_by"] is not None:
         superseded_by = _validate_case_id(
@@ -1537,7 +1564,9 @@ def validate_candidate(candidate: Mapping[str, Any]) -> dict[str, Any]:
         dormant_since = _timestamp(lifecycle["dormant_since"], "case.lifecycle.dormant_since")
         if lifecycle["dormant_from_status"] not in {"watching", "proposed"} or not revisit:
             _fail("invalid-dormancy", "dormant cases require origin status and revisit conditions")
-        if dormant_since != changed:
+        if _parse_time(dormant_since, "case.lifecycle.dormant_since") != _parse_time(
+            changed, "case.lifecycle_changed_at"
+        ):
             _fail("invalid-dormancy", "dormant_since must equal lifecycle_changed_at")
     elif lifecycle["dormant_since"] is not None or lifecycle["dormant_from_status"] is not None:
         _fail("invalid-dormancy", "non-dormant cases cannot carry dormancy fields")
@@ -1575,15 +1604,35 @@ def _validate_private_stat(info: os.stat_result, path: Path, *, directory: bool)
         _fail("unsafe-link-count", f"private state file must have one link: {path}")
 
 
-def _validate_helper_temp_stat(info: os.stat_result, path: Path, *, expected_links: int) -> None:
+def _validate_helper_temp_stat(
+    info: os.stat_result,
+    path: Path,
+    *,
+    expected_links: int,
+    max_bytes: int = MAX_WAL_JSON_BYTES,
+) -> None:
     if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
         _fail("unsafe-helper-temp", f"helper temporary is not a regular file: {path}")
     if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o600:
         _fail("unsafe-helper-temp", f"helper temporary has unsafe owner or mode: {path}")
     if info.st_nlink != expected_links:
         _fail("unsafe-helper-temp", f"helper temporary has an invalid link count: {path}")
-    if info.st_size > MAX_WAL_JSON_BYTES:
-        _fail("unsafe-helper-temp", f"helper temporary exceeds the WAL bound: {path}")
+    if info.st_size > max_bytes:
+        _fail("unsafe-helper-temp", f"helper temporary exceeds its byte bound: {path}")
+
+
+def _wal_history_fixed_temp_name(leaf: str) -> str:
+    """Return the one closed temporary name for an exact history leaf."""
+
+    if leaf != "usage.json" and WAL_HISTORY_LEAF_RE.fullmatch(leaf) is None:
+        _fail("invalid-wal-history-layout", f"invalid WAL history leaf: {leaf}")
+    return f".{leaf}.tmp-{WAL_HISTORY_FIXED_TEMP_PID}-{WAL_HISTORY_FIXED_TEMP_NONCE}"
+
+
+def _fail_foreign_wal_history_temp(name: str) -> NoReturn:
+    if ".tmp-" in name and WAL_HISTORY_ANY_TEMP_RE.fullmatch(name) is None:
+        _fail("malformed-helper-temp", f"malformed WAL history temporary entry: {name}")
+    _fail("foreign-helper-temp", f"foreign WAL history temporary entry: {name}")
 
 
 def _safe_relative_parts(relative: Path | str) -> tuple[str, ...]:
@@ -1681,6 +1730,8 @@ def _rename_state_directory_noreplace(
 def _json_limit_for_parts(parts: Sequence[str]) -> int:
     if parts and parts[0] == "wal":
         return MAX_WAL_JSON_BYTES
+    if parts and parts[0] == "wal-history":
+        return MAX_WAL_HISTORY_RECORD_BYTES
     if parts and parts[0] == "publication":
         return MAX_PUBLICATION_JSON_BYTES
     return MAX_JSON_BYTES
@@ -1745,8 +1796,10 @@ class StateStore:
         self.lock_fd = -1
         self.lock_identity: tuple[int, int, int] | None = None
         self._sensitive_root = sensitive_root
+        self._created_root = False
         self._directory_bindings: dict[tuple[str, ...], _StateDirectoryBinding] = {}
         self._immutable_publication_capture: _ImmutablePublicationCapture | None = None
+        self._fixed_publication_temporary: tuple[Path, str] | None = None
         try:
             self._open_root(create=create)
         except Exception:
@@ -1818,9 +1871,11 @@ class StateStore:
             except FileNotFoundError:
                 if not create:
                     _fail("missing-state-root", f"state root is not initialized: {self.root}")
+                created_component = False
                 try:
                     os.mkdir(component, 0o700, dir_fd=current)
                     os.fsync(current)
+                    created_component = True
                 except FileExistsError:
                     pass
                 except PermissionError as exc:
@@ -1851,6 +1906,8 @@ class StateStore:
                         "state-chain-replaced",
                         f"state custody component disappeared during creation: {component_path}",
                     )
+                if final and created_component:
+                    self._created_root = True
             try:
                 child_signal = self._directory_signal(
                     child,
@@ -2030,15 +2087,25 @@ class StateStore:
 
     def acquire_lock(self, *, create: bool = True) -> None:
         flags = os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC
-        if create:
-            flags |= os.O_CREAT
+        create_lock = create and self._created_root
+        if create_lock:
+            flags |= os.O_CREAT | os.O_EXCL
         self._bind_state_chain("lock preflight")
         try:
             self.lock_fd = os.open(LOCK_FILE, flags, 0o600, dir_fd=self.root_fd)
         except FileNotFoundError:
-            _fail("uninitialized-state", "state root has no trusted lock object")
+            code = "initialization-in-progress" if create else "uninitialized-state"
+            _fail(code, "existing state root has no trusted lock object")
+        except FileExistsError:
+            _fail(
+                "initialization-race",
+                "new state root unexpectedly acquired another lock initializer",
+            )
         except OSError as exc:
             _fail("unsafe-lock", f"cannot open state lock: {exc}")
+        if create_lock:
+            os.fsync(self.lock_fd)
+            os.fsync(self.root_fd)
         before = os.fstat(self.lock_fd)
         _validate_private_stat(before, self.root / LOCK_FILE, directory=False)
         _acl_digest(self.lock_fd, str(self.root / LOCK_FILE), sensitive=True)
@@ -2418,6 +2485,12 @@ class StateStore:
     def read_bytes(
         self, relative: Path | str, *, max_bytes: int | None = None
     ) -> tuple[bytes, str]:
+        raw, digest, _ = self.read_bytes_with_identity(relative, max_bytes=max_bytes)
+        return raw, digest
+
+    def read_bytes_with_identity(
+        self, relative: Path | str, *, max_bytes: int | None = None
+    ) -> tuple[bytes, str, tuple[int, int]]:
         parts = _safe_relative_parts(relative)
         if len(parts) == 1:
             parent_fd = self.root_fd
@@ -2436,7 +2509,8 @@ class StateStore:
                 _fail("missing-file", f"required state file is missing: {Path(*parts)}")
             try:
                 self._recover_link_publication(parent_fd, parts[-1], fd)
-                return _read_fd_stable(
+                opened = os.fstat(fd)
+                raw, digest = _read_fd_stable(
                     fd,
                     str(self.root / Path(*parts)),
                     private=True,
@@ -2444,6 +2518,7 @@ class StateStore:
                     expected_parent_fd=parent_fd,
                     expected_name=parts[-1],
                 )
+                return raw, digest, (opened.st_dev, opened.st_ino)
             finally:
                 os.close(fd)
         finally:
@@ -2503,9 +2578,299 @@ class StateStore:
             if context is not None:
                 context.__exit__(None, None, None)
 
+    def sync_exact(
+        self,
+        relative: Path | str,
+        expected_digest: str,
+        *,
+        expected_identity: tuple[int, int] | None = None,
+        max_bytes: int | None = None,
+    ) -> tuple[int, int]:
+        """Fsync one exact private leaf and close the post-sync mutation window.
+
+        Object identity is the retained descriptor plus its still-bound parent
+        name, content stability is the caller's exact digest, and access policy
+        is the private-file policy checked by ``_read_fd_stable``.  All three
+        properties are revalidated after both fsync calls; timestamps remain
+        irrelevant signals.
+        """
+
+        parts = _safe_relative_parts(relative)
+        if len(parts) == 1:
+            parent_fd = self.root_fd
+            context = None
+        else:
+            context = self.open_dir(Path(*parts[:-1]), create=False)
+            try:
+                parent_fd = context.__enter__()
+            except FileNotFoundError:
+                _fail("missing-file", f"required state parent is missing: {Path(*parts)}")
+        flags = os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC
+        try:
+            try:
+                fd = os.open(parts[-1], flags, dir_fd=parent_fd)
+            except FileNotFoundError:
+                _fail("missing-file", f"required state file is missing: {Path(*parts)}")
+            try:
+                self._recover_link_publication(parent_fd, parts[-1], fd)
+                opened = os.fstat(fd)
+                identity = (opened.st_dev, opened.st_ino)
+                if expected_identity is not None and identity != expected_identity:
+                    _fail("object-replaced", f"state leaf was rebound: {Path(*parts)}")
+                _, digest = _read_fd_stable(
+                    fd,
+                    str(self.root / Path(*parts)),
+                    private=True,
+                    max_bytes=(_json_limit_for_parts(parts) if max_bytes is None else max_bytes),
+                    expected_parent_fd=parent_fd,
+                    expected_name=parts[-1],
+                )
+                if digest != expected_digest:
+                    _fail("object-changed", f"state leaf content changed: {Path(*parts)}")
+                os.fsync(fd)
+                os.fsync(parent_fd)
+                _, synced_digest = _read_fd_stable(
+                    fd,
+                    str(self.root / Path(*parts)),
+                    private=True,
+                    max_bytes=(_json_limit_for_parts(parts) if max_bytes is None else max_bytes),
+                    expected_parent_fd=parent_fd,
+                    expected_name=parts[-1],
+                )
+                if synced_digest != expected_digest:
+                    _fail(
+                        "object-changed-after-sync",
+                        f"state leaf content changed during exact sync: {Path(*parts)}",
+                    )
+                self._bind_state_namespace("after exact leaf sync")
+                return identity
+            finally:
+                os.close(fd)
+        finally:
+            if context is not None:
+                context.__exit__(None, None, None)
+
     def read_json(self, relative: Path | str) -> tuple[dict[str, Any], str]:
         raw, digest = self.read_bytes(relative)
         return _json_from_bytes(raw, str(self.root / Path(relative))), digest
+
+    def read_bytes_without_publication_recovery_with_identity(
+        self,
+        relative: Path | str,
+        *,
+        max_bytes: int | None = None,
+        fixed_helper_name: str | None = None,
+    ) -> tuple[bytes, str, tuple[int, int], int]:
+        """Read one private leaf without changing a recoverable link pair.
+
+        This is the first-writer conflict probe.  Object identity is the
+        retained final descriptor plus its parent name; content stability is
+        the bounded equal reread; access policy is the private-file and ACL
+        policy.  A two-link state is accepted only when the sole closed-name
+        helper alias is opened, independently rebound to the same object, and
+        yields the same bytes.  Link count distinguishes the publication phase
+        here; timestamps are deliberately ignored and no alias is unlinked.
+        """
+
+        parts = _safe_relative_parts(relative)
+        path = Path(*parts)
+        limit = _json_limit_for_parts(parts) if max_bytes is None else max_bytes
+        if len(parts) == 1:
+            parent_fd = self.root_fd
+            context = None
+        else:
+            context = self.open_dir(Path(*parts[:-1]), create=False)
+            try:
+                parent_fd = context.__enter__()
+            except FileNotFoundError:
+                _fail("missing-file", f"required state file is missing: {path}")
+        flags = os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC
+        final_fd = -1
+        helper_fd = -1
+        try:
+            try:
+                final_fd = os.open(parts[-1], flags, dir_fd=parent_fd)
+            except FileNotFoundError:
+                _fail("missing-file", f"required state file is missing: {path}")
+            opened = os.fstat(final_fd)
+            identity = (opened.st_dev, opened.st_ino)
+            expected_links = 1
+            helper_digest: str | None = None
+            if opened.st_nlink != 1:
+                aliases: list[str] = []
+                if fixed_helper_name is not None:
+                    try:
+                        candidate = os.stat(
+                            fixed_helper_name,
+                            dir_fd=parent_fd,
+                            follow_symlinks=False,
+                        )
+                    except FileNotFoundError:
+                        candidate = None
+                    except PermissionError as exc:
+                        _fail(
+                            "helper-temp-unreadable",
+                            f"helper temporary is unreadable: {fixed_helper_name}: {exc}",
+                        )
+                    if candidate is not None:
+                        _validate_helper_temp_stat(
+                            candidate,
+                            self.root / Path(*parts[:-1]) / fixed_helper_name,
+                            expected_links=2,
+                            max_bytes=limit,
+                        )
+                        if (candidate.st_dev, candidate.st_ino) == identity:
+                            aliases.append(fixed_helper_name)
+                else:
+                    prefix = f".{parts[-1]}.tmp-"
+                    pattern = re.compile(rf"^{re.escape(prefix)}[1-9][0-9]{{0,19}}-[0-9a-f]{{16}}$")
+                    for child in os.listdir(parent_fd):
+                        if not child.startswith(prefix):
+                            continue
+                        if pattern.fullmatch(child) is None:
+                            _fail("unsafe-helper-temp", f"malformed helper temporary: {child}")
+                        candidate = os.stat(child, dir_fd=parent_fd, follow_symlinks=False)
+                        _validate_helper_temp_stat(
+                            candidate,
+                            self.root / Path(*parts[:-1]) / child,
+                            expected_links=2,
+                            max_bytes=limit,
+                        )
+                        if (candidate.st_dev, candidate.st_ino) == identity:
+                            aliases.append(child)
+                if opened.st_nlink != 2 or len(aliases) != 1:
+                    _fail(
+                        "unsafe-link-count",
+                        f"private state file has untrusted links: {parts[-1]}",
+                    )
+                expected_links = 2
+                alias = aliases[0]
+                try:
+                    helper_fd = os.open(alias, flags, dir_fd=parent_fd)
+                except PermissionError as exc:
+                    code = (
+                        "helper-temp-unreadable"
+                        if fixed_helper_name is not None
+                        else "unsafe-helper-temp"
+                    )
+                    _fail(code, f"helper temporary is unreadable: {alias}: {exc}")
+                helper_opened = os.fstat(helper_fd)
+                if (helper_opened.st_dev, helper_opened.st_ino) != identity:
+                    _fail("unsafe-helper-temp", f"helper temporary was rebound: {alias}")
+                _, helper_digest = _read_fd_stable(
+                    helper_fd,
+                    str(self.root / Path(*parts[:-1]) / alias),
+                    private=True,
+                    max_bytes=limit,
+                    expected_parent_fd=parent_fd,
+                    expected_name=alias,
+                    expected_links=2,
+                )
+            raw, digest = _read_fd_stable(
+                final_fd,
+                str(self.root / path),
+                private=True,
+                max_bytes=limit,
+                expected_parent_fd=parent_fd,
+                expected_name=parts[-1],
+                expected_links=expected_links,
+            )
+            if helper_digest is not None and helper_digest != digest:
+                _fail("unsafe-helper-temp", f"linked helper temporary differs: {path}")
+            self._bind_state_namespace("after read-only publication inspection")
+            return raw, digest, identity, len(raw)
+        finally:
+            if helper_fd >= 0:
+                os.close(helper_fd)
+            if final_fd >= 0:
+                os.close(final_fd)
+            if context is not None:
+                context.__exit__(*sys.exc_info())
+
+    def read_json_without_publication_recovery_with_identity(
+        self,
+        relative: Path | str,
+        *,
+        max_bytes: int | None = None,
+        fixed_helper_name: str | None = None,
+    ) -> tuple[dict[str, Any], str, tuple[int, int], int]:
+        raw, digest, identity, size = self.read_bytes_without_publication_recovery_with_identity(
+            relative,
+            max_bytes=max_bytes,
+            fixed_helper_name=fixed_helper_name,
+        )
+        return _json_from_bytes(raw, str(self.root / Path(relative))), digest, identity, size
+
+    def read_bytes_without_publication_recovery(
+        self,
+        relative: Path | str,
+        *,
+        max_bytes: int | None = None,
+        fixed_helper_name: str | None = None,
+    ) -> tuple[bytes, str]:
+        raw, digest, _, _ = self.read_bytes_without_publication_recovery_with_identity(
+            relative,
+            max_bytes=max_bytes,
+            fixed_helper_name=fixed_helper_name,
+        )
+        return raw, digest
+
+    def read_json_without_publication_recovery(
+        self,
+        relative: Path | str,
+        *,
+        max_bytes: int | None = None,
+        fixed_helper_name: str | None = None,
+    ) -> tuple[dict[str, Any], str]:
+        value, digest, _, _ = self.read_json_without_publication_recovery_with_identity(
+            relative,
+            max_bytes=max_bytes,
+            fixed_helper_name=fixed_helper_name,
+        )
+        return value, digest
+
+    def read_json_with_identity(
+        self, relative: Path | str, *, max_bytes: int | None = None
+    ) -> tuple[dict[str, Any], str, tuple[int, int], int]:
+        raw, digest, identity = self.read_bytes_with_identity(relative, max_bytes=max_bytes)
+        return _json_from_bytes(raw, str(self.root / Path(relative))), digest, identity, len(raw)
+
+    def private_file_size(self, relative: Path | str) -> int:
+        """Return a private regular leaf size through its retained parent."""
+
+        parts = _safe_relative_parts(relative)
+        if len(parts) == 1:
+            parent_fd = self.root_fd
+            context = None
+        else:
+            context = self.open_dir(Path(*parts[:-1]), create=False)
+            try:
+                parent_fd = context.__enter__()
+            except FileNotFoundError:
+                _fail("missing-file", f"required state parent is missing: {Path(*parts)}")
+        flags = os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC
+        try:
+            try:
+                fd = os.open(parts[-1], flags, dir_fd=parent_fd)
+            except FileNotFoundError:
+                _fail("missing-file", f"required state file is missing: {Path(*parts)}")
+            try:
+                self._recover_link_publication(parent_fd, parts[-1], fd)
+                info = os.fstat(fd)
+                _validate_private_stat(info, self.root / Path(*parts), directory=False)
+                _acl_digest(fd, str(self.root / Path(*parts)), sensitive=True)
+                named = os.stat(parts[-1], dir_fd=parent_fd, follow_symlinks=False)
+                if stat.S_ISLNK(named.st_mode) or (named.st_dev, named.st_ino) != (
+                    info.st_dev,
+                    info.st_ino,
+                ):
+                    _fail("object-replaced", f"state leaf was rebound: {Path(*parts)}")
+                return info.st_size
+            finally:
+                os.close(fd)
+        finally:
+            if context is not None:
+                context.__exit__(None, None, None)
 
     def list_names(self, relative: Path | str) -> list[str]:
         try:
@@ -2514,6 +2879,17 @@ class StateStore:
         except FileNotFoundError:
             return []
         return sorted(names, key=os.fsencode)
+
+    def iter_names(self, relative: Path | str) -> Iterator[str]:
+        """Yield retained-directory names without first materializing them."""
+
+        try:
+            with self.open_dir(relative) as directory_fd:
+                with os.scandir(directory_fd) as entries:
+                    for entry in entries:
+                        yield entry.name
+        except FileNotFoundError:
+            return
 
     def _read_named(
         self,
@@ -2580,15 +2956,25 @@ class StateStore:
         os.unlink(aliases[0], dir_fd=parent_fd)
         os.fsync(parent_fd)
 
-    def recover_wal_temporaries(self, relative: Path | str) -> None:
+    def recover_wal_temporaries(
+        self,
+        relative: Path | str,
+        *,
+        names: Sequence[str] | None = None,
+    ) -> None:
         """Remove only unambiguous pre-publication WAL temporaries."""
 
         relative_path = Path(*_safe_relative_parts(relative))
         with self.open_dir(relative_path) as directory_fd:
+            ordered_names = (
+                sorted(os.listdir(directory_fd), key=os.fsencode)
+                if names is None
+                else sorted(names, key=os.fsencode)
+            )
             # A linked final/temp pair is a post-publication crash.  Reading the
             # final through the ordinary fixed-fd path validates both names and
             # removes only its exact same-inode helper alias.
-            for name in sorted(os.listdir(directory_fd), key=os.fsencode):
+            for name in ordered_names:
                 if WAL_LEAF_RE.fullmatch(name) is None:
                     continue
                 try:
@@ -2616,7 +3002,7 @@ class StateStore:
                     os.close(fd)
 
             temporaries: dict[str, str] = {}
-            for name in sorted(os.listdir(directory_fd), key=os.fsencode):
+            for name in ordered_names:
                 if not name.startswith("."):
                     continue
                 match = WAL_TEMP_RE.fullmatch(name)
@@ -2625,7 +3011,12 @@ class StateStore:
                 leaf = match.group("leaf")
                 if leaf in temporaries:
                     _fail("unsafe-helper-temp", f"ambiguous WAL temporaries for {leaf}")
-                info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                try:
+                    info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    # The final-leaf pass already removed the exact post-link
+                    # alias captured by the bounded preflight inventory.
+                    continue
                 _validate_helper_temp_stat(
                     info,
                     self.root / relative_path / name,
@@ -2661,6 +3052,231 @@ class StateStore:
                     f"WAL temporary remains beside an existing final leaf: {leaf}",
                 )
 
+    @staticmethod
+    def _wal_history_leaf_kind(relative: Path | str) -> tuple[Path, bool]:
+        path = Path(*_safe_relative_parts(relative))
+        parts = path.parts
+        if parts == ("wal-history", "usage.json"):
+            return path, True
+        if (
+            len(parts) == 3
+            and parts[0] == "wal-history"
+            and parts[1] in TRANSACTION_OPERATIONS
+            and WAL_HISTORY_LEAF_RE.fullmatch(parts[2]) is not None
+        ):
+            return path, False
+        _fail("invalid-wal-history-layout", f"invalid WAL history leaf path: {path}")
+
+    def recover_wal_history_temporary(
+        self,
+        relative: Path | str,
+        *,
+        recover: bool = True,
+    ) -> None:
+        """Recover one fixed-name history publication without scanning history.
+
+        A single-link temporary is a pre-publication non-authority and can be
+        discarded only after retained-FD content, identity, private policy, and
+        parent/name validation.  A two-link final/temporary pair is accepted
+        only when both names bind the same stable object; the final is reread
+        after removing the alias.  Timestamps are deliberately irrelevant.
+        """
+
+        path, mutable = self._wal_history_leaf_kind(relative)
+        parent_path = Path(*path.parts[:-1])
+        try:
+            context = self.open_dir(parent_path, create=False)
+            parent_fd = context.__enter__()
+        except FileNotFoundError:
+            return
+        name = path.name
+        temporary = _wal_history_fixed_temp_name(name)
+        limit = _json_limit_for_parts(path.parts)
+
+        def named_stat(child: str, *, helper: bool) -> os.stat_result | None:
+            try:
+                return os.stat(child, dir_fd=parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                return None
+            except PermissionError as exc:
+                code = "helper-temp-unreadable" if helper else "invalid-wal-history-layout"
+                _fail(
+                    code,
+                    f"WAL history leaf is unreadable: {self.root / parent_path / child}: {exc}",
+                )
+            except OSError as exc:
+                code = "unsafe-helper-temp" if helper else "invalid-wal-history-layout"
+                _fail(code, f"could not inspect WAL history leaf {child}: {exc}")
+
+        def open_stable(
+            child: str,
+            *,
+            helper: bool,
+            expected_links: int,
+        ) -> tuple[int, bytes, str, tuple[int, int]]:
+            flags = os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC
+            try:
+                fd = os.open(child, flags, dir_fd=parent_fd)
+            except PermissionError as exc:
+                code = "helper-temp-unreadable" if helper else "invalid-wal-history-layout"
+                _fail(code, f"WAL history leaf is unreadable: {child}: {exc}")
+            except OSError as exc:
+                code = "unsafe-helper-temp" if helper else "invalid-wal-history-layout"
+                _fail(code, f"could not open WAL history leaf {child}: {exc}")
+            try:
+                opened = os.fstat(fd)
+                if helper:
+                    _validate_helper_temp_stat(
+                        opened,
+                        self.root / parent_path / child,
+                        expected_links=expected_links,
+                        max_bytes=limit,
+                    )
+                raw, digest = _read_fd_stable(
+                    fd,
+                    str(self.root / parent_path / child),
+                    private=True,
+                    max_bytes=limit,
+                    expected_parent_fd=parent_fd,
+                    expected_name=child,
+                    expected_links=expected_links,
+                )
+                return fd, raw, digest, (opened.st_dev, opened.st_ino)
+            except Exception:
+                os.close(fd)
+                raise
+
+        def unlink_exact_temp(fd: int, identity: tuple[int, int], expected_links: int) -> None:
+            # POSIX unlink is name-based rather than FD-conditional.  The
+            # retained-FD checks below protect cooperative writers serialized
+            # by the state lock; a non-cooperating same-UID rebind is diagnosed
+            # when observable but is outside the prevention boundary.
+            try:
+                current = os.stat(temporary, dir_fd=parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                _fail("unsafe-helper-temp", f"helper temporary disappeared: {temporary}")
+            except PermissionError as exc:
+                _fail("helper-temp-unreadable", f"helper temporary became unreadable: {exc}")
+            _validate_helper_temp_stat(
+                current,
+                self.root / parent_path / temporary,
+                expected_links=expected_links,
+                max_bytes=limit,
+            )
+            if (current.st_dev, current.st_ino) != identity:
+                _fail("unsafe-helper-temp", f"helper temporary was rebound: {temporary}")
+            os.unlink(temporary, dir_fd=parent_fd)
+            os.fsync(parent_fd)
+            if os.fstat(fd).st_nlink != expected_links - 1:
+                _fail("unsafe-helper-temp", f"helper temporary unlink was not exact: {temporary}")
+
+        final_fd = -1
+        temp_fd = -1
+        try:
+            self._bind_state_namespace("before WAL history temporary recovery")
+            temp_info = named_stat(temporary, helper=True)
+            if temp_info is None:
+                final_info = named_stat(name, helper=False)
+                if final_info is not None and final_info.st_nlink != 1:
+                    _fail(
+                        "unsafe-link-count",
+                        f"WAL history final has no exact helper alias: {path}",
+                    )
+                return
+            if temp_info.st_nlink not in {1, 2}:
+                _fail("unsafe-helper-temp", f"helper temporary has untrusted links: {temporary}")
+            final_info = named_stat(name, helper=False)
+            if final_info is None:
+                if temp_info.st_nlink != 1:
+                    _fail(
+                        "unsafe-helper-temp",
+                        f"orphan helper temporary has extra links: {temporary}",
+                    )
+                temp_fd, _, _, temp_identity = open_stable(
+                    temporary,
+                    helper=True,
+                    expected_links=1,
+                )
+                if not recover:
+                    return
+                unlink_exact_temp(temp_fd, temp_identity, 1)
+                self._bind_state_namespace("after pre-link WAL history recovery")
+                return
+
+            same_object = (temp_info.st_dev, temp_info.st_ino) == (
+                final_info.st_dev,
+                final_info.st_ino,
+            )
+            expected_links = 2 if same_object else 1
+            if temp_info.st_nlink != expected_links or final_info.st_nlink != expected_links:
+                _fail("unsafe-helper-temp", f"WAL history publication links are invalid: {path}")
+            final_fd, _, final_digest, final_identity = open_stable(
+                name,
+                helper=False,
+                expected_links=expected_links,
+            )
+            temp_fd, _, temp_digest, temp_identity = open_stable(
+                temporary,
+                helper=True,
+                expected_links=expected_links,
+            )
+            if same_object:
+                if temp_identity != final_identity or temp_digest != final_digest:
+                    _fail("unsafe-helper-temp", f"linked history temporary differs: {temporary}")
+            elif not mutable:
+                _fail(
+                    "unsafe-helper-temp",
+                    f"immutable history temporary is not the final object: {temporary}",
+                )
+            if not recover:
+                return
+            unlink_exact_temp(temp_fd, temp_identity, expected_links)
+            _, recovered_digest = _read_fd_stable(
+                final_fd,
+                str(self.root / path),
+                private=True,
+                max_bytes=limit,
+                expected_parent_fd=parent_fd,
+                expected_name=name,
+            )
+            if recovered_digest != final_digest:
+                _fail("unsafe-helper-temp", f"history final changed during recovery: {path}")
+            self._bind_state_namespace("after post-link WAL history recovery")
+        finally:
+            if temp_fd >= 0:
+                os.close(temp_fd)
+            if final_fd >= 0:
+                os.close(final_fd)
+            context.__exit__(*sys.exc_info())
+
+    def recover_all_wal_history_temporaries(self, *, recover: bool = True) -> None:
+        """Explicitly recover valid fixed temps and reject every foreign temp."""
+
+        _, _, temporary_targets = _enumerate_wal_history_namespace(self)
+        for target in temporary_targets:
+            self.recover_wal_history_temporary(target, recover=recover)
+
+    def write_wal_history_json(
+        self,
+        relative: Path | str,
+        value: Mapping[str, Any],
+        *,
+        immutable: bool = False,
+    ) -> str:
+        """Write one history leaf through its deterministic recoverable temp."""
+
+        path, mutable = self._wal_history_leaf_kind(relative)
+        if mutable == immutable:
+            _fail("invalid-wal-history-layout", "history leaf mutability does not match its kind")
+        self.recover_wal_history_temporary(path)
+        if self._fixed_publication_temporary is not None:
+            _fail("invalid-publication-capture", "fixed publication temporary is nested")
+        self._fixed_publication_temporary = (path, _wal_history_fixed_temp_name(path.name))
+        try:
+            return self.write_json(path, value, immutable=immutable)
+        finally:
+            self._fixed_publication_temporary = None
+
     @contextmanager
     def capture_immutable_publication(
         self, relative: Path | str, expected_digest: str
@@ -2678,6 +3294,42 @@ class StateStore:
             yield capture
         finally:
             self._immutable_publication_capture = None
+
+    def _unlink_created_publication_temporary(
+        self,
+        parent_fd: int,
+        temporary: str,
+        fd: int,
+        expected_identity: tuple[int, int],
+        *,
+        max_bytes: int,
+    ) -> None:
+        """Clean this invocation's helper under the cooperative-writer lock."""
+
+        try:
+            named = os.stat(temporary, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        except PermissionError as exc:
+            _fail("temporary-unreadable", f"publication temporary is unreadable: {exc}")
+        opened = os.fstat(fd)
+        if (opened.st_dev, opened.st_ino) != expected_identity or (
+            named.st_dev,
+            named.st_ino,
+        ) != expected_identity:
+            _fail("temporary-replaced", "publication temporary object was rebound")
+        if opened.st_nlink not in {1, 2}:
+            _fail("unsafe-helper-temp", "publication temporary has untrusted links")
+        _validate_helper_temp_stat(
+            named,
+            self.root / temporary,
+            expected_links=opened.st_nlink,
+            max_bytes=max_bytes,
+        )
+        os.unlink(temporary, dir_fd=parent_fd)
+        os.fsync(parent_fd)
+        if os.fstat(fd).st_nlink != opened.st_nlink - 1:
+            _fail("temporary-replaced", "publication temporary unlink was not exact")
 
     def write_json(
         self,
@@ -2701,8 +3353,19 @@ class StateStore:
             context = None
             parent_fd = self.root_fd
         name = parts[-1]
-        temporary = f".{name}.tmp-{os.getpid()}-{secrets.token_hex(8)}"
+        publication_path = Path(*parts)
+        fixed_temporary = self._fixed_publication_temporary
+        if fixed_temporary is not None and fixed_temporary[0] != publication_path:
+            _fail("invalid-publication-capture", "fixed temporary does not bind this write")
+        temporary = (
+            fixed_temporary[1]
+            if fixed_temporary is not None and fixed_temporary[0] == publication_path
+            else f".{name}.tmp-{os.getpid()}-{secrets.token_hex(8)}"
+        )
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+        fd = -1
+        created_identity: tuple[int, int] | None = None
+        cleanup_attempted = False
         try:
             try:
                 existing = self._read_named(parent_fd, name, Path(*parts), max_bytes=limit)
@@ -2717,6 +3380,8 @@ class StateStore:
                     f"{self.root / Path(*parts)}",
                 )
             fd = os.open(temporary, flags, 0o600, dir_fd=parent_fd)
+            opened = os.fstat(fd)
+            created_identity = (opened.st_dev, opened.st_ino)
             try:
                 _acl_digest(fd, str(self.root / Path(*parts)), sensitive=True)
                 offset = 0
@@ -2761,12 +3426,19 @@ class StateStore:
                     os.fsync(parent_fd)
                 self._bind_state_namespace("after publication")
             finally:
-                os.close(fd)
-            try:
-                os.unlink(temporary, dir_fd=parent_fd)
-            except FileNotFoundError:
-                pass
-            os.fsync(parent_fd)
+                assert created_identity is not None
+                cleanup_attempted = True
+                try:
+                    self._unlink_created_publication_temporary(
+                        parent_fd,
+                        temporary,
+                        fd,
+                        created_identity,
+                        max_bytes=limit,
+                    )
+                finally:
+                    os.close(fd)
+                    fd = -1
             final = self._read_named(parent_fd, name, Path(*parts), max_bytes=limit)
             if final != payload:
                 _fail("write-verification-failed", f"stored bytes differ: {Path(*parts)}")
@@ -2774,10 +3446,16 @@ class StateStore:
             return digest
         finally:
             try:
-                try:
-                    os.unlink(temporary, dir_fd=parent_fd)
-                except FileNotFoundError:
-                    pass
+                if fd >= 0:
+                    if created_identity is not None and not cleanup_attempted:
+                        self._unlink_created_publication_temporary(
+                            parent_fd,
+                            temporary,
+                            fd,
+                            created_identity,
+                            max_bytes=limit,
+                        )
+                    os.close(fd)
             finally:
                 if context is not None:
                     context.__exit__(*sys.exc_info())
@@ -2843,7 +3521,12 @@ def _atomic_write(path: Path, value: Mapping[str, Any], *, immutable: bool = Fal
 
 
 @contextmanager
-def _state_lock(state_root: Path, *, create: bool = True) -> Iterator[StateStore]:
+def _state_lock(
+    state_root: Path,
+    *,
+    create: bool = True,
+    recover_marker_publication: bool = True,
+) -> Iterator[StateStore]:
     store: StateStore | None = None
     token: contextvars.Token[StateStore | None] | None = None
     try:
@@ -2852,8 +3535,14 @@ def _state_lock(state_root: Path, *, create: bool = True) -> Iterator[StateStore
         token = _ACTIVE_STORE.set(store)
         if store.exists(Path(STATE_MARKER)):
             # Validate the persisted ACL chain before any caller can recover or
-            # apply a WAL after-image.
-            _read_marker(state_root)
+            # apply a WAL after-image.  Exact public transaction entrypoints
+            # may defer helper cleanup until their first-writer probe accepts
+            # the request, but still validate the same object, bytes, and
+            # access policy through retained descriptors here.
+            _read_marker(
+                state_root,
+                recover_publication=recover_marker_publication,
+            )
         yield store
     finally:
         try:
@@ -2879,6 +3568,941 @@ def _wal_paths(operation: str, natural_key: str) -> tuple[Path, Path]:
     key = _wal_key(operation, natural_key)
     base = Path("wal") / operation
     return base / f"{key}.intent.json", base / f"{key}.commit.json"
+
+
+def _wal_history_path(operation: str, natural_key: str) -> Path:
+    return Path("wal-history") / operation / f"{_wal_key(operation, natural_key)}.json"
+
+
+def _transaction_record_exists(store: StateStore, operation: str, natural_key: str) -> bool:
+    intent_path, commit_path = _wal_paths(operation, natural_key)
+    history_path = _wal_history_path(operation, natural_key)
+    return store.exists(intent_path) or store.exists(commit_path) or store.exists(history_path)
+
+
+def _wal_checkpoint_authorities(intent: Mapping[str, Any]) -> list[dict[str, str]]:
+    prefixes: dict[str, tuple[tuple[str, ...], ...]] = {
+        "stage": (("receipts", "stage"), ("repairs", "consumptions")),
+        "dormancy": (("receipts", "dormancy"),),
+        "complete-audit": (("completed",), ("historical", "completed")),
+        "selection-preflight": (("publication", "preflights"),),
+        "weekly-plan": (("publication", "plans"),),
+        "finalize-publication": (
+            ("publication", "prepared"),
+            ("publication", "manifests"),
+        ),
+        "close-publication": (("publication", "closures"),),
+        "approve-repair": (("repairs", "approvals"), ("repairs", "approval-index")),
+    }
+    allowed = prefixes[intent["operation"]]
+    authorities = [
+        {"path": write["path"], "sha256": write["after_sha256"]}
+        for raw_write in intent["writes"]
+        if (write := _require_object(raw_write, "wal.write"))["scope"] == "state"
+        and write["immutable"] is True
+        and any(Path(write["path"]).parts[: len(prefix)] == prefix for prefix in allowed)
+    ]
+    authorities.sort(key=lambda item: os.fsencode(item["path"]))
+    if not authorities:
+        _fail(
+            "wal-checkpoint-without-authority",
+            "committed transaction has no immutable domain authority for retirement",
+        )
+    return authorities
+
+
+def _validate_wal_authority_projection(
+    operation: str, authorities: Sequence[Mapping[str, str]]
+) -> None:
+    paths = [Path(item["path"]).parts for item in authorities]
+
+    def count(prefix: tuple[str, ...]) -> int:
+        return sum(parts[: len(prefix)] == prefix for parts in paths)
+
+    valid = {
+        "stage": count(("receipts", "stage")) == 1,
+        "dormancy": count(("receipts", "dormancy")) == 1,
+        "complete-audit": (count(("completed",)) + count(("historical", "completed")) == 1),
+        "selection-preflight": count(("publication", "preflights")) == 1,
+        "weekly-plan": count(("publication", "plans")) == 1,
+        "finalize-publication": count(("publication", "manifests")) == 1,
+        "close-publication": count(("publication", "closures")) == 1,
+        "approve-repair": (
+            count(("repairs", "approvals")) == 1 and count(("repairs", "approval-index")) == 1
+        ),
+    }
+    if valid.get(operation) is not True:
+        _fail(
+            "wal-checkpoint-without-authority",
+            f"{operation} lacks its deterministic immutable domain authority",
+        )
+
+
+def _wal_checkpoint_after_images(intent: Mapping[str, Any]) -> list[dict[str, Any]]:
+    state_replicas: dict[str, list[str]] = {}
+    for raw_write in intent["writes"]:
+        write = _require_object(raw_write, "wal.write")
+        if write["scope"] == "state" and write["immutable"] is True:
+            state_replicas.setdefault(write["after_sha256"], []).append(write["path"])
+    result: list[dict[str, Any]] = []
+    for raw_write in intent["writes"]:
+        write = _require_object(raw_write, "wal.write")
+        item: dict[str, Any] = {
+            "scope": write["scope"],
+            "path": write["path"],
+            "before_sha256": write["before_sha256"],
+            "after_sha256": write["after_sha256"],
+            "immutable": write["immutable"],
+        }
+        if write["scope"] == "external":
+            replicas = sorted(state_replicas.get(write["after_sha256"], []), key=os.fsencode)
+            if len(replicas) != 1:
+                _fail(
+                    "wal-external-replica-missing",
+                    "external WAL after-image must have one exact immutable state replica",
+                )
+            item["replica_path"] = replicas[0]
+            if "parent_binding" in write:
+                item["parent_binding"] = write["parent_binding"]
+                item["legacy_external"] = False
+            else:
+                item["legacy_external"] = True
+        result.append(item)
+    return result
+
+
+def _build_wal_checkpoint(
+    intent: Mapping[str, Any],
+    commit: Mapping[str, Any],
+    *,
+    sequence: int,
+    previous_usage_digest: str,
+) -> dict[str, Any]:
+    authorities = _wal_checkpoint_authorities(intent)
+    _validate_wal_authority_projection(intent["operation"], authorities)
+    body = {
+        "version": VERSION,
+        "kind": "state-transaction-checkpoint",
+        "operation": intent["operation"],
+        "natural_key": intent["natural_key"],
+        "request_digest": intent["request_digest"],
+        "captured_at": intent["captured_at"],
+        "intent_digest": intent["intent_digest"],
+        "intent_bytes": len(_canonical_bytes(intent)),
+        "commit_digest": commit["commit_digest"],
+        "result_digest": _digest(_require_object(intent["result"], "wal.result")),
+        "sequence": sequence,
+        "previous_usage_digest": previous_usage_digest,
+        "authorities": authorities,
+        "after_images": _wal_checkpoint_after_images(intent),
+    }
+    checkpoint = {**body, "checkpoint_digest": _digest(body)}
+    if len(_canonical_bytes(checkpoint)) > MAX_WAL_HISTORY_RECORD_BYTES:
+        _fail(
+            "wal-checkpoint-too-large",
+            f"compact WAL checkpoint exceeds {MAX_WAL_HISTORY_RECORD_BYTES} bytes",
+        )
+    return checkpoint
+
+
+def _validate_wal_checkpoint(
+    store: StateStore,
+    checkpoint: Mapping[str, Any],
+    expected_operation: str,
+    *,
+    expected_natural_key: str | None = None,
+) -> dict[str, Any]:
+    _exact_fields(
+        checkpoint,
+        "wal.checkpoint",
+        {
+            "version",
+            "kind",
+            "operation",
+            "natural_key",
+            "request_digest",
+            "captured_at",
+            "intent_digest",
+            "intent_bytes",
+            "commit_digest",
+            "result_digest",
+            "sequence",
+            "previous_usage_digest",
+            "authorities",
+            "after_images",
+            "checkpoint_digest",
+        },
+    )
+    if (
+        type(checkpoint["version"]) is not int
+        or checkpoint["version"] != VERSION
+        or checkpoint["kind"] != "state-transaction-checkpoint"
+        or checkpoint["operation"] != expected_operation
+        or expected_operation not in TRANSACTION_OPERATIONS
+    ):
+        _fail("invalid-wal-history", "WAL checkpoint kind or operation is invalid")
+    natural_key = _require_string(checkpoint["natural_key"], "wal.checkpoint.natural_key")
+    if expected_natural_key is not None and natural_key != expected_natural_key:
+        _fail("invalid-wal-history", "WAL checkpoint binds another natural key")
+    for field in (
+        "request_digest",
+        "intent_digest",
+        "commit_digest",
+        "result_digest",
+        "checkpoint_digest",
+        "previous_usage_digest",
+    ):
+        if (
+            HEX64_RE.fullmatch(_require_string(checkpoint[field], f"wal.checkpoint.{field}"))
+            is None
+        ):
+            _fail("invalid-wal-history", f"WAL checkpoint {field} must be raw SHA-256")
+    sequence = _require_int(checkpoint["sequence"], "wal.checkpoint.sequence", minimum=1)
+    if sequence > MAX_WAL_HISTORY_RECORDS:
+        _fail("wal-history-count-limit", "WAL checkpoint sequence exceeds history count limit")
+    intent_bytes = _require_int(
+        checkpoint["intent_bytes"], "wal.checkpoint.intent_bytes", minimum=1
+    )
+    if intent_bytes > MAX_WAL_JSON_BYTES:
+        _fail("invalid-wal-history", "checkpoint intent size exceeds WAL envelope")
+    _timestamp(checkpoint["captured_at"], "wal.checkpoint.captured_at")
+    authorities = _require_list(checkpoint["authorities"], "wal.checkpoint.authorities")
+    if not authorities:
+        _fail("invalid-wal-history", "WAL checkpoint has no immutable domain authority")
+    seen_authorities: set[str] = set()
+    normalized_authorities: list[dict[str, str]] = []
+    for index, raw in enumerate(authorities):
+        item = _require_object(raw, f"wal.checkpoint.authorities[{index}]")
+        _exact_fields(item, "wal.checkpoint.authority", {"path", "sha256"})
+        path = _require_string(item["path"], "wal.checkpoint.authority.path")
+        _safe_relative_parts(Path(path))
+        digest = _require_string(item["sha256"], "wal.checkpoint.authority.sha256")
+        if HEX64_RE.fullmatch(digest) is None or path in seen_authorities:
+            _fail("invalid-wal-history", "WAL checkpoint authority is invalid or repeated")
+        seen_authorities.add(path)
+        normalized_authorities.append({"path": path, "sha256": digest})
+    if normalized_authorities != sorted(
+        normalized_authorities, key=lambda item: os.fsencode(item["path"])
+    ):
+        _fail("invalid-wal-history", "WAL checkpoint authorities are not canonical")
+    _validate_wal_authority_projection(expected_operation, normalized_authorities)
+    after_images = _require_list(checkpoint["after_images"], "wal.checkpoint.after_images")
+    seen_targets: set[str] = set()
+    normalized_images: dict[str, dict[str, Any]] = {}
+    for index, raw in enumerate(after_images):
+        item = _require_object(raw, f"wal.checkpoint.after_images[{index}]")
+        scope = item.get("scope")
+        expected = {"scope", "path", "before_sha256", "after_sha256", "immutable"}
+        if scope == "external":
+            expected.update({"replica_path", "legacy_external"})
+            if item.get("legacy_external") is False:
+                expected.add("parent_binding")
+        _exact_fields(item, f"wal.checkpoint.after_images[{index}]", expected)
+        if scope not in {"state", "external"}:
+            _fail("invalid-wal-history", "WAL checkpoint after-image scope is invalid")
+        path = _require_string(item["path"], "wal.checkpoint.after_image.path")
+        if path in seen_targets:
+            _fail("invalid-wal-history", "WAL checkpoint repeats an after-image target")
+        seen_targets.add(path)
+        if scope == "state":
+            _safe_relative_parts(Path(path))
+        else:
+            if expected_operation not in {"weekly-plan", "finalize-publication"}:
+                _fail("invalid-wal-history", "this checkpoint operation cannot write externally")
+            absolute = Path(os.path.abspath(os.fspath(path)))
+            if not Path(path).is_absolute() or str(absolute) != path:
+                _fail("invalid-wal-history", "external checkpoint path is not canonical")
+            _normalize_external_output_outside_state_root(store.root, absolute)
+            replica = _require_string(item["replica_path"], "wal.checkpoint.replica_path")
+            _safe_relative_parts(Path(replica))
+            if replica not in seen_authorities:
+                _fail("invalid-wal-history", "external replica is not an immutable authority")
+            legacy = item["legacy_external"]
+            if not isinstance(legacy, bool):
+                _fail("invalid-wal-history", "legacy_external must be boolean")
+            if legacy:
+                if "parent_binding" in item:
+                    _fail("invalid-wal-history", "legacy external checkpoint has a parent binding")
+            else:
+                _validate_external_parent_binding(item["parent_binding"], absolute)
+        before = item["before_sha256"]
+        if before is not None and (
+            not isinstance(before, str) or HEX64_RE.fullmatch(before) is None
+        ):
+            _fail("invalid-wal-history", "checkpoint before_sha256 is invalid")
+        if HEX64_RE.fullmatch(
+            _require_string(item["after_sha256"], "wal.checkpoint.after_sha256")
+        ) is None or not isinstance(item["immutable"], bool):
+            _fail("invalid-wal-history", "checkpoint after-image digest/flag is invalid")
+        if scope == "external" and item["immutable"] is not True:
+            _fail("invalid-wal-history", "external checkpoint output must be immutable")
+        normalized_images[path] = item
+    for authority in normalized_authorities:
+        image = normalized_images.get(authority["path"])
+        if (
+            image is None
+            or image["scope"] != "state"
+            or image["immutable"] is not True
+            or image["after_sha256"] != authority["sha256"]
+        ):
+            _fail(
+                "invalid-wal-history",
+                "checkpoint authority does not bind its immutable state after-image",
+            )
+    body = {key: value for key, value in checkpoint.items() if key != "checkpoint_digest"}
+    if checkpoint["checkpoint_digest"] != _digest(body):
+        _fail("invalid-wal-history", "WAL checkpoint digest mismatch")
+    return dict(checkpoint)
+
+
+WAL_HISTORY_USAGE = Path("wal-history") / "usage.json"
+
+
+def _new_wal_history_usage() -> dict[str, Any]:
+    body = {
+        "version": VERSION,
+        "kind": "wal-history-usage",
+        "record_count": 0,
+        "total_bytes": 0,
+        "last_checkpoint_digest": None,
+    }
+    return {**body, "usage_digest": _digest(body)}
+
+
+def _validate_wal_history_usage(value: Mapping[str, Any]) -> dict[str, Any]:
+    _exact_fields(
+        value,
+        "wal.history_usage",
+        {
+            "version",
+            "kind",
+            "record_count",
+            "total_bytes",
+            "last_checkpoint_digest",
+            "usage_digest",
+        },
+    )
+    count = _require_int(value["record_count"], "wal.history_usage.record_count")
+    total = _require_int(value["total_bytes"], "wal.history_usage.total_bytes")
+    last = value["last_checkpoint_digest"]
+    if (
+        type(value["version"]) is not int
+        or value["version"] != VERSION
+        or value["kind"] != "wal-history-usage"
+        or count > MAX_WAL_HISTORY_RECORDS
+        or total > MAX_WAL_HISTORY_BYTES
+        or ((count == 0) != (last is None))
+        or (last is not None and (not isinstance(last, str) or HEX64_RE.fullmatch(last) is None))
+    ):
+        _fail("invalid-wal-history-usage", "WAL history usage record is invalid")
+    body = {key: item for key, item in value.items() if key != "usage_digest"}
+    if value["usage_digest"] != _digest(body):
+        _fail("invalid-wal-history-usage", "WAL history usage digest mismatch")
+    return dict(value)
+
+
+def _read_wal_history_usage(
+    store: StateStore,
+    *,
+    recover: bool = True,
+) -> dict[str, Any]:
+    if recover:
+        store.recover_wal_history_temporary(WAL_HISTORY_USAGE)
+    if not store.exists(WAL_HISTORY_USAGE):
+        return _new_wal_history_usage()
+    if recover:
+        value, _ = store.read_json(WAL_HISTORY_USAGE)
+    else:
+        value, _ = store.read_json_without_publication_recovery(
+            WAL_HISTORY_USAGE,
+            fixed_helper_name=_wal_history_fixed_temp_name(WAL_HISTORY_USAGE.name),
+        )
+    return _validate_wal_history_usage(value)
+
+
+def _read_wal_history_usage_binding_read_only(
+    store: StateStore,
+) -> tuple[dict[str, Any], str | None, tuple[int, int] | None, int]:
+    """Read usage without cleanup and retain its exact file binding."""
+
+    if not store.exists(WAL_HISTORY_USAGE):
+        return _new_wal_history_usage(), None, None, 0
+    value, digest, identity, size = store.read_json_without_publication_recovery_with_identity(
+        WAL_HISTORY_USAGE,
+        fixed_helper_name=_wal_history_fixed_temp_name(WAL_HISTORY_USAGE.name),
+    )
+    return _validate_wal_history_usage(value), digest, identity, size
+
+
+def _project_wal_history_usage(
+    usage: Mapping[str, Any],
+    checkpoint: Mapping[str, Any],
+    checkpoint_size: int,
+) -> dict[str, Any]:
+    """Project one exact checkpoint onto usage without changing state."""
+
+    usage = _validate_wal_history_usage(usage)
+    count = usage["record_count"]
+    total = usage["total_bytes"]
+    if checkpoint["sequence"] == count:
+        if usage["last_checkpoint_digest"] != checkpoint["checkpoint_digest"]:
+            _fail("invalid-wal-history-usage", "history usage does not bind its last checkpoint")
+        return dict(usage)
+    if (
+        checkpoint["sequence"] != count + 1
+        or checkpoint["previous_usage_digest"] != usage["usage_digest"]
+    ):
+        _fail("invalid-wal-history-usage", "checkpoint is not the next usage-chain record")
+    if count + 1 > MAX_WAL_HISTORY_RECORDS:
+        _fail("wal-history-count-limit", "WAL history record count limit reached")
+    if total + checkpoint_size > MAX_WAL_HISTORY_BYTES:
+        _fail("wal-history-byte-limit", "WAL history aggregate byte limit reached")
+    body = {
+        "version": VERSION,
+        "kind": "wal-history-usage",
+        "record_count": count + 1,
+        "total_bytes": total + checkpoint_size,
+        "last_checkpoint_digest": checkpoint["checkpoint_digest"],
+    }
+    return {**body, "usage_digest": _digest(body)}
+
+
+def _advance_wal_history_usage(
+    store: StateStore,
+    usage: Mapping[str, Any],
+    checkpoint: Mapping[str, Any],
+    checkpoint_size: int,
+) -> dict[str, Any]:
+    usage = _validate_wal_history_usage(usage)
+    checkpoint = _validate_wal_checkpoint(store, checkpoint, checkpoint["operation"])
+    advanced = _project_wal_history_usage(usage, checkpoint, checkpoint_size)
+    if advanced == usage:
+        return dict(usage)
+    store.write_wal_history_json(WAL_HISTORY_USAGE, advanced)
+    return advanced
+
+
+def _checkpoint_authority_objects(
+    store: StateStore,
+    checkpoint: Mapping[str, Any],
+    *,
+    recover_publication: bool = True,
+) -> dict[str, dict[str, Any]]:
+    result: dict[str, dict[str, Any]] = {}
+    for raw in checkpoint["authorities"]:
+        authority = _require_object(raw, "wal.checkpoint.authority")
+        path = authority["path"]
+        if recover_publication:
+            value, digest = store.read_json(Path(path))
+        else:
+            value, digest = store.read_json_without_publication_recovery(Path(path))
+        if digest != authority["sha256"]:
+            _fail("wal-history-authority-drift", f"checkpoint authority changed: {path}")
+        result[path] = value
+    return result
+
+
+def _one_checkpoint_authority(
+    authorities: Mapping[str, dict[str, Any]],
+    *,
+    prefix: tuple[str, ...],
+) -> tuple[str, dict[str, Any]]:
+    matches = [
+        (path, value)
+        for path, value in authorities.items()
+        if Path(path).parts[: len(prefix)] == prefix
+    ]
+    if len(matches) != 1:
+        _fail(
+            "invalid-wal-history",
+            f"checkpoint must bind one {'/'.join(prefix)} authority",
+        )
+    return matches[0]
+
+
+def _checkpoint_external_outputs(checkpoint: Mapping[str, Any]) -> list[dict[str, Any]]:
+    return [
+        _require_object(raw, "wal.checkpoint.after_image")
+        for raw in checkpoint["after_images"]
+        if _require_object(raw, "wal.checkpoint.after_image")["scope"] == "external"
+    ]
+
+
+def _verify_checkpoint_external_outputs(
+    store: StateStore,
+    checkpoint: Mapping[str, Any],
+    authorities: Mapping[str, dict[str, Any]],
+    *,
+    recover_publication: bool = True,
+    allow_repairable: bool = False,
+    usage_committed: bool = True,
+) -> None:
+    for image in _checkpoint_external_outputs(checkpoint):
+        replica_path = image["replica_path"]
+        if replica_path not in authorities:
+            _fail("invalid-wal-history", "external replica authority is missing")
+        replica_digest = hashlib.sha256(_canonical_bytes(authorities[replica_path])).hexdigest()
+        if replica_digest != image["after_sha256"]:
+            _fail("wal-history-authority-drift", "external replica digest changed")
+        target = Path(image["path"])
+        binding = None if image["legacy_external"] else image["parent_binding"]
+        with _bound_external_parent(target, binding) as (parent, _):
+            current = _read_optional_external(
+                parent,
+                target,
+                recover_publication=recover_publication,
+            )
+            current_digest = current[1] if current is not None else None
+            if current_digest == image["after_sha256"]:
+                continue
+            if (
+                allow_repairable
+                and not image["legacy_external"]
+                and current_digest == image["before_sha256"]
+            ):
+                repair_intent = _active_wal_binds_checkpoint_read_only(
+                    store,
+                    checkpoint,
+                    required=False,
+                    require_commit=not usage_committed,
+                )
+                if repair_intent is not None:
+                    continue
+            code = (
+                "legacy-external-wal-unbound"
+                if image["legacy_external"]
+                else "wal-history-external-drift"
+            )
+            _fail(
+                code,
+                "retired external after-image is missing or changed; automatic repair requires "
+                "the exact retained full WAL",
+            )
+
+
+def _reconstruct_checkpoint_result(
+    store: StateStore,
+    checkpoint: Mapping[str, Any],
+    *,
+    verify_external: bool = True,
+    recover_publication: bool = True,
+    allow_repairable_external: bool = False,
+    usage_committed: bool = True,
+) -> dict[str, Any]:
+    checkpoint = _validate_wal_checkpoint(
+        store,
+        checkpoint,
+        checkpoint["operation"],
+        expected_natural_key=checkpoint["natural_key"],
+    )
+    authorities = _checkpoint_authority_objects(
+        store,
+        checkpoint,
+        recover_publication=recover_publication,
+    )
+    operation = checkpoint["operation"]
+    if operation == "stage":
+        path, receipt = _one_checkpoint_authority(authorities, prefix=("receipts", "stage"))
+        result = {**receipt, "path": str(store.root / path)}
+    elif operation == "dormancy":
+        path, receipt = _one_checkpoint_authority(authorities, prefix=("receipts", "dormancy"))
+        result = {**receipt, "path": str(store.root / path)}
+    elif operation == "complete-audit":
+        completed = [
+            (path, value)
+            for path, value in authorities.items()
+            if Path(path).parts[:1] == ("completed",)
+            or Path(path).parts[:2] == ("historical", "completed")
+        ]
+        if len(completed) != 1:
+            _fail("invalid-wal-history", "checkpoint must bind one completed snapshot")
+        path, snapshot = completed[0]
+        historical = snapshot.get("mode") == "historical-replay"
+        result = {
+            "version": VERSION,
+            "status": "completed",
+            "mode": snapshot["mode"],
+            "audit_id": snapshot["audit_id"],
+            "snapshot_path": str(store.root / (Path(path) if historical else Path(LIVE_POINTER))),
+            "snapshot_digest": snapshot["snapshot_digest"],
+            "case_count": len(_require_list(snapshot["cases"], "snapshot.cases")),
+        }
+    elif operation == "selection-preflight":
+        _, result = _one_checkpoint_authority(authorities, prefix=("publication", "preflights"))
+    elif operation == "weekly-plan":
+        _, plan = _one_checkpoint_authority(authorities, prefix=("publication", "plans"))
+        outputs = _checkpoint_external_outputs(checkpoint)
+        if len(outputs) != 1:
+            _fail("invalid-wal-history", "weekly checkpoint must bind one external plan")
+        result = {
+            "version": VERSION,
+            "status": "planned",
+            "plan_path": outputs[0]["path"],
+            "plan_digest": plan["plan_digest"],
+            "selected_count": len(_require_list(plan["entries"], "plan.entries")),
+            "skipped": _require_list(plan["skipped"], "plan.skipped"),
+        }
+    elif operation == "finalize-publication":
+        _, manifest = _one_checkpoint_authority(authorities, prefix=("publication", "manifests"))
+        outputs = _checkpoint_external_outputs(checkpoint)
+        if len(outputs) != 1:
+            _fail("invalid-wal-history", "finalize checkpoint must bind one external manifest")
+        result = {
+            "version": VERSION,
+            "status": "finalized",
+            "manifest_path": outputs[0]["path"],
+            "manifest_digest": manifest["manifest_digest"],
+            "entry_count": len(_require_list(manifest["entries"], "manifest.entries")),
+        }
+    elif operation == "close-publication":
+        _, closure = _one_checkpoint_authority(authorities, prefix=("publication", "closures"))
+        result = {
+            "version": VERSION,
+            "status": "closed",
+            "closure_id": closure["closure_id"],
+            "closure_digest": closure["closure_digest"],
+            "closed_count": len(_require_list(closure["entries"], "closure.entries")),
+        }
+    elif operation == "approve-repair":
+        _, approval = _one_checkpoint_authority(authorities, prefix=("repairs", "approvals"))
+        _, index = _one_checkpoint_authority(authorities, prefix=("repairs", "approval-index"))
+        result = {
+            "version": VERSION,
+            "status": "approved",
+            "approval_id": approval["approval_id"],
+            "approval_digest": approval["approval_digest"],
+            "approval_key": index["approval_key"],
+            "expires_at": approval["expires_at"],
+        }
+    else:
+        _fail("invalid-wal-history", f"unsupported checkpoint operation: {operation}")
+    if _digest(result) != checkpoint["result_digest"]:
+        _fail("wal-history-result-drift", "domain authority cannot reconstruct exact WAL result")
+    if verify_external:
+        _verify_checkpoint_external_outputs(
+            store,
+            checkpoint,
+            authorities,
+            recover_publication=recover_publication,
+            allow_repairable=allow_repairable_external,
+            usage_committed=usage_committed,
+        )
+    return dict(result)
+
+
+def _active_wal_binds_checkpoint_read_only(
+    store: StateStore,
+    checkpoint: Mapping[str, Any],
+    *,
+    required: bool = True,
+    require_commit: bool = True,
+) -> dict[str, Any] | None:
+    """Prove a checkpoint still has its exact retained full intent."""
+
+    operation = checkpoint["operation"]
+    natural_key = checkpoint["natural_key"]
+    intent_path, commit_path = _wal_paths(operation, natural_key)
+    if not store.exists(intent_path):
+        if not required:
+            return None
+        _fail(
+            "invalid-wal-history-usage",
+            "repairable history checkpoint has no retained active intent",
+        )
+    intent, _ = store.read_json_without_publication_recovery(
+        intent_path,
+        max_bytes=MAX_WAL_JSON_BYTES,
+    )
+    _validate_wal_intent(
+        store,
+        intent,
+        operation,
+        allow_committed_legacy_external=True,
+    )
+    if store.exists(commit_path):
+        commit, _ = store.read_json_without_publication_recovery(
+            commit_path,
+            max_bytes=MAX_WAL_JSON_BYTES,
+        )
+        _validate_wal_commit(commit, intent)
+    else:
+        if require_commit:
+            _fail(
+                "invalid-wal-history-usage",
+                "uncommitted history tail has no retained commit",
+            )
+        commit_body = {
+            "version": VERSION,
+            "kind": "state-transaction-commit",
+            "operation": operation,
+            "natural_key": natural_key,
+            "intent_digest": intent["intent_digest"],
+        }
+        commit = {**commit_body, "commit_digest": _digest(commit_body)}
+    expected = _build_wal_checkpoint(
+        intent,
+        commit,
+        sequence=checkpoint["sequence"],
+        previous_usage_digest=checkpoint["previous_usage_digest"],
+    )
+    if checkpoint != expected:
+        _fail("wal-history-conflict", "uncommitted history tail differs from active WAL")
+    return intent
+
+
+def _enumerate_wal_history_namespace(
+    store: StateStore,
+) -> tuple[
+    tuple[tuple[str, ...], tuple[tuple[str, tuple[str, ...]], ...]],
+    tuple[Path, ...],
+    tuple[Path, ...],
+]:
+    """Stream, classify, and bound the complete history namespace first."""
+
+    root = Path("wal-history")
+    usage_temp = _wal_history_fixed_temp_name(WAL_HISTORY_USAGE.name)
+    root_names: list[str] = []
+    operations: list[str] = []
+    try:
+        for name in store.iter_names(root):
+            root_names.append(name)
+            if name in {WAL_HISTORY_USAGE.name, usage_temp}:
+                continue
+            if name.startswith("."):
+                _fail_foreign_wal_history_temp(name)
+            if SAFE_OBJECT_ID_RE.fullmatch(name) is None or name not in TRANSACTION_OPERATIONS:
+                _fail("invalid-wal-history-layout", f"unexpected WAL history entry: {name}")
+            operations.append(name)
+    except OSError as exc:
+        _fail("invalid-wal-history-layout", f"WAL history root is invalid: {exc}")
+
+    checkpoint_paths: list[Path] = []
+    temporary_targets: list[Path] = []
+    checkpoint_temporary_count = 0
+    operation_signatures: list[tuple[str, tuple[str, ...]]] = []
+    if usage_temp in root_names:
+        temporary_targets.append(WAL_HISTORY_USAGE)
+    suffix = f".tmp-{WAL_HISTORY_FIXED_TEMP_PID}-{WAL_HISTORY_FIXED_TEMP_NONCE}"
+    for operation in sorted(operations, key=os.fsencode):
+        directory = root / operation
+        children: list[str] = []
+        try:
+            for name in store.iter_names(directory):
+                children.append(name)
+                if name.startswith("."):
+                    leaf = name[1 : -len(suffix)] if name.endswith(suffix) else ""
+                    if (
+                        not name.endswith(suffix)
+                        or WAL_HISTORY_LEAF_RE.fullmatch(leaf) is None
+                        or name != _wal_history_fixed_temp_name(leaf)
+                    ):
+                        _fail_foreign_wal_history_temp(name)
+                    if checkpoint_temporary_count >= MAX_WAL_HISTORY_RECORDS:
+                        _fail(
+                            "wal-history-count-limit",
+                            "WAL history temporary entry limit exceeded",
+                        )
+                    temporary_targets.append(directory / leaf)
+                    checkpoint_temporary_count += 1
+                    continue
+                if WAL_HISTORY_LEAF_RE.fullmatch(name) is None:
+                    _fail("invalid-wal-history-layout", f"unexpected history leaf: {name}")
+                if len(checkpoint_paths) >= MAX_WAL_HISTORY_RECORDS:
+                    _fail("wal-history-count-limit", "WAL history record count limit exceeded")
+                checkpoint_paths.append(directory / name)
+        except OSError as exc:
+            _fail(
+                "invalid-wal-history-layout",
+                f"WAL history operation entry is invalid: {operation}: {exc}",
+            )
+        operation_signatures.append((operation, tuple(sorted(children, key=os.fsencode))))
+
+    signature = (
+        tuple(sorted(root_names, key=os.fsencode)),
+        tuple(operation_signatures),
+    )
+    return (
+        signature,
+        tuple(sorted(checkpoint_paths, key=lambda path: os.fsencode(str(path)))),
+        tuple(sorted(temporary_targets, key=lambda path: os.fsencode(str(path)))),
+    )
+
+
+def _read_wal_history_chain(
+    store: StateStore,
+    *,
+    recover_temporaries: bool,
+    allow_adjacent_uncommitted: bool,
+    target_path: Path | None = None,
+) -> tuple[list[tuple[Path, dict[str, Any], str, tuple[int, int], int]], dict[str, Any]]:
+    """Boundedly verify the complete history chain and optional exact member.
+
+    Old-key retry is intentionally the exceptional bounded path: it scans at
+    most ``MAX_WAL_HISTORY_RECORDS`` leaves and ``MAX_WAL_HISTORY_BYTES`` bytes.
+    New-key and active-key paths never call it.  The selected target must be the
+    committed member discovered only after the namespace bound has passed.
+    """
+
+    # Validate every fixed helper only after a complete streaming namespace
+    # inventory has proved the entry-count bound.  This pass never unlinks.
+    store.recover_all_wal_history_temporaries(recover=False)
+    baseline_namespace, checkpoint_paths, _ = _enumerate_wal_history_namespace(store)
+
+    records: list[tuple[Path, dict[str, Any], str, tuple[int, int], int]] = []
+    total_bytes = 0
+    for path in checkpoint_paths:
+        operation = path.parts[1]
+        name = path.name
+        checkpoint, file_digest, identity, size = (
+            store.read_json_without_publication_recovery_with_identity(
+                path,
+                max_bytes=MAX_WAL_HISTORY_RECORD_BYTES,
+                fixed_helper_name=_wal_history_fixed_temp_name(name),
+            )
+        )
+        checkpoint = _validate_wal_checkpoint(store, checkpoint, operation)
+        if name != f"{_wal_key(operation, checkpoint['natural_key'])}.json":
+            _fail("invalid-wal-history-layout", "checkpoint filename does not bind its key")
+        records.append((path, checkpoint, file_digest, identity, size))
+        total_bytes += size
+        if total_bytes > MAX_WAL_HISTORY_BYTES:
+            _fail("wal-history-byte-limit", "WAL history aggregate byte limit exceeded")
+
+    records.sort(key=lambda item: item[1]["sequence"])
+    usage_states = [_new_wal_history_usage()]
+    seen_sequences: set[int] = set()
+    for _, checkpoint, _, _, size in records:
+        sequence = checkpoint["sequence"]
+        expected_usage = usage_states[-1]
+        if sequence in seen_sequences or sequence != expected_usage["record_count"] + 1:
+            _fail("invalid-wal-history-usage", "WAL history sequence is missing or repeated")
+        seen_sequences.add(sequence)
+        if checkpoint["previous_usage_digest"] != expected_usage["usage_digest"]:
+            _fail("invalid-wal-history-usage", "WAL history usage chain is broken")
+        usage_states.append(_project_wal_history_usage(expected_usage, checkpoint, size))
+
+    actual_usage, usage_digest, usage_identity, usage_size = (
+        _read_wal_history_usage_binding_read_only(store)
+    )
+    committed_count = actual_usage["record_count"]
+    if committed_count >= len(usage_states) or actual_usage != usage_states[committed_count]:
+        _fail("invalid-wal-history-usage", "WAL history usage does not match its prefix")
+    uncommitted = records[committed_count:]
+    if uncommitted:
+        if not allow_adjacent_uncommitted or len(uncommitted) != 1:
+            _fail("invalid-wal-history-usage", "WAL history has an uncommitted record tail")
+        _active_wal_binds_checkpoint_read_only(store, uncommitted[0][1])
+    elif actual_usage != usage_states[-1] or total_bytes != actual_usage["total_bytes"]:
+        _fail("invalid-wal-history-usage", "WAL history usage does not match its records")
+
+    terminal_namespace, terminal_paths, _ = _enumerate_wal_history_namespace(store)
+    if terminal_namespace != baseline_namespace or terminal_paths != checkpoint_paths:
+        _fail("wal-history-changed", "WAL history namespace changed during chain verification")
+    for path, checkpoint, file_digest, identity, size in records:
+        rebound, rebound_digest, rebound_identity, rebound_size = (
+            store.read_json_without_publication_recovery_with_identity(
+                path,
+                max_bytes=MAX_WAL_HISTORY_RECORD_BYTES,
+                fixed_helper_name=_wal_history_fixed_temp_name(path.name),
+            )
+        )
+        if (
+            rebound != checkpoint
+            or rebound_digest != file_digest
+            or rebound_identity != identity
+            or rebound_size != size
+        ):
+            _fail("wal-history-changed", f"checkpoint changed during chain verification: {path}")
+    rebound_usage, rebound_usage_digest, rebound_usage_identity, rebound_usage_size = (
+        _read_wal_history_usage_binding_read_only(store)
+    )
+    if (
+        rebound_usage != actual_usage
+        or rebound_usage_digest != usage_digest
+        or rebound_usage_identity != usage_identity
+        or rebound_usage_size != usage_size
+    ):
+        _fail("wal-history-changed", "WAL history usage changed during chain verification")
+    final_namespace, final_paths, _ = _enumerate_wal_history_namespace(store)
+    if final_namespace != baseline_namespace or final_paths != checkpoint_paths:
+        _fail("wal-history-changed", "WAL history namespace changed during chain verification")
+
+    if target_path is not None:
+        member = next((record for record in records if record[0] == target_path), None)
+        if member is None or member[1]["sequence"] > committed_count:
+            _fail("invalid-wal-history-membership", "checkpoint is not a committed chain member")
+    if recover_temporaries:
+        # Recovery is history-specific and begins only after the entire fixed
+        # namespace, chain, usage, and every leaf binding have passed the
+        # read-only proof.  Re-read the resulting namespace strictly.
+        store.recover_all_wal_history_temporaries()
+        return _read_wal_history_chain(
+            store,
+            recover_temporaries=False,
+            allow_adjacent_uncommitted=allow_adjacent_uncommitted,
+            target_path=target_path,
+        )
+    return records, actual_usage
+
+
+def audit_wal_history(state_root: Path) -> dict[str, Any]:
+    """Explicitly validate, converge, and revalidate the compact history."""
+
+    with _state_lock(state_root, create=False) as store:
+        # Phase one is wholly read-only.  Validate every helper name/object and
+        # the complete bounded chain before cleanup or pending-WAL recovery can
+        # alter persistent state.
+        store.recover_all_wal_history_temporaries(recover=False)
+        preflight_records, preflight_usage = _read_wal_history_chain(
+            store,
+            recover_temporaries=False,
+            allow_adjacent_uncommitted=True,
+        )
+        for _, checkpoint, _, _, _ in preflight_records:
+            _reconstruct_checkpoint_result(
+                store,
+                checkpoint,
+                recover_publication=False,
+                allow_repairable_external=True,
+                usage_committed=(checkpoint["sequence"] <= preflight_usage["record_count"]),
+            )
+
+        # Only a fully valid namespace may converge.  A checkpoint/usage crash
+        # tail retains its active intent until this pass commits the usage state.
+        store.recover_all_wal_history_temporaries()
+        _recover_pending_wal(store, compact_committed=False)
+
+        # Phase one proved every authority and any retained-WAL repair path.
+        # Normal reads may now converge valid domain/external helper aliases.
+        converged_records, _ = _read_wal_history_chain(
+            store,
+            recover_temporaries=False,
+            allow_adjacent_uncommitted=False,
+        )
+        for _, checkpoint, _, _, _ in converged_records:
+            _reconstruct_checkpoint_result(store, checkpoint)
+
+        # The terminal audit is strict and read-only: no helper or uncommitted
+        # tail may remain, and every domain authority is checked again.
+        store.recover_all_wal_history_temporaries(recover=False)
+        records, actual_usage = _read_wal_history_chain(
+            store,
+            recover_temporaries=False,
+            allow_adjacent_uncommitted=False,
+        )
+        for _, checkpoint, _, _, _ in records:
+            _reconstruct_checkpoint_result(
+                store,
+                checkpoint,
+                recover_publication=False,
+            )
+        return {
+            "version": VERSION,
+            "status": "clean",
+            "record_count": len(records),
+            "total_bytes": actual_usage["total_bytes"],
+            "usage_digest": actual_usage["usage_digest"],
+        }
 
 
 def _read_optional_state(store: StateStore, relative: Path) -> tuple[bytes, str] | None:
@@ -3181,11 +4805,21 @@ def _validate_external_output_target(
     return absolute
 
 
-def _read_optional_external(parent: StateStore, target: Path) -> tuple[bytes, str] | None:
+def _read_optional_external(
+    parent: StateStore,
+    target: Path,
+    *,
+    recover_publication: bool = True,
+) -> tuple[bytes, str] | None:
     leaf = Path(target.name)
     if not parent.exists(leaf):
         return None
-    return parent.read_bytes(leaf, max_bytes=MAX_PUBLICATION_JSON_BYTES)
+    if recover_publication:
+        return parent.read_bytes(leaf, max_bytes=MAX_PUBLICATION_JSON_BYTES)
+    return parent.read_bytes_without_publication_recovery(
+        leaf,
+        max_bytes=MAX_PUBLICATION_JSON_BYTES,
+    )
 
 
 def _planned_external_write(
@@ -3537,6 +5171,237 @@ def _repair_committed_external_after_images(intent: Mapping[str, Any]) -> None:
                 _fail("wal-write-failed", f"external repair did not reach after-image: {target}")
 
 
+def _sync_retirement_after_images(store: StateStore, intent: Mapping[str, Any]) -> None:
+    """Durably validate compacted outcomes while the full intent is still present."""
+
+    for raw_write in intent["writes"]:
+        write = _require_object(raw_write, "wal.write")
+        target = Path(write["path"])
+        if write["scope"] == "state":
+            try:
+                _, digest, identity, _ = store.read_json_with_identity(target)
+            except StateError as exc:
+                if exc.code == "missing-file":
+                    _fail("wal-retirement-state-missing", f"WAL state target is missing: {target}")
+                raise
+            if digest == write["after_sha256"]:
+                store.sync_exact(target, digest, expected_identity=identity)
+            elif write["immutable"] is True:
+                _fail(
+                    "wal-retirement-authority-drift",
+                    f"immutable WAL authority changed before retirement: {target}",
+                )
+            # Mutable state can legitimately carry a later committed after-image.
+            # Its original digest remains in the checkpoint and its immutable
+            # transaction receipt is validated separately.
+            continue
+        binding = write.get("parent_binding")
+        with _bound_external_parent(target, binding) as (parent, _):
+            current = _read_optional_external(parent, target)
+            if current is None or current[1] != write["after_sha256"]:
+                if binding is None:
+                    _fail(
+                        "legacy-external-wal-unbound",
+                        "legacy external WAL cannot retire after its exact output changed",
+                    )
+                _fail(
+                    "wal-retirement-external-drift",
+                    f"external WAL after-image changed before retirement: {target}",
+                )
+            parent.sync_exact(
+                Path(target.name),
+                write["after_sha256"],
+                max_bytes=MAX_PUBLICATION_JSON_BYTES,
+            )
+
+
+def _load_wal_checkpoint(
+    store: StateStore, operation: str, natural_key: str
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    path = _wal_history_path(operation, natural_key)
+    if not store.exists(path):
+        return None
+    records, _ = _read_wal_history_chain(
+        store,
+        recover_temporaries=True,
+        allow_adjacent_uncommitted=False,
+        target_path=path,
+    )
+    member = next((record for record in records if record[0] == path), None)
+    if member is None:
+        _fail("invalid-wal-history-membership", "checkpoint is not a committed chain member")
+    checkpoint = member[1]
+    checkpoint = _validate_wal_checkpoint(
+        store,
+        checkpoint,
+        operation,
+        expected_natural_key=natural_key,
+    )
+    if path.name != f"{_wal_key(operation, natural_key)}.json":
+        _fail("invalid-wal-history", "WAL checkpoint filename does not bind its key")
+    result = _reconstruct_checkpoint_result(store, checkpoint)
+    return checkpoint, result
+
+
+def _load_wal_checkpoint_binding_read_only(
+    store: StateStore,
+    operation: str,
+    natural_key: str,
+) -> dict[str, Any] | None:
+    """Read only the exact retired first-writer binding.
+
+    Usage-chain recovery and result reconstruction intentionally happen only
+    after the request digest is known not to conflict.  A linked checkpoint
+    helper is validated in place by the read-only publication reader, so even
+    a rejected retry leaves every persistent name, object, and byte unchanged.
+    """
+
+    path = _wal_history_path(operation, natural_key)
+    if not store.exists(path):
+        return None
+    records, _ = _read_wal_history_chain(
+        store,
+        recover_temporaries=False,
+        allow_adjacent_uncommitted=True,
+        target_path=path,
+    )
+    member = next((record for record in records if record[0] == path), None)
+    if member is None:
+        _fail("invalid-wal-history-membership", "checkpoint is not a committed chain member")
+    checkpoint = member[1]
+    checkpoint = _validate_wal_checkpoint(
+        store,
+        checkpoint,
+        operation,
+        expected_natural_key=natural_key,
+    )
+    if path.name != f"{_wal_key(operation, natural_key)}.json":
+        _fail("invalid-wal-history", "WAL checkpoint filename does not bind its key")
+    return checkpoint
+
+
+def _preflight_wal_checkpoint_capacity(store: StateStore, intent: Mapping[str, Any]) -> None:
+    """Prove retirement capacity before an intent or any after-image is published."""
+
+    commit_body = {
+        "version": VERSION,
+        "kind": "state-transaction-commit",
+        "operation": intent["operation"],
+        "natural_key": intent["natural_key"],
+        "intent_digest": intent["intent_digest"],
+    }
+    commit = {**commit_body, "commit_digest": _digest(commit_body)}
+    usage = _read_wal_history_usage(store)
+    checkpoint = _build_wal_checkpoint(
+        intent,
+        commit,
+        sequence=usage["record_count"] + 1,
+        previous_usage_digest=usage["usage_digest"],
+    )
+    checkpoint_size = len(_canonical_bytes(checkpoint))
+    if checkpoint["sequence"] > MAX_WAL_HISTORY_RECORDS:
+        _fail("wal-history-count-limit", "WAL history record count limit reached")
+    if usage["total_bytes"] + checkpoint_size > MAX_WAL_HISTORY_BYTES:
+        _fail("wal-history-byte-limit", "WAL history aggregate byte limit reached")
+
+
+def _retire_committed_wal(
+    store: StateStore,
+    intent: Mapping[str, Any],
+    commit: Mapping[str, Any],
+    *,
+    intent_path: Path,
+    commit_path: Path | None,
+    intent_file_digest: str,
+    commit_file_digest: str | None,
+    intent_identity: tuple[int, int],
+    commit_identity: tuple[int, int] | None,
+) -> dict[str, Any]:
+    """Replace one full committed WAL pair with a compact chained checkpoint."""
+
+    usage = _read_wal_history_usage(store)
+    history_path = _wal_history_path(intent["operation"], intent["natural_key"])
+    store.recover_wal_history_temporary(history_path)
+    checkpoint_file_digest: str | None = None
+    checkpoint_identity: tuple[int, int] | None = None
+    checkpoint_exists = store.exists(history_path)
+    if checkpoint_exists:
+        checkpoint, checkpoint_file_digest, checkpoint_identity, checkpoint_size = (
+            store.read_json_with_identity(
+                history_path,
+                max_bytes=MAX_WAL_HISTORY_RECORD_BYTES,
+            )
+        )
+        checkpoint = _validate_wal_checkpoint(
+            store,
+            checkpoint,
+            intent["operation"],
+            expected_natural_key=intent["natural_key"],
+        )
+        expected = _build_wal_checkpoint(
+            intent,
+            commit,
+            sequence=checkpoint["sequence"],
+            previous_usage_digest=checkpoint["previous_usage_digest"],
+        )
+        if checkpoint != expected:
+            _fail("wal-history-conflict", "existing checkpoint differs from active WAL")
+    else:
+        checkpoint = _build_wal_checkpoint(
+            intent,
+            commit,
+            sequence=usage["record_count"] + 1,
+            previous_usage_digest=usage["usage_digest"],
+        )
+        checkpoint_size = len(_canonical_bytes(checkpoint))
+        if checkpoint["sequence"] > MAX_WAL_HISTORY_RECORDS:
+            _fail("wal-history-count-limit", "WAL history record count limit reached")
+        if usage["total_bytes"] + checkpoint_size > MAX_WAL_HISTORY_BYTES:
+            _fail("wal-history-byte-limit", "WAL history aggregate byte limit reached")
+
+    # Validate every permanent authority and durably sync every after-image
+    # before publishing a new compact checkpoint or completing an interrupted
+    # retirement.  Until publication, the full intent remains the only recovery
+    # authority for an external leaf; it is also retained until both checks pass.
+    _reconstruct_checkpoint_result(store, checkpoint)
+    _sync_retirement_after_images(store, intent)
+    if not checkpoint_exists:
+        checkpoint_file_digest = store.write_wal_history_json(
+            history_path,
+            checkpoint,
+            immutable=True,
+        )
+        _, stored_digest, checkpoint_identity, stored_size = store.read_json_with_identity(
+            history_path,
+            max_bytes=MAX_WAL_HISTORY_RECORD_BYTES,
+        )
+        if stored_digest != checkpoint_file_digest or stored_size != checkpoint_size:
+            _fail("wal-history-write-failed", "stored checkpoint bytes differ")
+    assert checkpoint_file_digest is not None and checkpoint_identity is not None
+    store.sync_exact(
+        history_path,
+        checkpoint_file_digest,
+        expected_identity=checkpoint_identity,
+        max_bytes=MAX_WAL_HISTORY_RECORD_BYTES,
+    )
+    _advance_wal_history_usage(store, usage, checkpoint, checkpoint_size)
+    # Commit-first cleanup can only leave either a complete pair or an intent
+    # beside the authoritative checkpoint.  It never creates an orphan commit.
+    if commit_path is not None:
+        assert commit_file_digest is not None and commit_identity is not None
+        store.unlink_exact(
+            commit_path,
+            commit_file_digest,
+            expected_identity=commit_identity,
+        )
+    store.unlink_exact(
+        intent_path,
+        intent_file_digest,
+        expected_identity=intent_identity,
+    )
+    return checkpoint
+
+
 def _commit_wal(store: StateStore, intent: Mapping[str, Any]) -> None:
     _, commit_path = _wal_paths(intent["operation"], intent["natural_key"])
     body = {
@@ -3584,6 +5449,59 @@ def _commit_wal(store: StateStore, intent: Mapping[str, Any]) -> None:
             raise
 
 
+def _preflight_transaction_binding_read_only(
+    store: StateStore,
+    *,
+    operation: str,
+    natural_key: str,
+    request: Mapping[str, Any],
+    approved_intent_upper_bound: int | None = None,
+) -> None:
+    """Reject an exact first-writer conflict without persistent mutation."""
+
+    request_digest = _digest(request)
+    intent_path, commit_path = _wal_paths(operation, natural_key)
+    history_path = _wal_history_path(operation, natural_key)
+    committed = store.exists(commit_path)
+    if store.exists(intent_path):
+        intent, _ = store.read_json_without_publication_recovery(
+            intent_path,
+            max_bytes=MAX_WAL_JSON_BYTES,
+        )
+        _validate_wal_intent(
+            store,
+            intent,
+            operation,
+            allow_committed_legacy_external=(committed or store.exists(history_path)),
+        )
+        if intent["natural_key"] != natural_key or intent["request_digest"] != request_digest:
+            _fail("wal-request-conflict", "transaction key already binds a different request")
+        if (
+            approved_intent_upper_bound is not None
+            and len(_canonical_bytes(intent)) > approved_intent_upper_bound
+        ):
+            _fail(
+                "invalid-selection-preflight",
+                "persisted publication WAL exceeds its approved upper bound",
+            )
+        return
+    if committed:
+        return
+    checkpoint = _load_wal_checkpoint_binding_read_only(store, operation, natural_key)
+    if checkpoint is None:
+        return
+    if checkpoint["request_digest"] != request_digest:
+        _fail("wal-request-conflict", "transaction key already binds a different request")
+    if (
+        approved_intent_upper_bound is not None
+        and checkpoint["intent_bytes"] > approved_intent_upper_bound
+    ):
+        _fail(
+            "invalid-selection-preflight",
+            "retired publication WAL exceeded its approved upper bound",
+        )
+
+
 def _run_transaction(
     store: StateStore,
     *,
@@ -3597,10 +5515,46 @@ def _run_transaction(
 ) -> dict[str, Any]:
     """Create or replay a deterministic after-image transaction."""
 
-    store._bind_state_namespace("before transaction")
+    store._bind_state_namespace("before transaction binding preflight")
     captured_at = _timestamp(captured_at, "transaction.captured_at")
     request_digest = _digest(request)
     intent_path, commit_path = _wal_paths(operation, natural_key)
+
+    # First-writer binding is checked before recovery can compact any other
+    # transaction or advance history usage.  A request conflict is therefore a
+    # strictly read-only failure for persistent state.
+    _preflight_transaction_binding_read_only(
+        store,
+        operation=operation,
+        natural_key=natural_key,
+        request=request,
+        approved_intent_upper_bound=approved_intent_upper_bound,
+    )
+
+    # Callers perform operation-specific validation before entering this
+    # function.  Once the exact key is known not to conflict, recover pending
+    # work and compact prior committed WAL while retaining this transaction.
+    _recover_pending_wal(
+        store,
+        compact_committed=True,
+        retain_transaction=(operation, natural_key),
+    )
+    store._bind_state_namespace("before transaction")
+    retired = _load_wal_checkpoint(store, operation, natural_key)
+    if retired is not None:
+        checkpoint, retired_result = retired
+        if checkpoint["request_digest"] != request_digest:
+            _fail("wal-request-conflict", "transaction key already binds a different request")
+        if (
+            approved_intent_upper_bound is not None
+            and checkpoint["intent_bytes"] > approved_intent_upper_bound
+        ):
+            _fail(
+                "invalid-selection-preflight",
+                "retired publication WAL exceeded its approved upper bound",
+            )
+        store._bind_state_namespace("after retired transaction lookup")
+        return retired_result
     legacy_external = False
     committed = store.exists(commit_path)
     if store.exists(intent_path):
@@ -3642,6 +5596,7 @@ def _run_transaction(
                 "wal-intent-too-large",
                 f"WAL intent exceeds {MAX_WAL_JSON_BYTES} bytes",
             )
+        _preflight_wal_checkpoint_capacity(store, intent)
         store.write_json(intent_path, intent, immutable=True)
     if (
         approved_intent_upper_bound is not None
@@ -3667,28 +5622,187 @@ def _run_transaction(
     return dict(_require_object(intent["result"], "wal.result"))
 
 
-def _recover_pending_wal(store: StateStore) -> None:
-    store._bind_state_namespace("before WAL recovery")
-    validated: list[tuple[str, Path, Path | None, str, str | None, bool]] = []
+def _preflight_active_wal_namespace(
+    store: StateStore,
+) -> list[tuple[str, tuple[str, ...]]]:
+    """Stream and cap every active WAL name/object before payload recovery."""
+
+    operations: list[str] = []
     try:
-        operations = store.list_names(Path("wal"))
+        for operation in store.iter_names(Path("wal")):
+            if (
+                SAFE_OBJECT_ID_RE.fullmatch(operation) is None
+                or operation not in TRANSACTION_OPERATIONS
+            ):
+                _fail("invalid-wal-layout", f"unsafe WAL operation directory: {operation}")
+            operations.append(operation)
     except OSError as exc:
         _fail("invalid-wal-layout", f"WAL root is not a private directory: {exc}")
-    for operation in operations:
-        if (
-            SAFE_OBJECT_ID_RE.fullmatch(operation) is None
-            or operation not in TRANSACTION_OPERATIONS
-        ):
-            _fail("invalid-wal-layout", f"unsafe WAL operation directory: {operation}")
+
+    transaction_keys: set[tuple[str, str]] = set()
+    object_sizes: dict[tuple[int, int], int] = {}
+    bindings: dict[tuple[str, str], tuple[int, int, int, int, int, int, int]] = {}
+    inventory: list[tuple[str, tuple[str, ...]]] = []
+    entry_count = 0
+    aggregate_bytes = 0
+    maximum_entries = MAX_ACTIVE_WAL_TRANSACTIONS * 4
+    for operation in sorted(operations, key=os.fsencode):
         directory = Path("wal") / operation
+        names: list[str] = []
         try:
-            store.recover_wal_temporaries(directory)
-            names = store.list_names(directory)
+            with store.open_dir(directory) as directory_fd:
+                with os.scandir(directory_fd) as entries:
+                    for entry in entries:
+                        name = entry.name
+                        leaf = name
+                        if name.startswith("."):
+                            match = WAL_TEMP_RE.fullmatch(name)
+                            if match is None:
+                                _fail(
+                                    "unsafe-helper-temp",
+                                    f"foreign WAL temporary entry: {name}",
+                                )
+                            leaf = match.group("leaf")
+                        elif WAL_LEAF_RE.fullmatch(name) is None:
+                            _fail("invalid-wal-layout", f"unexpected WAL entry: {name}")
+                        entry_count += 1
+                        if entry_count > maximum_entries:
+                            _fail(
+                                "active-wal-count-limit",
+                                "active WAL namespace entry limit exceeded",
+                            )
+                        transaction_keys.add((operation, leaf[:64]))
+                        if len(transaction_keys) > MAX_ACTIVE_WAL_TRANSACTIONS:
+                            _fail(
+                                "active-wal-count-limit",
+                                f"active WAL exceeds {MAX_ACTIVE_WAL_TRANSACTIONS} transactions",
+                            )
+                        info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                        if (
+                            not stat.S_ISREG(info.st_mode)
+                            or stat.S_ISLNK(info.st_mode)
+                            or info.st_uid != os.geteuid()
+                            or stat.S_IMODE(info.st_mode) != 0o600
+                            or info.st_nlink not in {1, 2}
+                        ):
+                            _fail(
+                                "invalid-wal-layout",
+                                f"WAL entry is not a private regular file: {directory / name}",
+                            )
+                        if info.st_size > MAX_WAL_JSON_BYTES:
+                            _fail(
+                                "active-wal-byte-limit",
+                                f"active WAL leaf is too large: {directory / name}",
+                            )
+                        identity = (info.st_dev, info.st_ino)
+                        prior_size = object_sizes.get(identity)
+                        if prior_size is None:
+                            object_sizes[identity] = info.st_size
+                            aggregate_bytes += info.st_size
+                            if aggregate_bytes > MAX_ACTIVE_WAL_BYTES:
+                                _fail(
+                                    "active-wal-byte-limit",
+                                    f"active WAL exceeds {MAX_ACTIVE_WAL_BYTES} aggregate bytes",
+                                )
+                        elif prior_size != info.st_size:
+                            _fail(
+                                "wal-layout-changed",
+                                "active WAL alias size changed during inventory: "
+                                f"{directory / name}",
+                            )
+                        bindings[(operation, name)] = (
+                            info.st_dev,
+                            info.st_ino,
+                            stat.S_IFMT(info.st_mode),
+                            info.st_uid,
+                            stat.S_IMODE(info.st_mode),
+                            info.st_nlink,
+                            info.st_size,
+                        )
+                        names.append(name)
         except OSError as exc:
             _fail(
                 "invalid-wal-layout",
                 f"WAL operation entry is not a private directory: {operation}: {exc}",
             )
+        inventory.append((operation, tuple(sorted(names, key=os.fsencode))))
+
+    # The count/byte caps now hold for the complete namespace.  Open every
+    # captured name without reading payload bytes to bind object identity and
+    # ACL policy before any helper cleanup may occur.
+    flags = os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC
+    for operation, captured_names in inventory:
+        directory = Path("wal") / operation
+        with store.open_dir(directory) as directory_fd:
+            for name in captured_names:
+                try:
+                    fd = os.open(name, flags, dir_fd=directory_fd)
+                except OSError as exc:
+                    _fail("invalid-wal-layout", f"cannot open active WAL entry {name}: {exc}")
+                try:
+                    opened = os.fstat(fd)
+                    opened_binding = (
+                        opened.st_dev,
+                        opened.st_ino,
+                        stat.S_IFMT(opened.st_mode),
+                        opened.st_uid,
+                        stat.S_IMODE(opened.st_mode),
+                        opened.st_nlink,
+                        opened.st_size,
+                    )
+                    if opened_binding != bindings[(operation, name)]:
+                        _fail(
+                            "wal-layout-changed",
+                            f"active WAL entry changed after inventory: {directory / name}",
+                        )
+                    try:
+                        named = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                    except OSError as exc:
+                        _fail(
+                            "wal-layout-changed",
+                            f"active WAL entry could not be rebound: {directory / name}: {exc}",
+                        )
+                    named_binding = (
+                        named.st_dev,
+                        named.st_ino,
+                        stat.S_IFMT(named.st_mode),
+                        named.st_uid,
+                        stat.S_IMODE(named.st_mode),
+                        named.st_nlink,
+                        named.st_size,
+                    )
+                    if named_binding != bindings[(operation, name)]:
+                        _fail(
+                            "wal-layout-changed",
+                            f"active WAL name changed after inventory: {directory / name}",
+                        )
+                    _acl_digest(fd, str(store.root / directory / name), sensitive=True)
+                finally:
+                    os.close(fd)
+    return inventory
+
+
+def _recover_pending_wal(
+    store: StateStore,
+    *,
+    compact_committed: bool = False,
+    retain_transaction: tuple[str, str] | None = None,
+) -> None:
+    store._bind_state_namespace("before WAL recovery")
+    validated: list[dict[str, Any]] = []
+    active_transaction_count = 0
+    active_bytes = 0
+    inventory = _preflight_active_wal_namespace(store)
+    for operation, inventory_names in inventory:
+        directory = Path("wal") / operation
+        try:
+            store.recover_wal_temporaries(directory, names=inventory_names)
+        except OSError as exc:
+            _fail(
+                "invalid-wal-layout",
+                f"WAL operation entry is not a private directory: {operation}: {exc}",
+            )
+        names = [name for name in inventory_names if WAL_LEAF_RE.fullmatch(name) is not None]
 
         intent_paths: dict[str, Path] = {}
         commit_paths: dict[str, Path] = {}
@@ -3705,9 +5819,29 @@ def _recover_pending_wal(store: StateStore) -> None:
                 f"WAL commit exists without its intent: {commit_paths[orphan_commits[0]]}",
             )
 
+        active_transaction_count += len(intent_paths)
+        if active_transaction_count > MAX_ACTIVE_WAL_TRANSACTIONS:
+            _fail(
+                "active-wal-count-limit",
+                f"active WAL exceeds {MAX_ACTIVE_WAL_TRANSACTIONS} transactions",
+            )
+        for path in [*intent_paths.values(), *commit_paths.values()]:
+            size = store.private_file_size(path)
+            if size > MAX_WAL_JSON_BYTES:
+                _fail("active-wal-byte-limit", f"active WAL leaf is too large: {path}")
+            active_bytes += size
+            if active_bytes > MAX_ACTIVE_WAL_BYTES:
+                _fail(
+                    "active-wal-byte-limit",
+                    f"active WAL exceeds {MAX_ACTIVE_WAL_BYTES} aggregate bytes",
+                )
+
         for key, intent_path in sorted(intent_paths.items()):
             try:
-                intent, intent_file_digest = store.read_json(intent_path)
+                intent, intent_file_digest, intent_identity, _ = store.read_json_with_identity(
+                    intent_path,
+                    max_bytes=MAX_WAL_JSON_BYTES,
+                )
             except OSError as exc:
                 _fail(
                     "invalid-wal-layout",
@@ -3715,11 +5849,17 @@ def _recover_pending_wal(store: StateStore) -> None:
                 )
             candidate_commit = commit_paths.get(key)
             candidate_committed = candidate_commit is not None
+            history_path: Path | None = None
+            checkpoint: dict[str, Any] | None = None
+            checkpoint_size: int | None = None
             legacy_external = _validate_wal_intent(
                 store,
                 intent,
                 operation,
-                allow_committed_legacy_external=candidate_committed,
+                allow_committed_legacy_external=(
+                    candidate_committed
+                    or store.exists(_wal_history_path(operation, intent["natural_key"]))
+                ),
             )
             expected_intent, commit_path = _wal_paths(operation, intent["natural_key"])
             if expected_intent != intent_path:
@@ -3727,61 +5867,225 @@ def _recover_pending_wal(store: StateStore) -> None:
             if candidate_commit is not None and candidate_commit != commit_path:
                 _fail("invalid-wal-layout", "WAL commit filename does not bind its intent")
             commit_file_digest: str | None = None
+            commit_identity: tuple[int, int] | None = None
+            commit: dict[str, Any] | None = None
             if candidate_commit is not None:
                 try:
-                    commit, commit_file_digest = store.read_json(candidate_commit)
+                    commit, commit_file_digest, commit_identity, _ = store.read_json_with_identity(
+                        candidate_commit,
+                        max_bytes=MAX_WAL_JSON_BYTES,
+                    )
                 except OSError as exc:
                     _fail(
                         "invalid-wal-layout",
                         f"WAL commit is not a private regular JSON file: {candidate_commit}: {exc}",
                     )
                 _validate_wal_commit(commit, intent)
-            validated.append(
-                (
-                    operation,
-                    intent_path,
-                    candidate_commit,
-                    intent_file_digest,
-                    commit_file_digest,
-                    legacy_external,
+            history_candidate = _wal_history_path(operation, intent["natural_key"])
+            store.recover_wal_history_temporary(history_candidate)
+            if store.exists(history_candidate):
+                history_path = history_candidate
+                checkpoint, _, _, checkpoint_size = store.read_json_with_identity(
+                    history_path,
+                    max_bytes=MAX_WAL_HISTORY_RECORD_BYTES,
                 )
+                checkpoint = _validate_wal_checkpoint(
+                    store,
+                    checkpoint,
+                    operation,
+                    expected_natural_key=intent["natural_key"],
+                )
+                if commit is None:
+                    commit_body = {
+                        "version": VERSION,
+                        "kind": "state-transaction-commit",
+                        "operation": operation,
+                        "natural_key": intent["natural_key"],
+                        "intent_digest": intent["intent_digest"],
+                    }
+                    commit = {**commit_body, "commit_digest": _digest(commit_body)}
+                expected_checkpoint = _build_wal_checkpoint(
+                    intent,
+                    commit,
+                    sequence=checkpoint["sequence"],
+                    previous_usage_digest=checkpoint["previous_usage_digest"],
+                )
+                if checkpoint != expected_checkpoint:
+                    _fail("wal-history-conflict", "checkpoint differs from active WAL")
+                _reconstruct_checkpoint_result(store, checkpoint, verify_external=False)
+            if commit is None and checkpoint is None and candidate_commit is None:
+                # This is the sole replayable state: a full bound intent without
+                # either commit or checkpoint.
+                pass
+            elif commit is None:
+                _fail("invalid-wal-layout", "committed WAL state has no reconstructable commit")
+            validated.append(
+                {
+                    "operation": operation,
+                    "intent_path": intent_path,
+                    "commit_path": candidate_commit,
+                    "intent_file_digest": intent_file_digest,
+                    "commit_file_digest": commit_file_digest,
+                    "intent_identity": intent_identity,
+                    "commit_identity": commit_identity,
+                    "legacy_external": legacy_external,
+                    "checkpoint": checkpoint,
+                    "checkpoint_size": checkpoint_size,
+                    "commit": commit,
+                    "intent": intent,
+                    "natural_key": intent["natural_key"],
+                }
             )
+
+    # Prove the complete recovery order and capacity before replay, repair, or
+    # cleanup mutates anything.  Existing checkpoints are the authoritative
+    # prefix of the usage chain, so interrupted retirement must converge in
+    # sequence order before a checkpoint-free legacy backlog can allocate a new
+    # sequence.  Canonical operation/key ordering breaks otherwise-equal ties.
+    checkpoint_records = sorted(
+        (record for record in validated if record["checkpoint"] is not None),
+        key=lambda record: (
+            record["checkpoint"]["sequence"],
+            os.fsencode(record["operation"]),
+            os.fsencode(record["natural_key"]),
+        ),
+    )
+    checkpoint_free_records = sorted(
+        (record for record in validated if record["checkpoint"] is None),
+        key=lambda record: (
+            os.fsencode(record["operation"]),
+            os.fsencode(record["natural_key"]),
+        ),
+    )
+    projected_usage = _read_wal_history_usage(store)
+    for record in checkpoint_records:
+        checkpoint = record["checkpoint"]
+        checkpoint_size = record["checkpoint_size"]
+        assert checkpoint is not None and checkpoint_size is not None
+        advanced_usage = _project_wal_history_usage(
+            projected_usage,
+            checkpoint,
+            checkpoint_size,
+        )
+        usage_committed = advanced_usage == projected_usage
+        if not usage_committed and record["commit_path"] is None:
+            _fail(
+                "invalid-wal-history-usage",
+                "uncommitted history tail has no retained commit",
+            )
+        record["checkpoint_usage_committed"] = usage_committed
+        projected_usage = advanced_usage
+    for record in checkpoint_free_records:
+        if not compact_committed or retain_transaction == (
+            record["operation"],
+            record["natural_key"],
+        ):
+            continue
+        intent = record["intent"]
+        commit = record["commit"]
+        if commit is None:
+            commit_body = {
+                "version": VERSION,
+                "kind": "state-transaction-commit",
+                "operation": record["operation"],
+                "natural_key": record["natural_key"],
+                "intent_digest": intent["intent_digest"],
+            }
+            commit = {**commit_body, "commit_digest": _digest(commit_body)}
+        projected_checkpoint = _build_wal_checkpoint(
+            intent,
+            commit,
+            sequence=projected_usage["record_count"] + 1,
+            previous_usage_digest=projected_usage["usage_digest"],
+        )
+        projected_checkpoint = _validate_wal_checkpoint(
+            store,
+            projected_checkpoint,
+            record["operation"],
+            expected_natural_key=record["natural_key"],
+        )
+        projected_usage = _project_wal_history_usage(
+            projected_usage,
+            projected_checkpoint,
+            len(_canonical_bytes(projected_checkpoint)),
+        )
+    validated = [*checkpoint_records, *checkpoint_free_records]
 
     # Only replay or repair after the complete WAL namespace and every existing
     # pair have passed canonical-name, private-file, JSON, and exact-binding
     # validation.  Re-read each leaf and compare its content digest so the
     # validation-to-use boundary does not rely on timestamp metadata.
-    for (
-        operation,
-        intent_path,
-        commit_path,
-        intent_file_digest,
-        commit_file_digest,
-        legacy_external,
-    ) in validated:
-        current_intent, current_intent_digest = store.read_json(intent_path)
-        if current_intent_digest != intent_file_digest:
+    for record in validated:
+        operation = record["operation"]
+        intent_path = record["intent_path"]
+        current_intent, current_intent_digest, current_intent_identity, _ = (
+            store.read_json_with_identity(intent_path, max_bytes=MAX_WAL_JSON_BYTES)
+        )
+        if (
+            current_intent_digest != record["intent_file_digest"]
+            or current_intent_identity != record["intent_identity"]
+        ):
             _fail("wal-layout-changed", f"WAL intent changed during recovery: {intent_path}")
         intent = current_intent
         _validate_wal_intent(
             store,
             intent,
             operation,
-            allow_committed_legacy_external=commit_path is not None,
+            allow_committed_legacy_external=(
+                record["commit_path"] is not None or record["checkpoint"] is not None
+            ),
         )
-        if commit_path is not None:
-            commit, current_commit_digest = store.read_json(commit_path)
-            if current_commit_digest != commit_file_digest:
-                _fail("wal-layout-changed", f"WAL commit changed during recovery: {commit_path}")
+        commit = record["commit"]
+        if record["commit_path"] is not None:
+            commit, current_commit_digest, current_commit_identity, _ = (
+                store.read_json_with_identity(
+                    record["commit_path"],
+                    max_bytes=MAX_WAL_JSON_BYTES,
+                )
+            )
+            if (
+                current_commit_digest != record["commit_file_digest"]
+                or current_commit_identity != record["commit_identity"]
+            ):
+                _fail(
+                    "wal-layout-changed",
+                    f"WAL commit changed during recovery: {record['commit_path']}",
+                )
             _validate_wal_commit(commit, intent)
-            if legacy_external:
+        if commit is not None:
+            if record["legacy_external"]:
                 _verify_committed_legacy_external_after_images(intent)
             else:
                 _repair_committed_external_after_images(intent)
                 _preflight_external_writes(intent, require_after=True)
+        else:
+            _apply_wal_intent(store, intent)
+            _commit_wal(store, intent)
+            _, new_commit_path = _wal_paths(operation, intent["natural_key"])
+            commit, commit_file_digest, commit_identity, _ = store.read_json_with_identity(
+                new_commit_path,
+                max_bytes=MAX_WAL_JSON_BYTES,
+            )
+            _validate_wal_commit(commit, intent)
+            record["commit_path"] = new_commit_path
+            record["commit_file_digest"] = commit_file_digest
+            record["commit_identity"] = commit_identity
+        assert commit is not None
+        if record["checkpoint"] is None and (
+            not compact_committed or retain_transaction == (operation, intent["natural_key"])
+        ):
             continue
-        _apply_wal_intent(store, intent)
-        _commit_wal(store, intent)
+        _retire_committed_wal(
+            store,
+            intent,
+            commit,
+            intent_path=intent_path,
+            commit_path=record["commit_path"],
+            intent_file_digest=record["intent_file_digest"],
+            commit_file_digest=record["commit_file_digest"],
+            intent_identity=record["intent_identity"],
+            commit_identity=record["commit_identity"],
+        )
     store._bind_state_namespace("after WAL recovery")
 
 
@@ -3789,6 +6093,26 @@ def _require_committed_transaction(
     store: StateStore, operation: str, natural_key: str
 ) -> dict[str, Any]:
     intent_path, commit_path = _wal_paths(operation, natural_key)
+    if not store.exists(intent_path) and not store.exists(commit_path):
+        retired = _load_wal_checkpoint(store, operation, natural_key)
+        if retired is None:
+            _fail(
+                "missing-authority-transaction",
+                f"{operation} has no committed control transaction",
+            )
+        checkpoint, result = retired
+        return {
+            "version": VERSION,
+            "kind": "retired-state-transaction",
+            "operation": operation,
+            "natural_key": natural_key,
+            "request_digest": checkpoint["request_digest"],
+            "captured_at": checkpoint["captured_at"],
+            "writes": checkpoint["after_images"],
+            "result": result,
+            "intent_digest": checkpoint["intent_digest"],
+            "intent_bytes": checkpoint["intent_bytes"],
+        }
     if not store.exists(intent_path) or not store.exists(commit_path):
         _fail("missing-authority-transaction", f"{operation} has no committed control transaction")
     intent, _ = store.read_json(intent_path)
@@ -3877,11 +6201,21 @@ def _new_state_marker(store: StateStore, now: str) -> dict[str, Any]:
     }
 
 
-def _read_marker(root: Path) -> dict[str, Any] | None:
+def _read_marker(
+    root: Path,
+    *,
+    recover_publication: bool = True,
+) -> dict[str, Any] | None:
     path = _marker_path(root)
     if not _state_exists(path):
         return None
-    marker = _load_json(path)
+    store = _active_store_for_path(path)
+    if store is None:
+        _fail("unbound-state-marker-read", "state marker requires descriptor-bound validation")
+    if recover_publication:
+        marker = _load_json(path)
+    else:
+        marker = store.read_json_without_publication_recovery(Path(STATE_MARKER))[0]
     mode = marker.get("mode")
     if "access_policy" not in marker:
         _fail(
@@ -3900,9 +6234,6 @@ def _read_marker(root: Path) -> dict[str, Any] | None:
         _fail("invalid-state-marker", f"invalid state marker: {path}")
     if mode not in {"unbound", "live", "historical-replay"}:
         _fail("invalid-state-marker", f"unsupported state marker mode: {marker.get('mode')}")
-    store = _active_store_for_path(path)
-    if store is None:
-        _fail("unbound-state-marker-read", "state marker requires descriptor-bound validation")
     _validate_state_access_policy_binding(marker["access_policy"], store)
     try:
         uuid.UUID(_require_string(marker["state_id"], "state_marker.state_id"))
@@ -4658,10 +6989,20 @@ def approve_repair(
         _fail("repair-approval-mismatch", "approval does not bind the exact target tuple")
     request = {"approval": approval, "target": target_tuple}
     approval_id = approval["approval_id"]
-    with _state_lock(state_root, create=False) as store:
+    with _state_lock(
+        state_root,
+        create=False,
+        recover_marker_publication=False,
+    ) as store:
+        _preflight_transaction_binding_read_only(
+            store,
+            operation="approve-repair",
+            natural_key=approval_id,
+            request=request,
+        )
+        _read_marker(state_root)
         _recover_pending_wal(store)
-        intent_path, _ = _wal_paths("approve-repair", approval_id)
-        if store.exists(intent_path):
+        if _transaction_record_exists(store, "approve-repair", approval_id):
             return _run_transaction(
                 store,
                 operation="approve-repair",
@@ -5071,10 +7412,7 @@ def transition_dormant(state_root: Path, now: str) -> dict[str, Any]:
         pending = _pending_case_ids(state_root)
         pending_digest = _digest(sorted(pending))
         natural_key = f"{anchor or 'initial'}:{pending_digest}"
-        intent_path, _ = _wal_paths("dormancy", natural_key)
-        if store.exists(intent_path):
-            intent, _ = store.read_json(intent_path)
-            _validate_wal_intent(store, intent, "dormancy")
+        if _transaction_record_exists(store, "dormancy", natural_key):
             return _run_transaction(
                 store,
                 operation="dormancy",
@@ -5579,8 +7917,14 @@ def complete_audit(
     mode = "historical-replay" if historical_replay else "live"
     natural_key = f"{mode}:{audit_id}"
     request = {"audit": audit, "mode": mode}
-    with _state_lock(state_root) as store:
-        intent_path, _ = _wal_paths("complete-audit", natural_key)
+    with _state_lock(state_root, recover_marker_publication=False) as store:
+        _preflight_transaction_binding_read_only(
+            store,
+            operation="complete-audit",
+            natural_key=natural_key,
+            request=request,
+        )
+        _read_marker(state_root)
 
         def validate_audit_receipts() -> None:
             actual_stage = _receipt_files(state_root, "stage", anchor)
@@ -5608,7 +7952,7 @@ def complete_audit(
                 receipt_objects["dormancy"],
             )
 
-        if store.exists(intent_path):
+        if _transaction_record_exists(store, "complete-audit", natural_key):
             validate_audit_receipts()
             _recover_pending_wal(store)
             return _run_transaction(
@@ -6033,7 +8377,18 @@ def preflight_selection(state_root: Path, selection_draft_path: Path, now: str) 
     now_value = _timestamp(now, "now")
     basis = _load_json(selection_draft_path, max_bytes=MAX_PUBLICATION_JSON_BYTES)
     selection_id, selected = _validate_selection_basis(basis)
-    with _state_lock(state_root, create=False) as store:
+    with _state_lock(
+        state_root,
+        create=False,
+        recover_marker_publication=False,
+    ) as store:
+        _preflight_transaction_binding_read_only(
+            store,
+            operation="selection-preflight",
+            natural_key=selection_id,
+            request={"selection_basis": basis},
+        )
+        _read_marker(state_root)
         _recover_pending_wal(store)
         marker = _read_marker(state_root)
         if marker is None or marker.get("mode") != "live":
@@ -6128,8 +8483,7 @@ def preflight_selection(state_root: Path, selection_draft_path: Path, now: str) 
         receipt = {**receipt_body, "receipt_digest": _digest(receipt_body)}
         receipt_relative = Path("publication") / "preflights" / f"{selection_id}.json"
         if store.exists(receipt_relative):
-            intent_relative, commit_relative = _wal_paths("selection-preflight", selection_id)
-            if not store.exists(intent_relative) or not store.exists(commit_relative):
+            if not _transaction_record_exists(store, "selection-preflight", selection_id):
                 _fail(
                     "orphan-selection-preflight",
                     "preflight receipt exists without its committed helper transaction",
@@ -6173,7 +8527,21 @@ def weekly_plan(state_root: Path, selection_path: Path, output: Path, now: str) 
         "selection": selection,
         "output": str(Path(os.path.abspath(os.fspath(output)))),
     }
-    with _state_lock(state_root, create=False) as store:
+    with _state_lock(
+        state_root,
+        create=False,
+        recover_marker_publication=False,
+    ) as store:
+        _preflight_transaction_binding_read_only(
+            store,
+            operation="weekly-plan",
+            natural_key=selection_id,
+            request=request,
+            approved_intent_upper_bound=selection["resource_preflight"][
+                "weekly_wal_upper_bound_bytes"
+            ],
+        )
+        _read_marker(state_root)
         _validate_external_output_target(store, output)
         _recover_pending_wal(store)
         preflight_intent = _require_committed_transaction(
@@ -6203,8 +8571,7 @@ def weekly_plan(state_root: Path, selection_path: Path, output: Path, now: str) 
             )
         if approved_at <= _parse_time(preflight_receipt["checked_at"], "preflight.checked_at"):
             _fail("clock-order", "selection approval must be after helper preflight")
-        intent_path, _ = _wal_paths("weekly-plan", selection_id)
-        if store.exists(intent_path):
+        if _transaction_record_exists(store, "weekly-plan", selection_id):
             return _run_transaction(
                 store,
                 operation="weekly-plan",
@@ -6860,16 +9227,30 @@ def finalize_publication(
     }
     natural_key = f"{plan['selection_id']}:{plan['plan_digest']}"
 
-    with _state_lock(state_root, create=False) as store:
+    with _state_lock(
+        state_root,
+        create=False,
+        recover_marker_publication=False,
+    ) as store:
+        _preflight_transaction_binding_read_only(
+            store,
+            operation="finalize-publication",
+            natural_key=natural_key,
+            request=request,
+            approved_intent_upper_bound=finalize_wal_upper_bound,
+        )
+        _read_marker(state_root)
         _validate_external_output_target(store, output)
         _recover_pending_wal(store)
-        intent_path, _ = _wal_paths("finalize-publication", natural_key)
         existing_finalize_intent: dict[str, Any] | None = None
-        if store.exists(intent_path):
+        if _transaction_record_exists(store, "finalize-publication", natural_key):
             existing_finalize_intent = _require_committed_transaction(
                 store, "finalize-publication", natural_key
             )
-            if len(_canonical_bytes(existing_finalize_intent)) > finalize_wal_upper_bound:
+            persisted_intent_bytes = existing_finalize_intent.get("intent_bytes")
+            if persisted_intent_bytes is None:
+                persisted_intent_bytes = len(_canonical_bytes(existing_finalize_intent))
+            if persisted_intent_bytes > finalize_wal_upper_bound:
                 _fail(
                     "invalid-plan-resource-envelope",
                     "persisted finalize WAL exceeds the selection envelope",
@@ -7170,10 +9551,20 @@ def close_publication(
     closure_record = {**closure_body, "closure_digest": closure_digest}
     request = {"closure": canonical, "publication_approval": approval}
 
-    with _state_lock(state_root, create=False) as store:
+    with _state_lock(
+        state_root,
+        create=False,
+        recover_marker_publication=False,
+    ) as store:
+        _preflight_transaction_binding_read_only(
+            store,
+            operation="close-publication",
+            natural_key=closure_id,
+            request=request,
+        )
+        _read_marker(state_root)
         _recover_pending_wal(store)
-        intent_path, _ = _wal_paths("close-publication", closure_id)
-        if store.exists(intent_path):
+        if _transaction_record_exists(store, "close-publication", closure_id):
             return _run_transaction(
                 store,
                 operation="close-publication",
@@ -7417,6 +9808,12 @@ def _parser() -> argparse.ArgumentParser:
     close.add_argument("--receipt", type=Path, required=True)
     close.add_argument("--publish-receipt", type=Path)
     close.add_argument("--now", required=True)
+
+    wal_audit = subparsers.add_parser(
+        "audit-wal-history",
+        help="explicitly audit compact WAL history and usage accounting",
+    )
+    wal_audit.add_argument("--state-root", type=Path, required=True)
     return parser
 
 
@@ -7478,6 +9875,8 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
             args.now,
             args.publish_receipt,
         )
+    if args.command == "audit-wal-history":
+        return audit_wal_history(Path(os.path.abspath(args.state_root)))
     _fail("unsupported-command", f"unsupported command: {args.command}")
 
 

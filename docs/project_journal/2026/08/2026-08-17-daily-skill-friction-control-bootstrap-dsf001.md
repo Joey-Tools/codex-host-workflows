@@ -46,6 +46,10 @@ superseded_by:
 - A dedicated pinned-action `macos-15` CI lane runs the complete host bootstrap and state-engine suites plus native LaunchAgent plist validation so Darwin rename, fork, process-group, ACL, WAL, and launchd behavior is exercised on the deployment platform rather than inferred from Linux-only coverage.
 - Weekly selection has no count-based candidate cap, but an immutable helper-generated preflight receipt must prove the exact draft fits the publication and WAL byte envelopes before a later Joey approval can bind it; the old implicit 4 MiB post-approval failure is not retained.
 - Weekly plan and manifest outputs must remain outside the managed state-root namespace during normal execution and persisted WAL recovery; non-regular external JSON inputs, including FIFOs without writers, are opened non-blockingly and rejected before they can stall the control path.
+- Equivalent legal UTC timestamp spellings are compared as parsed instants rather than formatter output, so whole seconds and 1–6 fractional digits remain compatible with the frozen ledger schema.
+- Completed full WAL pairs retire into bounded compact checkpoints that contain only digests, locators, and immutable-authority bindings. New-key and active-key operations scan only the bounded active set; retired exact-key lookup and the explicit full-history audit validate the complete bounded usage chain. Revert this layout only if another reviewed bounded transaction index replaces its first-writer, crash-recovery, and external-output guarantees.
+- Compact-history publication uses fixed helper-owned temporary leaves that can be recovered only after exact identity, content, private-access, name, and link-shape validation; foreign or malformed leaves remain blocked. Retired exact-key lookup proves membership through a bounded read-only replay of the current global usage chain, while new-key and active paths do not scan permanent history. A conflicting natural-key request is rejected before any history maintenance so failed input cannot advance usage or retire another transaction. Final temp cleanup relies on the cooperative state lock and does not claim impossible protection from an uncooperative same-UID writer. Revert these guards only when a replacement preserves authenticated membership, crash convergence, and rejected-input non-mutation.
+- Generated CI pins every third-party Action to a full commit SHA, disables persisted checkout credentials, and selects exact Node, Python, uv, Go, Rust, actionlint, and shfmt versions. Change those pins only through the authoritative generator and its round-trip contract when a reviewed dependency update requires it.
 - The redesigned Daily path is evidence-only. Publication and repair happen in the explicit Weekly path, with separate approval boundaries for creating changes, pushing, and opening a PR.
 - The existing private overlay remains independently installed and is not absorbed into this host manifest. Host-only control can be removed without changing overlay installation; each later squash commit must describe the concrete friction it addresses so a no-longer-needed repair can be identified and reverted.
 - Daily and Weekly run from the stable local `codex-workspace` project, not an app-generated worktree: the host-only skill locator is intentionally untracked and points into that workspace's `.codex-local` mirror, so it would be absent or broken in a generated worktree. Their skill contracts prohibit workspace writes; this local-mode choice can be revisited only if skill discovery gains a verified host-wide or per-worktree locator.
@@ -61,6 +65,10 @@ superseded_by:
 - `tests/test_host_setup.py`
 - `.agents/skills/daily-skill-friction/scripts/friction_state.py`
 - `.agents/skills/daily-skill-friction/references/daily-audit.md`
+- `.agents/skills/daily-skill-friction/references/weekly-publication.md`
 - `tests/test_friction_state.py`
+- `.github/workflows/ci.yml`
+- `scripts/setup-ci.mjs`
+- `test/setup-ci.node-test.mjs`
 - `launchd/com.hoteng.codex.daily-skill-friction-control-prefetch.plist`
 - `launchd/com.hoteng.codex.daily-skill-friction-weekly-prefetch.plist`
