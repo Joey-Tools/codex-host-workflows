@@ -143,11 +143,15 @@ describe('setup-ci file plan', () => {
   });
 
   it('runs setup-ci generator tests when the GitHub Actions module is selected', () => {
-    const plan = buildFilePlan({ tools: ['github-actions', 'markdown'], benchmark: false });
+    const plan = buildFilePlan({ tools: ['github-actions'], benchmark: false });
     const workflow = plan.files.find((file) => file.path === '.github/workflows/ci.yml').content;
 
+    assert.match(workflow, /setup-ci-generator:/);
+    assert.match(workflow, /name: setup-ci generator/);
+    assert.match(workflow, /node-version: '24\.19\.0'/);
     assert.match(workflow, /if \[ ! -f test\/setup-ci\.node-test\.mjs \]; then/);
     assert.match(workflow, /node --test test\/setup-ci\.node-test\.mjs/);
+    assert.doesNotMatch(workflow, /node-tooling:/);
   });
 
   it('pins external Actions, checkout credentials, runtimes, and Go-installed tools', () => {

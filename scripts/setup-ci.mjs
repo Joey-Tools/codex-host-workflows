@@ -621,6 +621,8 @@ function buildCiWorkflow(selected) {
   const jobs = [];
   if (selected.has('js-ts') || selected.has('markdown')) {
     jobs.push(nodeToolingJob(selected));
+  } else if (selected.has('github-actions')) {
+    jobs.push(setupCiGeneratorTestJob());
   }
   if (selected.has('python')) {
     jobs.push(pythonJob());
@@ -670,17 +672,7 @@ function nodeToolingJob(selected) {
     steps.push(step('Lint Markdown', 'pnpm run lint:markdown'));
   }
   if (selected.has('github-actions')) {
-    steps.push(
-      step(
-        'Run setup-ci generator tests',
-        `if [ ! -f test/setup-ci.node-test.mjs ]; then
-  echo "No test/setup-ci.node-test.mjs file found; skipping generator tests."
-  exit 0
-fi
-
-node --test test/setup-ci.node-test.mjs`,
-      ),
-    );
+    steps.push(setupCiGeneratorTestStep());
   }
   if (selected.has('js-ts')) {
     steps.push(step('Run JavaScript and TypeScript tests', 'pnpm test'));
@@ -714,6 +706,31 @@ ${checkoutStep()}
             pnpm install --no-frozen-lockfile
           fi
 ${steps.join('\n')}`;
+}
+
+function setupCiGeneratorTestJob() {
+  return `  setup-ci-generator:
+    name: setup-ci generator
+    runs-on: ubuntu-latest
+    steps:
+${checkoutStep()}
+      - name: Set up Node
+        uses: ${SETUP_NODE_ACTION}
+        with:
+          node-version: '${NODE_VERSION}'
+${setupCiGeneratorTestStep()}`;
+}
+
+function setupCiGeneratorTestStep() {
+  return step(
+    'Run setup-ci generator tests',
+    `if [ ! -f test/setup-ci.node-test.mjs ]; then
+  echo "No test/setup-ci.node-test.mjs file found; skipping generator tests."
+  exit 0
+fi
+
+node --test test/setup-ci.node-test.mjs`,
+  );
 }
 
 function pythonJob() {
