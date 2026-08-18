@@ -4619,8 +4619,11 @@ def _fork_supervision_fixture(
         "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
         f"process = subprocess.Popen([sys.executable, {str(grandchild)!r}, "
         f"{str(late_write)!r}])\n"
-        f"pathlib.Path({str(readiness)!r}).write_text("
-        "json.dumps({'pid': process.pid, 'pgid': os.getpgrp()}), encoding='utf-8')\n"
+        f"readiness = pathlib.Path({str(readiness)!r})\n"
+        "temporary = readiness.with_suffix('.tmp')\n"
+        "temporary.write_text(json.dumps({'pid': process.pid, 'pgid': os.getpgrp()}), "
+        "encoding='utf-8')\n"
+        "temporary.replace(readiness)\n"
         f"output_bytes = {output_bytes}\n"
         "if output_bytes:\n"
         "    os.write(1, b'x' * output_bytes)\n"
@@ -4664,7 +4667,10 @@ def _assert_fork_descendant_cleaned(readiness: Path, late_write: Path) -> None:
     assert not late_write.exists()
 
 
-def test_forked_python_source_timeout_kills_descendant_group(tmp_path: Path) -> None:
+def test_forked_python_source_timeout_kills_descendant_group(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     source_path, snapshot, readiness, late_write = _fork_supervision_fixture(
         tmp_path,
         output_bytes=0,
@@ -4674,6 +4680,26 @@ def test_forked_python_source_timeout_kills_descendant_group(tmp_path: Path) -> 
         term_grace_seconds=0.1,
         kill_grace_seconds=1,
     )
+    real_fork = runner._fork_python_source
+
+    def wait_for_descendant_ready(*args: Any, **kwargs: Any) -> Any:
+        process = real_fork(*args, **kwargs)
+        deadline = time.monotonic() + 5
+        while not readiness.is_file():
+            try:
+                process.wait(timeout=0)
+            except subprocess.TimeoutExpired:
+                pass
+            else:
+                runner._terminate_process_group(process)
+                pytest.fail("forked helper exited before descendant readiness")
+            if time.monotonic() >= deadline:
+                runner._terminate_process_group(process)
+                pytest.fail("forked helper descendant did not publish readiness")
+            time.sleep(0.01)
+        return process
+
+    monkeypatch.setattr(runner, "_fork_python_source", wait_for_descendant_ready)
 
     with pytest.raises(hs.SetupError, match="command timed out"):
         runner.run_python_source(

@@ -125,8 +125,19 @@ describe('setup-ci file plan', () => {
     );
     assert.match(workflow, /python-version: '3\.12\.12'/);
     assert.match(workflow, /version: '0\.10\.7'/);
+    assert.match(workflow, /if \[ -f uv\.lock \]; then/);
+    assert.match(workflow, /uv sync --locked --group dev/);
+    assert.match(workflow, /uv sync --group dev/);
     assert.match(workflow, /if \[ ! -d tests \]; then/);
     assert.match(workflow, /No tests\/ directory found; skipping pytest\./);
+  });
+
+  it('runs setup-ci generator tests when the GitHub Actions module is selected', () => {
+    const plan = buildFilePlan({ tools: ['github-actions', 'markdown'], benchmark: false });
+    const workflow = plan.files.find((file) => file.path === '.github/workflows/ci.yml').content;
+
+    assert.match(workflow, /if \[ ! -f test\/setup-ci\.node-test\.mjs \]; then/);
+    assert.match(workflow, /node --test test\/setup-ci\.node-test\.mjs/);
   });
 
   it('pins external Actions, checkout credentials, runtimes, and Go-installed tools', () => {

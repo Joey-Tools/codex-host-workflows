@@ -671,6 +671,19 @@ function nodeToolingJob(selected) {
   if (selected.has('markdown')) {
     steps.push(step('Lint Markdown', 'pnpm run lint:markdown'));
   }
+  if (selected.has('github-actions')) {
+    steps.push(
+      step(
+        'Run setup-ci generator tests',
+        `if [ ! -f test/setup-ci.node-test.mjs ]; then
+  echo "No test/setup-ci.node-test.mjs file found; skipping generator tests."
+  exit 0
+fi
+
+node --test test/setup-ci.node-test.mjs`,
+      ),
+    );
+  }
   if (selected.has('js-ts')) {
     steps.push(step('Run JavaScript and TypeScript tests', 'pnpm test'));
   }
@@ -720,7 +733,12 @@ ${checkoutStep()}
         with:
           version: '${UV_VERSION}'
       - name: Install dependencies
-        run: uv sync --group dev
+        run: |
+          if [ -f uv.lock ]; then
+            uv sync --locked --group dev
+          else
+            uv sync --group dev
+          fi
       - name: Check Python formatting
         run: uv run ruff format --check .
       - name: Lint Python
@@ -896,6 +914,15 @@ ${steps.join('\n')}`;
 }
 
 function step(name, run) {
+  if (run.includes('\n')) {
+    const block = run
+      .split('\n')
+      .map((line) => (line === '' ? '' : `          ${line}`))
+      .join('\n');
+    return `      - name: ${name}
+        run: |
+${block}`;
+  }
   return `      - name: ${name}
         run: ${run}`;
 }

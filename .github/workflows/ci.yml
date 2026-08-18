@@ -50,6 +50,14 @@ jobs:
         run: pnpm run format:check
       - name: Lint Markdown
         run: pnpm run lint:markdown
+      - name: Run setup-ci generator tests
+        run: |
+          if [ ! -f test/setup-ci.node-test.mjs ]; then
+            echo "No test/setup-ci.node-test.mjs file found; skipping generator tests."
+            exit 0
+          fi
+
+          node --test test/setup-ci.node-test.mjs
 
   python:
     name: Python
@@ -68,7 +76,12 @@ jobs:
         with:
           version: '0.10.7'
       - name: Install dependencies
-        run: uv sync --group dev
+        run: |
+          if [ -f uv.lock ]; then
+            uv sync --locked --group dev
+          else
+            uv sync --group dev
+          fi
       - name: Check Python formatting
         run: uv run ruff format --check .
       - name: Lint Python
