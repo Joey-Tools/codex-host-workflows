@@ -1,6 +1,6 @@
 # Codex Host Workflows
 
-Private, host-scoped control-plane assets for Codex workflows that should run on one workstation rather than every machine using the private overlay.
+Public source for host-scoped control-plane assets that run on one workstation rather than every machine using the private overlay. Runtime state and the separate evidence ledger remain outside this repository.
 
 ## Boundaries
 

@@ -78,15 +78,13 @@ const TOOL_IGNORES = {
 const PACKAGE_MANAGER = 'pnpm@11.5.2';
 const CHECKOUT_ACTION = 'actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0';
 const SETUP_NODE_ACTION = 'actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0';
-const SETUP_PYTHON_ACTION =
-  'actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0';
 const SETUP_GO_ACTION = 'actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0';
 const PNPM_SETUP_ACTION = 'pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10';
 const SETUP_UV_ACTION = 'astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0';
 const RUST_TOOLCHAIN_ACTION =
   'dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable';
 const NODE_VERSION = '24.19.0';
-const PYTHON_VERSION = '3.12.12';
+const PYTHON_VERSION = '3.12.10';
 const UV_VERSION = '0.10.7';
 const GO_VERSION = '1.26.6';
 const RUST_TOOLCHAIN_VERSION = '1.97.1';
@@ -722,22 +720,33 @@ function pythonJob() {
   return `  python:
     name: Python
     runs-on: ubuntu-latest
+    env:
+      UV_MANAGED_PYTHON: 'true'
     steps:
 ${checkoutStep()}
-      - name: Set up Python
-        uses: ${SETUP_PYTHON_ACTION}
-        with:
-          python-version: '${PYTHON_VERSION}'
+      - name: Prepare trusted Python directory
+        env:
+          UV_PYTHON_INSTALL_DIR: \${{ runner.temp }}/uv-python-dir
+        run: install -d -m 0700 "$UV_PYTHON_INSTALL_DIR"
       - name: Set up uv
         uses: ${SETUP_UV_ACTION}
+        env:
+          UV_PYTHON_INSTALL_DIR: \${{ runner.temp }}/uv-python-dir
         with:
           version: '${UV_VERSION}'
+          python-version: '${PYTHON_VERSION}'
+      - name: Install trusted Python
+        env:
+          UV_PYTHON_INSTALL_DIR: \${{ runner.temp }}/uv-python-dir
+        run: uv python install --managed-python '${PYTHON_VERSION}'
       - name: Install dependencies
+        env:
+          UV_PYTHON_INSTALL_DIR: \${{ runner.temp }}/uv-python-dir
         run: |
           if [ -f uv.lock ]; then
-            uv sync --locked --group dev
+            uv sync --locked --group dev --managed-python --python '${PYTHON_VERSION}'
           else
-            uv sync --group dev
+            uv sync --group dev --managed-python --python '${PYTHON_VERSION}'
           fi
       - name: Check Python formatting
         run: uv run ruff format --check .

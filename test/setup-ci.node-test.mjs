@@ -115,19 +115,29 @@ describe('setup-ci file plan', () => {
     );
   });
 
-  it('skips pytest before invoking it when the tests directory is missing', () => {
+  it('uses an exact uv-managed Python from the runner-owned temporary tree', () => {
     const plan = buildFilePlan({ tools: ['python'], benchmark: false });
     const workflow = plan.files.find((file) => file.path === '.github/workflows/ci.yml').content;
 
+    assert.doesNotMatch(workflow, /uses: actions\/setup-python@/);
     assert.match(
       workflow,
       /uses: astral-sh\/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8\.1\.0/,
     );
-    assert.match(workflow, /python-version: '3\.12\.12'/);
+    assert.match(workflow, /UV_MANAGED_PYTHON: 'true'/);
+    assert.equal(
+      (workflow.match(/UV_PYTHON_INSTALL_DIR: \$\{\{ runner\.temp \}\}\/uv-python-dir/g) ?? [])
+        .length,
+      4,
+    );
+    assert.match(workflow, /python-version: '3\.12\.10'/);
     assert.match(workflow, /version: '0\.10\.7'/);
+    assert.match(workflow, /install -d -m 0700 "\$UV_PYTHON_INSTALL_DIR"/);
+    assert.ok(workflow.indexOf('Prepare trusted Python directory') < workflow.indexOf('Set up uv'));
+    assert.match(workflow, /uv python install --managed-python '3\.12\.10'/);
     assert.match(workflow, /if \[ -f uv\.lock \]; then/);
-    assert.match(workflow, /uv sync --locked --group dev/);
-    assert.match(workflow, /uv sync --group dev/);
+    assert.match(workflow, /uv sync --locked --group dev --managed-python --python '3\.12\.10'/);
+    assert.match(workflow, /uv sync --group dev --managed-python --python '3\.12\.10'/);
     assert.match(workflow, /if \[ ! -d tests \]; then/);
     assert.match(workflow, /No tests\/ directory found; skipping pytest\./);
   });
@@ -159,7 +169,7 @@ describe('setup-ci file plan', () => {
     assert.equal(hardenedCheckoutCount, checkoutCount);
 
     assert.match(workflow, /node-version: '24\.19\.0'/);
-    assert.match(workflow, /python-version: '3\.12\.12'/);
+    assert.match(workflow, /python-version: '3\.12\.10'/);
     assert.match(workflow, /version: '0\.10\.7'/);
     assert.match(workflow, /go-version: '1\.26\.6'/);
     assert.match(workflow, /toolchain: '1\.97\.1'/);
@@ -180,6 +190,18 @@ describe('setup-ci file plan', () => {
     );
 
     assert.equal(checkedIn, generated);
+  });
+
+  it('pins the host macOS workflow to the available Darwin ARM64 Python patch', async () => {
+    const workflow = await fs.readFile(
+      path.join(import.meta.dirname, '..', '.github', 'workflows', 'host-macos.yml'),
+      'utf8',
+    );
+
+    assert.match(workflow, /Host control \(macOS 15, Python 3\.12\.10\)/);
+    assert.match(workflow, /python-version: '3\.12\.10'/);
+    assert.match(workflow, /uv sync --locked --group dev --python 3\.12\.10/);
+    assert.doesNotMatch(workflow, /3\.12\.12/);
   });
 
   it('disables SwiftLint cache in generated CI', () => {

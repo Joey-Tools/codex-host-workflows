@@ -416,7 +416,7 @@ default_max_age_minutes = 60
 name = "codex-host-workflows"
 url = "{control_remote}"
 default_branch = "master"
-visibility = "private"
+visibility = "public"
 '''
 
 

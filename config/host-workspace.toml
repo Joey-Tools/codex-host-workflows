@@ -26,4 +26,4 @@ default_max_age_minutes = 60
 name = "codex-host-workflows"
 url = "git@github.com:Joey-Tools/codex-host-workflows.git"
 default_branch = "master"
-visibility = "private"
+visibility = "public"
