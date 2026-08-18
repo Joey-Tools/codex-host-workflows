@@ -2524,6 +2524,9 @@ def test_git_and_helper_environments_disable_executable_fsmonitor(tmp_path: Path
     assert overrides["protocol.ext.allow"] == "never"
     assert helper_environment["GIT_NO_REPLACE_OBJECTS"] == "1"
     assert helper_environment["GIT_GRAFT_FILE"] == "/dev/null"
+    assert "GIT_ALTERNATE_OBJECT_DIRECTORIES" not in helper_environment
+    assert "GIT_OBJECT_DIRECTORY" not in helper_environment
+    assert "GIT_COMMON_DIR" not in helper_environment
 
 
 @pytest.mark.parametrize(
@@ -2542,6 +2545,12 @@ def test_git_and_helper_environments_disable_executable_fsmonitor(tmp_path: Path
         ("core", "bare = true"),
         ("core", "bare"),
         ("core", "bare = false\n\tbare = false"),
+        ("core", "alternateRefsCommand = /tmp/hostile-alternate-refs"),
+        ("core", "alternateRefsCommand"),
+        (
+            "core",
+            "alternateRefsCommand = false\n\talternateRefsCommand = false",
+        ),
     ],
 )
 def test_git_local_config_rejects_executable_or_redirected_behavior_before_git(
@@ -2757,6 +2766,410 @@ def test_git_worktree_config_creation_during_command_fails_post_revalidation(
         hs._run_git(mirror, "status", "--porcelain=v1")
 
     assert started
+
+
+@pytest.mark.parametrize(
+    ("leaf_kind", "expected_error"),
+    [
+        ("symlink", "leaf is a symlink"),
+        ("nonregular", "leaf is not a regular file"),
+        ("file", "regular file is present"),
+    ],
+)
+def test_git_commondir_redirect_leaf_is_rejected_without_following(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    leaf_kind: str,
+    expected_error: str,
+) -> None:
+    fixture = _build_host(tmp_path)
+    active = _active(fixture)
+    manifest = hs._load_main_manifest(active)
+    mirror = fixture.config.cache_root / "repos" / "alpha"
+    commondir = mirror / ".git" / "commondir"
+    external = tmp_path / "external-commondir"
+    external.write_text("../external-common\n", encoding="utf-8")
+    if leaf_kind == "symlink":
+        commondir.symlink_to(external)
+    elif leaf_kind == "nonregular":
+        commondir.mkdir()
+    else:
+        commondir.write_text("../external-common\n", encoding="utf-8")
+
+    started = False
+
+    def forbidden_run(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        nonlocal started
+        started = True
+        raise AssertionError("Git must not start when commondir redirects its object source")
+
+    monkeypatch.setattr(hs.CommandRunner, "run", forbidden_run)
+    with pytest.raises(
+        hs.SetupError,
+        match=rf"Git common-directory redirect {expected_error}",
+    ):
+        hs._run_git(mirror, "status", "--porcelain=v1")
+    runner = FakeRunner()
+    with pytest.raises(
+        hs.SetupError,
+        match=rf"Git common-directory redirect {expected_error}",
+    ):
+        hs._run_helper(
+            active,
+            manifest,
+            ["status", "--repo", manifest.repos[0].name],
+            runner,
+        )
+
+    assert started is False
+    assert runner.calls == []
+    if leaf_kind == "symlink":
+        assert commondir.is_symlink()
+        assert external.read_text(encoding="utf-8") == "../external-common\n"
+
+
+@pytest.mark.parametrize("entrypoint", ["git", "helper"])
+def test_git_commondir_creation_during_command_fails_revalidation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    entrypoint: str,
+) -> None:
+    fixture = _build_host(tmp_path)
+    active = _active(fixture)
+    manifest = hs._load_main_manifest(active)
+    mirror = fixture.config.cache_root / "repos" / "alpha"
+    commondir = mirror / ".git" / "commondir"
+    started = False
+
+    def create_commondir() -> None:
+        nonlocal started
+        started = True
+        commondir.write_text("../external-common\n", encoding="utf-8")
+
+    if entrypoint == "git":
+
+        def create_during_git(
+            _runner: hs.CommandRunner,
+            argv: Sequence[str],
+            **_kwargs: object,
+        ) -> subprocess.CompletedProcess[str]:
+            create_commondir()
+            return subprocess.CompletedProcess(list(argv), 0, "", "")
+
+        monkeypatch.setattr(hs.CommandRunner, "run", create_during_git)
+        with pytest.raises(
+            hs.SetupError,
+            match="Git common-directory redirect regular file is present",
+        ):
+            hs._run_git(mirror, "status", "--porcelain=v1")
+    else:
+
+        def create_during_helper(_args: list[str]) -> None:
+            create_commondir()
+
+        runner = FakeRunner(on_helper=create_during_helper)
+        with pytest.raises(
+            hs.SetupError,
+            match="Git common-directory redirect regular file is present",
+        ):
+            hs._run_helper(
+                active,
+                manifest,
+                ["status", "--repo", manifest.repos[0].name],
+                runner,
+            )
+
+    assert started
+
+
+@pytest.mark.parametrize(
+    ("leaf_name", "label"),
+    [
+        ("alternates", "Git object alternates"),
+        ("http-alternates", "Git HTTP object alternates"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("leaf_kind", "expected_error"),
+    [
+        ("symlink", "leaf is a symlink"),
+        ("directory", "leaf is not a regular file"),
+        ("regular", "regular file is present"),
+        ("unreadable", "regular file is unreadable"),
+    ],
+)
+def test_git_alternate_object_source_leaf_is_rejected_without_following(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    leaf_name: str,
+    label: str,
+    leaf_kind: str,
+    expected_error: str,
+) -> None:
+    fixture = _build_host(tmp_path)
+    active = _active(fixture)
+    manifest = hs._load_main_manifest(active)
+    mirror = fixture.config.cache_root / "repos" / "alpha"
+    object_info = mirror / ".git" / "objects" / "info"
+    object_info.mkdir(exist_ok=True)
+    leaf = object_info / leaf_name
+    external = tmp_path / f"external-{leaf_name}"
+    external.write_text("/tmp/external-object-store\n", encoding="utf-8")
+    if leaf_kind == "symlink":
+        leaf.symlink_to(external)
+    elif leaf_kind == "directory":
+        leaf.mkdir()
+    else:
+        leaf.write_text("/tmp/external-object-store\n", encoding="utf-8")
+
+    if leaf_kind == "unreadable":
+        real_open = hs.os.open
+
+        def deny_alternate_open(
+            path: os.PathLike[str] | str,
+            flags: int,
+            mode: int = 0o777,
+            *,
+            dir_fd: int | None = None,
+        ) -> int:
+            if path == leaf_name and dir_fd is not None:
+                raise PermissionError(errno.EACCES, "injected unreadable alternate source")
+            if dir_fd is None:
+                return real_open(path, flags, mode)
+            return real_open(path, flags, mode, dir_fd=dir_fd)
+
+        monkeypatch.setattr(hs.os, "open", deny_alternate_open)
+
+    started = False
+
+    def forbidden_run(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        nonlocal started
+        started = True
+        raise AssertionError("Git must not start when an alternate object source exists")
+
+    monkeypatch.setattr(hs.CommandRunner, "run", forbidden_run)
+    with pytest.raises(hs.SetupError, match=rf"{label} {expected_error}"):
+        hs._run_git(mirror, "status", "--porcelain=v1")
+    runner = FakeRunner()
+    with pytest.raises(hs.SetupError, match=rf"{label} {expected_error}"):
+        hs._run_helper(
+            active,
+            manifest,
+            ["status", "--repo", manifest.repos[0].name],
+            runner,
+        )
+
+    assert started is False
+    assert runner.calls == []
+    if leaf_kind == "symlink":
+        assert leaf.is_symlink()
+        assert external.read_text(encoding="utf-8") == "/tmp/external-object-store\n"
+
+
+def test_alternate_refs_command_and_object_store_are_blocked_before_child_execution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _build_host(tmp_path)
+    active = _active(fixture)
+    manifest = hs._load_main_manifest(active)
+    repo = manifest.repos[0]
+    mirror = manifest.repo_path(repo)
+    attack_probe = tmp_path / "alternate-attack-probe"
+    alternate = tmp_path / "alternate-repository"
+    for destination in (attack_probe, alternate):
+        subprocess.run(
+            [hs.GIT_EXECUTABLE, "clone", repo.url, str(destination)],
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+    alternate.joinpath("alternate-only.txt").write_text("alternate\n", encoding="utf-8")
+    _git(alternate, "add", "alternate-only.txt")
+    _git(
+        alternate,
+        "-c",
+        "user.name=Host Setup Test",
+        "-c",
+        "user.email=host-setup@example.invalid",
+        "commit",
+        "-m",
+        "alternate-only commit",
+    )
+    alternate_head = _git(alternate, "rev-parse", "HEAD")
+    alternate_objects = alternate / ".git" / "objects"
+    marker = tmp_path / "alternate-refs-command-invoked"
+    command = tmp_path / "hostile-alternate-refs"
+    command.write_text(
+        f"#!/bin/sh\nprintf invoked > {shlex.quote(str(marker))}\n"
+        f"printf '%s\\n' {shlex.quote(alternate_head)}\n",
+        encoding="utf-8",
+    )
+    command.chmod(0o755)
+
+    def install_alternate_source(repository: Path) -> None:
+        local_config = repository / ".git" / "config"
+        local_config.write_text(
+            local_config.read_text(encoding="utf-8")
+            + f"\n[core]\n\talternateRefsCommand = {command}\n",
+            encoding="utf-8",
+        )
+        repository.joinpath(".git", "objects", "info", "alternates").write_text(
+            f"{alternate_objects}\n",
+            encoding="utf-8",
+        )
+
+    install_alternate_source(attack_probe)
+    unguarded = subprocess.run(
+        [hs.GIT_EXECUTABLE, "rev-list", "--alternate-refs", "--all"],
+        cwd=attack_probe,
+        check=False,
+        text=True,
+        capture_output=True,
+        env={**os.environ, "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1"},
+    )
+    assert unguarded.returncode == 0, unguarded
+    assert alternate_head in unguarded.stdout.splitlines()
+    assert marker.read_text(encoding="utf-8") == "invoked"
+    marker.unlink()
+
+    install_alternate_source(mirror)
+    git_started = False
+
+    def forbidden_git_start(
+        _runner: hs.CommandRunner,
+        argv: Sequence[str],
+        **_kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
+        nonlocal git_started
+        git_started = True
+        raise AssertionError(f"protected Git child started: {argv}")
+
+    monkeypatch.setattr(hs.CommandRunner, "run", forbidden_git_start)
+    with pytest.raises(hs.SetupError, match="core.alternaterefscommand"):
+        hs._run_git(mirror, "rev-list", "--alternate-refs", "--all")
+    runner = FakeRunner()
+    with pytest.raises(hs.SetupError, match="core.alternaterefscommand"):
+        hs._run_helper(active, manifest, ["status", "--repo", repo.name], runner)
+
+    assert not marker.exists()
+    assert git_started is False
+    assert runner.calls == []
+
+
+@pytest.mark.parametrize(
+    ("leaf_name", "label"),
+    [
+        ("alternates", "Git object alternates"),
+        ("http-alternates", "Git HTTP object alternates"),
+    ],
+)
+@pytest.mark.parametrize("entrypoint", ["git", "helper"])
+def test_git_alternate_object_source_creation_during_command_fails_revalidation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    leaf_name: str,
+    label: str,
+    entrypoint: str,
+) -> None:
+    fixture = _build_host(tmp_path)
+    active = _active(fixture)
+    manifest = hs._load_main_manifest(active)
+    mirror = fixture.config.cache_root / "repos" / "alpha"
+    leaf = mirror / ".git" / "objects" / "info" / leaf_name
+    started = False
+
+    def create_during_git(
+        _runner: hs.CommandRunner,
+        argv: Sequence[str],
+        **_kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
+        nonlocal started
+        started = True
+        leaf.write_text("/tmp/external-object-store\n", encoding="utf-8")
+        return subprocess.CompletedProcess(list(argv), 0, "", "")
+
+    if entrypoint == "git":
+        monkeypatch.setattr(hs.CommandRunner, "run", create_during_git)
+        with pytest.raises(hs.SetupError, match=rf"{label} regular file is present"):
+            hs._run_git(mirror, "status", "--porcelain=v1")
+    else:
+
+        def create_during_helper(_args: list[str]) -> None:
+            nonlocal started
+            started = True
+            leaf.write_text("/tmp/external-object-store\n", encoding="utf-8")
+
+        runner = FakeRunner(on_helper=create_during_helper)
+        with pytest.raises(hs.SetupError, match=rf"{label} regular file is present"):
+            hs._run_helper(
+                active,
+                manifest,
+                ["status", "--repo", manifest.repos[0].name],
+                runner,
+            )
+
+    assert started
+
+
+def test_git_object_info_access_policy_change_during_command_fails_revalidation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _build_host(tmp_path)
+    mirror = fixture.config.cache_root / "repos" / "alpha"
+    object_info = mirror / ".git" / "objects" / "info"
+    original_mode = stat.S_IMODE(object_info.stat().st_mode)
+
+    def tighten_during_git(
+        _runner: hs.CommandRunner,
+        argv: Sequence[str],
+        **_kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
+        object_info.chmod(0o700 if original_mode != 0o700 else 0o500)
+        return subprocess.CompletedProcess(list(argv), 0, "", "")
+
+    monkeypatch.setattr(hs.CommandRunner, "run", tighten_during_git)
+    with pytest.raises(
+        hs.SetupError,
+        match="Git object info directory identity or access policy changed",
+    ):
+        hs._run_git(mirror, "status", "--porcelain=v1")
+
+
+def test_git_fetch_allows_ordinary_object_churn_with_stable_source_boundary(
+    tmp_path: Path,
+) -> None:
+    fixture = _build_host(tmp_path)
+    active = _active(fixture)
+    manifest = hs._load_main_manifest(active)
+    repo = manifest.repos[0]
+    mirror = manifest.repo_path(repo)
+    updater = tmp_path / "ordinary-object-updater"
+    subprocess.run(
+        [hs.GIT_EXECUTABLE, "clone", repo.url, str(updater)],
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+    updater.joinpath("ordinary-object.txt").write_text("new object\n", encoding="utf-8")
+    _commit_and_push(updater, Path(repo.url), "ordinary object churn")
+
+    guard = hs._inspect_git_topology_replacements(mirror)
+    result = hs._run_git(
+        mirror,
+        "-c",
+        "protocol.file.allow=always",
+        "fetch",
+        "origin",
+    )
+
+    assert result.returncode == 0
+    assert guard.alternate_object_sources_absent is True
+    assert _git(mirror, "rev-parse", "origin/master") == _git(updater, "rev-parse", "HEAD")
+    object_info = mirror / ".git" / "objects" / "info"
+    assert not object_info.joinpath("alternates").exists()
+    assert not object_info.joinpath("http-alternates").exists()
 
 
 def test_helper_rejects_local_config_drift_after_child_without_executing_marker(

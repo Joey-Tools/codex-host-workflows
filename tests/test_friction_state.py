@@ -3613,6 +3613,236 @@ def test_store_distinguishes_benign_metadata_churn_identity_and_content_change(
         store.close()
 
 
+def test_state_directory_binding_ignores_child_churn_and_classifies_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "state"
+    year = root / "cases" / "2026"
+    displaced = root / "cases" / ".2026-displaced"
+    store = fs.StateStore(root)
+    store.acquire_lock()
+    real_stat = fs.os.stat
+    try:
+        store.write_json(Path("cases") / "2026" / "one.json", {"value": 1})
+        assert set(store._directory_bindings) == {("cases",), ("cases", "2026")}
+        original_limit = fs.MAX_RETAINED_STATE_DIRECTORIES
+        monkeypatch.setattr(fs, "MAX_RETAINED_STATE_DIRECTORIES", 2)
+        with pytest.raises(fs.StateError, match="binding limit exceeded") as bounded:
+            with store.open_dir(Path("receipts") / "stage", create=True):
+                pass
+        assert bounded.value.code == "state-directory-binding-limit"
+        assert not (root / "receipts").exists()
+        monkeypatch.setattr(fs, "MAX_RETAINED_STATE_DIRECTORIES", original_limit)
+
+        original_rename = fs._rename_state_directory_noreplace
+
+        def lose_directory_publication_race(
+            parent_fd: int,
+            source_name: str,
+            target_name: str,
+            path: Path,
+        ) -> None:
+            del source_name, path
+            os.mkdir(target_name, 0o700, dir_fd=parent_fd)
+            raise FileExistsError(fs.errno.EEXIST, "injected no-replace race", target_name)
+
+        monkeypatch.setattr(
+            fs,
+            "_rename_state_directory_noreplace",
+            lose_directory_publication_race,
+        )
+        with pytest.raises(fs.StateError, match="lost a no-replace race") as creation_race:
+            with store.open_dir(Path("receipts"), create=True):
+                pass
+        assert creation_race.value.code == "state-directory-replaced"
+        assert ("receipts",) not in store._directory_bindings
+        assert (
+            sorted(path.name for path in root.iterdir() if path.name.startswith(".receipts.dir-"))
+            == []
+        )
+        (root / "receipts").rmdir()
+        monkeypatch.setattr(fs, "_rename_state_directory_noreplace", original_rename)
+
+        transient = year / "transient"
+        transient.mkdir(mode=0o700)
+        transient.rmdir()
+        store._bind_state_namespace("benign root-relative child churn")
+
+        year.chmod(0o750)
+        with pytest.raises(fs.StateError, match="owner or mode is unsafe") as policy:
+            store._bind_state_namespace("root-relative mode drift")
+        assert policy.value.code == "state-directory-policy-changed"
+        year.chmod(0o700)
+
+        year_binding = store._directory_bindings[("cases", "2026")]
+
+        def deny_named_stat(path: Any, *args: Any, **kwargs: Any) -> os.stat_result:
+            if path == "2026" and kwargs.get("dir_fd") == year_binding.parent_fd:
+                raise PermissionError(fs.errno.EACCES, "injected unreadable directory", path)
+            return real_stat(path, *args, **kwargs)
+
+        monkeypatch.setattr(fs.os, "stat", deny_named_stat)
+        with pytest.raises(fs.StateError, match="name became unreadable") as unreadable:
+            store._bind_state_namespace("root-relative unreadable name")
+        assert unreadable.value.code == "state-directory-unreadable"
+        monkeypatch.setattr(fs.os, "stat", real_stat)
+
+        year.rename(displaced)
+        with pytest.raises(fs.StateError, match="name disappeared") as missing:
+            store._bind_state_namespace("root-relative missing name")
+        assert missing.value.code == "state-directory-missing"
+
+        year.mkdir(mode=0o700)
+        with pytest.raises(fs.StateError, match="name was rebound") as replaced:
+            store._bind_state_namespace("root-relative replacement")
+        assert replaced.value.code == "state-directory-replaced"
+        year.rmdir()
+        displaced.rename(year)
+        store.finish()
+    finally:
+        monkeypatch.setattr(fs.os, "stat", real_stat)
+        if displaced.exists():
+            if year.exists():
+                year.rmdir()
+            displaced.rename(year)
+        store.close()
+
+
+def test_transaction_rejects_rebound_wal_operation_before_commit_and_recovers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "state"
+    operation_dir = root / "wal" / "stage"
+    displaced = root / "wal" / ".stage-displaced"
+    store = fs.StateStore(root)
+    store.acquire_lock()
+    write = fs._planned_write(store, Path("probe.json"), {"value": 1}, immutable=False)
+    original_apply = fs._apply_wal_intent
+    replaced = False
+
+    def replace_operation_after_apply(current: Any, intent: dict[str, Any]) -> None:
+        nonlocal replaced
+        original_apply(current, intent)
+        if current is store and not replaced:
+            replaced = True
+            operation_dir.rename(displaced)
+            operation_dir.mkdir(mode=0o700)
+
+    monkeypatch.setattr(fs, "_apply_wal_intent", replace_operation_after_apply)
+    try:
+        with pytest.raises(fs.StateError, match="name was rebound") as raised:
+            fs._run_transaction(
+                store,
+                operation="stage",
+                natural_key="rebound-wal-operation",
+                request={"operation": "rebound-wal-operation"},
+                captured_at="2026-07-10T12:00:00Z",
+                writes=[write],
+                result={"status": "recovered"},
+            )
+        assert raised.value.code == "state-directory-replaced"
+        assert replaced
+
+        intent_path, commit_path = fs._wal_paths("stage", "rebound-wal-operation")
+        assert not (root / commit_path).exists()
+        assert (displaced / intent_path.name).exists()
+        assert not (displaced / commit_path.name).exists()
+
+        operation_dir.rmdir()
+        displaced.rename(operation_dir)
+        monkeypatch.setattr(fs, "_apply_wal_intent", original_apply)
+        result = fs._run_transaction(
+            store,
+            operation="stage",
+            natural_key="rebound-wal-operation",
+            request={"operation": "rebound-wal-operation"},
+            captured_at="2026-07-10T12:00:00Z",
+            writes=[write],
+            result={"status": "recovered"},
+        )
+        assert result == {"status": "recovered"}
+        assert (root / commit_path).exists()
+        store.finish()
+    finally:
+        monkeypatch.setattr(fs, "_apply_wal_intent", original_apply)
+        if displaced.exists():
+            if operation_dir.exists():
+                operation_dir.rmdir()
+            displaced.rename(operation_dir)
+        store.close()
+
+
+def test_transaction_rejects_rebound_after_image_directory_and_recovery_is_deterministic(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "state"
+    year = root / "cases" / "2026"
+    displaced = root / "cases" / ".2026-displaced"
+    store = fs.StateStore(root)
+    store.acquire_lock()
+    write = fs._planned_write(
+        store,
+        Path("cases") / "2026" / "probe.json",
+        {"value": 1},
+        immutable=False,
+    )
+    original_bind = fs.StateStore._bind_state_namespace
+    injected = False
+
+    def replace_after_publication_preflight(current: Any, phase: str) -> None:
+        nonlocal injected
+        original_bind(current, phase)
+        if (
+            current is store
+            and phase == "before publication"
+            and ("cases", "2026") in current._directory_bindings
+            and not injected
+        ):
+            injected = True
+            year.rename(displaced)
+            year.mkdir(mode=0o700)
+
+    monkeypatch.setattr(
+        fs.StateStore,
+        "_bind_state_namespace",
+        replace_after_publication_preflight,
+    )
+    try:
+        with pytest.raises(fs.StateError, match="name was rebound") as raised:
+            fs._run_transaction(
+                store,
+                operation="stage",
+                natural_key="rebound-after-image-directory",
+                request={"operation": "rebound-after-image-directory"},
+                captured_at="2026-07-10T12:00:00Z",
+                writes=[write],
+                result={"status": "recovered"},
+            )
+        assert raised.value.code == "state-directory-replaced"
+        assert injected
+
+        intent_path, commit_path = fs._wal_paths("stage", "rebound-after-image-directory")
+        assert (root / intent_path).exists()
+        assert not (root / commit_path).exists()
+        assert not (year / "probe.json").exists()
+        assert (displaced / "probe.json").exists()
+
+        year.rmdir()
+        displaced.rename(year)
+        monkeypatch.setattr(fs.StateStore, "_bind_state_namespace", original_bind)
+        fs._recover_pending_wal(store)
+        assert (year / "probe.json").exists()
+        assert (root / commit_path).exists()
+        store.finish()
+    finally:
+        monkeypatch.setattr(fs.StateStore, "_bind_state_namespace", original_bind)
+        if displaced.exists():
+            if year.exists():
+                year.rmdir()
+            displaced.rename(year)
+        store.close()
+
+
 def test_state_transaction_revalidates_full_ancestor_chain_before_commit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

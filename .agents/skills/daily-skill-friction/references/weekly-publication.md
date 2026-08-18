@@ -86,6 +86,16 @@ merge, or repair. Treat `selected_daily_snapshot_digest` as selection provenance
 and `planned_from_current_snapshot_digest` as planning provenance; neither replaces
 the per-case semantic selection binding.
 
+Within the live state root, retain a descriptor binding for every actual
+root-relative directory component used by the transaction, including WAL
+operation, case-year, receipt-category, and publication directories. Revalidate
+each directory's object identity, access policy, and parent-visible name before
+and after intent, after-image, commit, and recovery publications. Bind directory
+components only, never case, receipt, or transaction file leaves, and fail closed
+before exceeding 128 retained directory descriptors. Close retained descriptors
+from child to parent. Timestamps, directory size, link count, and ordinary child
+entry churn are not part of this binding.
+
 The output parent must already exist and be owner-private. The WAL persists the
 complete parent-visible name chain plus each directory's device/inode/type and
 effective POSIX owner/mode policy (including group identity only when the group

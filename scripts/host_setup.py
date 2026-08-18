@@ -278,15 +278,18 @@ class WorkspaceManifest:
 
 @dataclasses.dataclass(frozen=True)
 class GitTopologyGuard:
-    """Bind the administrative parents that must remain replacement-free."""
+    """Bind the administrative and object-source boundaries used by Git."""
 
     repository: Path
     repository_binding: Binding | None
     git_dir_binding: Binding | None
+    objects_binding: Binding | None
+    objects_info_binding: Binding | None
     refs_binding: Binding | None
     info_binding: Binding | None
     local_config_snapshot: FileSnapshot | None
     worktree_config_absent: bool | None
+    alternate_object_sources_absent: bool | None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -3106,6 +3109,68 @@ def _require_missing_git_worktree_config(parent_fd: int, git_dir: Path) -> bool:
     raise SetupError(f"Git worktree config regular file is present: {path}")
 
 
+def _require_missing_git_external_source_leaf(
+    parent_fd: int,
+    name: str,
+    *,
+    parent_path: Path,
+    label: str,
+) -> None:
+    """Reject an external Git source redirect without following its leaf."""
+
+    path = parent_path / name
+    try:
+        metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    except PermissionError as error:
+        raise SetupError(f"{label} absence is unreadable: {path}") from error
+    except OSError as error:
+        raise SetupError(
+            f"{label} absence could not be inspected: {path}: "
+            f"{error.strerror or type(error).__name__}"
+        ) from error
+    if stat.S_ISLNK(metadata.st_mode):
+        raise SetupError(f"{label} leaf is a symlink: {path}")
+    if not stat.S_ISREG(metadata.st_mode):
+        raise SetupError(f"{label} leaf is not a regular file: {path}")
+
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+    flags |= getattr(os, "O_NONBLOCK", 0)
+    try:
+        descriptor = os.open(name, flags, dir_fd=parent_fd)
+    except PermissionError as error:
+        raise SetupError(f"{label} regular file is unreadable: {path}") from error
+    except FileNotFoundError as error:
+        raise SetupError(f"{label} leaf changed while being inspected: {path}") from error
+    except OSError as error:
+        raise SetupError(
+            f"{label} regular file could not be opened without following links: "
+            f"{path}: {error.strerror or type(error).__name__}"
+        ) from error
+    try:
+        rebound = os.fstat(descriptor)
+        if not stat.S_ISREG(rebound.st_mode) or _binding_tuple(rebound) != _binding_tuple(metadata):
+            raise SetupError(f"{label} leaf changed while being opened: {path}")
+    finally:
+        os.close(descriptor)
+    raise SetupError(f"{label} regular file is present: {path}")
+
+
+def _require_missing_git_object_sources(parent_fd: int, parent_path: Path) -> bool:
+    for name, label in (
+        ("alternates", "Git object alternates"),
+        ("http-alternates", "Git HTTP object alternates"),
+    ):
+        _require_missing_git_external_source_leaf(
+            parent_fd,
+            name,
+            parent_path=parent_path,
+            label=label,
+        )
+    return True
+
+
 def _packed_refs_contains_replace_ref(data: bytes) -> bool:
     for line in data.splitlines():
         if not line or line.startswith((b"#", b"^")):
@@ -3171,6 +3236,7 @@ def _git_config_key_is_unsafe(key: str) -> bool:
     if section == "filter" and leaf in {"clean", "smudge", "process"}:
         return True
     if section == "core" and leaf in {
+        "alternaterefscommand",
         "askpass",
         "attributesfile",
         "editor",
@@ -3231,8 +3297,9 @@ def _inspect_git_topology_replacements(
     """Reject Git topology substitution and bind its administrative parents.
 
     Object identity and access policy are protected for the repository, ``.git``,
-    and any existing ``refs``/``info`` parents. Packed refs may legitimately be
-    rewritten by fetch, so only the absence of replacement refs is revalidated.
+    the common object directory, and any existing object/ref metadata parents.
+    Ordinary loose/pack object and ref churn is allowed. The complete external
+    object-source set and replacement topology must remain absent.
     """
 
     repository_fd, repository_binding = _open_real_directory(
@@ -3241,6 +3308,8 @@ def _inspect_git_topology_replacements(
         require_current_owner=True,
     )
     git_dir_opened: tuple[int, Binding] | None = None
+    objects_opened: tuple[int, Binding] | None = None
+    objects_info_opened: tuple[int, Binding] | None = None
     refs_opened: tuple[int, Binding] | None = None
     info_opened: tuple[int, Binding] | None = None
     try:
@@ -3267,6 +3336,12 @@ def _inspect_git_topology_replacements(
                 raise SetupError(
                     f"Git topology .git identity or access policy changed: {repository / '.git'}"
                 )
+        _require_missing_git_external_source_leaf(
+            git_fd,
+            "commondir",
+            parent_path=repository / ".git",
+            label="Git common-directory redirect",
+        )
         local_config = _snapshot_at(
             git_fd,
             "config",
@@ -3290,6 +3365,49 @@ def _inspect_git_topology_replacements(
         )
         if expected is not None and expected.worktree_config_absent is not True:
             raise SetupError("Git worktree config absence baseline is invalid")
+
+        objects_opened = _open_optional_child_directory(
+            git_fd,
+            repository / ".git",
+            "objects",
+            label="Git common object directory",
+        )
+        if objects_opened is None:
+            raise SetupError(
+                f"Git common object directory is missing: {repository / '.git' / 'objects'}"
+            )
+        objects_fd, objects_binding = objects_opened
+        if expected is not None:
+            if expected.objects_binding is None or _directory_binding_tuple(
+                objects_binding
+            ) != _directory_binding_tuple(expected.objects_binding):
+                raise SetupError(
+                    f"Git common object directory identity or access policy changed: "
+                    f"{repository / '.git' / 'objects'}"
+                )
+        objects_info_opened = _open_optional_child_directory(
+            objects_fd,
+            repository / ".git" / "objects",
+            "info",
+            label="Git object info directory",
+        )
+        objects_info_binding = objects_info_opened[1] if objects_info_opened is not None else None
+        if expected is not None and expected.objects_info_binding is not None:
+            if objects_info_binding is None or _directory_binding_tuple(
+                objects_info_binding
+            ) != _directory_binding_tuple(expected.objects_info_binding):
+                raise SetupError(
+                    f"Git object info directory identity or access policy changed: "
+                    f"{repository / '.git' / 'objects' / 'info'}"
+                )
+        alternate_object_sources_absent = True
+        if objects_info_opened is not None:
+            alternate_object_sources_absent = _require_missing_git_object_sources(
+                objects_info_opened[0],
+                repository / ".git" / "objects" / "info",
+            )
+        if expected is not None and expected.alternate_object_sources_absent is not True:
+            raise SetupError("Git alternate object source absence baseline is invalid")
 
         refs_opened = _open_optional_child_directory(
             git_fd,
@@ -3356,6 +3474,34 @@ def _inspect_git_topology_replacements(
             git_dir_binding,
             label="Git topology .git directory",
         )
+        _directory_path_matches(
+            repository / ".git" / "objects",
+            objects_binding,
+            label="Git common object directory",
+        )
+        if objects_info_opened is not None:
+            _directory_path_matches(
+                repository / ".git" / "objects" / "info",
+                objects_info_opened[1],
+                label="Git object info directory",
+            )
+            _require_missing_git_object_sources(
+                objects_info_opened[0],
+                repository / ".git" / "objects" / "info",
+            )
+        else:
+            rebound_objects_info = _open_optional_child_directory(
+                objects_fd,
+                repository / ".git" / "objects",
+                "info",
+                label="Git object info directory revalidation",
+            )
+            if rebound_objects_info is not None:
+                os.close(rebound_objects_info[0])
+                raise SetupError(
+                    f"Git object info directory appeared while it was being inspected: "
+                    f"{repository / '.git' / 'objects' / 'info'}"
+                )
         if refs_opened is not None:
             _directory_path_matches(
                 repository / ".git" / "refs",
@@ -3402,22 +3548,35 @@ def _inspect_git_topology_replacements(
                 f"Git local config changed while it was being inspected: "
                 f"{repository / '.git' / 'config'}"
             )
+        _require_missing_git_external_source_leaf(
+            git_fd,
+            "commondir",
+            parent_path=repository / ".git",
+            label="Git common-directory redirect",
+        )
         if not _require_missing_git_worktree_config(git_fd, repository / ".git"):
             raise SetupError("Git worktree config absence revalidation failed")
         return GitTopologyGuard(
             repository=repository,
             repository_binding=repository_binding,
             git_dir_binding=git_dir_binding,
+            objects_binding=objects_binding,
+            objects_info_binding=objects_info_binding,
             refs_binding=refs_binding,
             info_binding=info_binding,
             local_config_snapshot=local_config,
             worktree_config_absent=worktree_config_absent,
+            alternate_object_sources_absent=alternate_object_sources_absent,
         )
     finally:
         if info_opened is not None:
             os.close(info_opened[0])
         if refs_opened is not None:
             os.close(refs_opened[0])
+        if objects_info_opened is not None:
+            os.close(objects_info_opened[0])
+        if objects_opened is not None:
+            os.close(objects_opened[0])
         if git_dir_opened is not None:
             os.close(git_dir_opened[0])
         os.close(repository_fd)
@@ -3431,7 +3590,7 @@ def _git_topology_replacement_check(repository: Path, *, prefix: str) -> Check:
     return Check(
         f"{prefix}-topology-replacements",
         "ready",
-        f"no Git replace refs or graft file: {repository}",
+        f"no Git replace refs, graft file, or alternate object source: {repository}",
     )
 
 
@@ -5210,7 +5369,20 @@ def _bind_helper_git_topology(
             guards.append(_inspect_git_topology_replacements(repository))
             continue
         if occupancy.status == "missing" and allow_missing:
-            guards.append(GitTopologyGuard(repository, None, None, None, None, None, None))
+            guards.append(
+                GitTopologyGuard(
+                    repository=repository,
+                    repository_binding=None,
+                    git_dir_binding=None,
+                    objects_binding=None,
+                    objects_info_binding=None,
+                    refs_binding=None,
+                    info_binding=None,
+                    local_config_snapshot=None,
+                    worktree_config_absent=None,
+                    alternate_object_sources_absent=None,
+                )
+            )
             continue
         raise SetupError(occupancy.detail)
     return tuple(guards)

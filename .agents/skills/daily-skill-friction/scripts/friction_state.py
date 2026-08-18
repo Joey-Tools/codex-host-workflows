@@ -41,6 +41,9 @@ MAX_WAL_JSON_BYTES = 64 * 1024 * 1024
 MAX_PREPARED_COMMANDS = 8
 MAX_PREPARED_COMMAND_CHARS = 512
 MAX_PREPARED_SIGNER_CHARS = 256
+MAX_RETAINED_STATE_DIRECTORIES = 128
+DARWIN_RENAME_EXCL = 0x00000004
+LINUX_RENAME_NOREPLACE = 0x00000001
 # Publication v1 bounds every non-case plan/active field (UUID, safe ID,
 # revision, digest, timestamp, repository, branch, and derived case path).  The
 # per-case reservations exceed their maximum canonical encodings, while the
@@ -1593,6 +1596,88 @@ def _safe_relative_parts(relative: Path | str) -> tuple[str, ...]:
     return parts
 
 
+def _rename_state_directory_noreplace(
+    parent_fd: int,
+    source_name: str,
+    target_name: str,
+    path: Path,
+) -> None:
+    """Atomically publish a bound directory without replacing any target."""
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    if sys.platform == "darwin":
+        try:
+            rename = libc.renameatx_np
+        except AttributeError:
+            _fail(
+                "state-directory-publication-unavailable",
+                "Darwin renameatx_np is unavailable for no-replace directory publication",
+            )
+        rename.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        rename.restype = ctypes.c_int
+        flags = DARWIN_RENAME_EXCL
+    elif sys.platform.startswith("linux"):
+        try:
+            rename = libc.renameat2
+        except AttributeError:
+            _fail(
+                "state-directory-publication-unavailable",
+                "Linux renameat2 is unavailable for no-replace directory publication",
+            )
+        rename.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        rename.restype = ctypes.c_int
+        flags = LINUX_RENAME_NOREPLACE
+    else:
+        _fail(
+            "state-directory-publication-unavailable",
+            f"no atomic no-replace directory publication primitive for {sys.platform}",
+        )
+    ctypes.set_errno(0)
+    status = rename(
+        parent_fd,
+        os.fsencode(source_name),
+        parent_fd,
+        os.fsencode(target_name),
+        flags,
+    )
+    if status == 0:
+        return
+    error = ctypes.get_errno()
+    if error in {errno.EEXIST, errno.ENOTEMPTY}:
+        raise FileExistsError(error, os.strerror(error), target_name)
+    if error == errno.ENOENT:
+        _fail(
+            "state-directory-missing",
+            f"temporary state directory disappeared before publication: {path}",
+        )
+    if error in {errno.EACCES, errno.EPERM}:
+        _fail(
+            "state-directory-unreadable",
+            f"cannot publish state directory {path}: {os.strerror(error)}",
+        )
+    if error in {errno.ELOOP, errno.ENOTDIR}:
+        _fail(
+            "state-directory-replaced",
+            f"state directory parent was replaced during publication: {path}",
+        )
+    _fail(
+        "state-directory-revalidation-failed",
+        f"could not publish state directory {path}: {os.strerror(error)}",
+    )
+
+
 def _json_limit_for_parts(parts: Sequence[str]) -> int:
     if parts and parts[0] == "wal":
         return MAX_WAL_JSON_BYTES
@@ -1611,12 +1696,30 @@ class _ImmutablePublicationCapture:
         self.identity: tuple[int, int] | None = None
 
 
+class _StateDirectoryBinding:
+    """Retained proof for one root-relative state directory component."""
+
+    def __init__(
+        self,
+        parts: tuple[str, ...],
+        fd: int,
+        parent_fd: int,
+        signal: tuple[int, int, int, int, int, int, str],
+    ) -> None:
+        self.parts = parts
+        self.fd = fd
+        self.parent_fd = parent_fd
+        self.name = parts[-1]
+        self.signal = signal
+
+
 class StateStore:
     """Descriptor-rooted owner-private state storage.
 
     The retained directory descriptors protect the complete path from the
-    filesystem root through the selected state root.  Every path component is
-    bound to its object identity, type, access policy, and parent-visible name.
+    filesystem root through the selected state root and every root-relative
+    directory used by the transaction.  Every path component is bound to its
+    object identity, type, access policy, and parent-visible name.
     Timestamps and directory link counts are deliberately excluded because
     ordinary child-entry churn can change them without replacing the protected
     object or its access policy.  Every child lookup is relative to a validated
@@ -1642,6 +1745,7 @@ class StateStore:
         self.lock_fd = -1
         self.lock_identity: tuple[int, int, int] | None = None
         self._sensitive_root = sensitive_root
+        self._directory_bindings: dict[tuple[str, ...], _StateDirectoryBinding] = {}
         self._immutable_publication_capture: _ImmutablePublicationCapture | None = None
         try:
             self._open_root(create=create)
@@ -1775,6 +1879,9 @@ class StateStore:
         if self.lock_fd >= 0:
             os.close(self.lock_fd)
             self.lock_fd = -1
+        for parts in sorted(self._directory_bindings, key=len, reverse=True):
+            os.close(self._directory_bindings[parts].fd)
+        self._directory_bindings.clear()
         if self.root_fd >= 0:
             os.close(self.root_fd)
             self.root_fd = -1
@@ -1960,7 +2067,7 @@ class StateStore:
             _fail("lock-replaced", f"state lock identity changed {phase}")
 
     def finish(self) -> None:
-        self._bind_state_chain("transaction completion")
+        self._bind_state_namespace("transaction completion")
         self._bind_lock("at transaction completion")
 
     def relative(self, path: Path) -> Path:
@@ -1970,32 +2077,320 @@ class StateStore:
         except ValueError:
             _fail("outside-state-root", f"path is outside state root: {path}")
 
+    @staticmethod
+    def _state_directory_stat_signal(
+        info: os.stat_result,
+        path: Path,
+    ) -> tuple[int, int, int, int, int, int]:
+        """Return nested-directory identity and POSIX access-policy signals."""
+
+        if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+            _fail("state-directory-replaced", f"state directory is not a directory: {path}")
+        permissions = stat.S_IMODE(info.st_mode)
+        if info.st_uid != os.geteuid() or permissions & 0o077:
+            _fail(
+                "state-directory-policy-changed",
+                f"state directory owner or mode is unsafe: {path}",
+            )
+        group_bits = (permissions & stat.S_IRWXG) >> 3
+        other_bits = permissions & stat.S_IRWXO
+        return (
+            info.st_dev,
+            info.st_ino,
+            stat.S_IFMT(info.st_mode),
+            info.st_uid,
+            info.st_gid if group_bits != other_bits else -1,
+            permissions,
+        )
+
+    def _state_directory_signal(
+        self,
+        fd: int,
+        parts: tuple[str, ...],
+    ) -> tuple[int, int, int, int, int, int, str]:
+        path = self.root / Path(*parts)
+        try:
+            info = os.fstat(fd)
+        except OSError as exc:
+            _fail(
+                "state-directory-revalidation-failed",
+                f"could not inspect retained state directory {path}: {exc}",
+            )
+        signal = self._state_directory_stat_signal(info, path)
+        try:
+            acl_digest = _acl_digest(fd, str(path), sensitive=True)
+        except StateError as exc:
+            if exc.code in {"state-acl-present", "custody-acl-allows-access"}:
+                _fail(
+                    "state-directory-policy-changed",
+                    f"state directory ACL is unsafe: {path}",
+                )
+            if exc.code == "acl-revalidation-failed":
+                _fail(
+                    "state-directory-revalidation-failed",
+                    f"could not revalidate state directory ACL: {path}",
+                )
+            raise
+        return (*signal, acl_digest)
+
+    @staticmethod
+    def _open_state_directory_component(
+        parent_fd: int,
+        name: str,
+        path: Path,
+    ) -> int:
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+        try:
+            return os.open(name, flags, dir_fd=parent_fd)
+        except FileNotFoundError:
+            raise
+        except PermissionError as exc:
+            _fail(
+                "state-directory-unreadable",
+                f"state directory is unreadable: {path}: {exc}",
+            )
+        except OSError as exc:
+            if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+                _fail(
+                    "state-directory-replaced",
+                    f"state directory is no longer a directory: {path}",
+                )
+            _fail(
+                "state-directory-revalidation-failed",
+                f"could not open state directory {path}: {exc}",
+            )
+
+    def _validate_state_directory_binding(
+        self,
+        binding: _StateDirectoryBinding,
+        phase: str,
+    ) -> None:
+        path = self.root / Path(*binding.parts)
+        opened = self._state_directory_signal(binding.fd, binding.parts)
+        if opened[:3] != binding.signal[:3]:
+            _fail(
+                "state-directory-replaced",
+                f"retained state directory identity changed during {phase}: {path}",
+            )
+        if opened[3:] != binding.signal[3:]:
+            _fail(
+                "state-directory-policy-changed",
+                f"retained state directory policy changed during {phase}: {path}",
+            )
+        try:
+            named = os.stat(binding.name, dir_fd=binding.parent_fd, follow_symlinks=False)
+        except (FileNotFoundError, NotADirectoryError):
+            _fail(
+                "state-directory-missing",
+                f"state directory name disappeared during {phase}: {path}",
+            )
+        except PermissionError as exc:
+            _fail(
+                "state-directory-unreadable",
+                f"state directory name became unreadable during {phase}: {path}: {exc}",
+            )
+        except OSError as exc:
+            _fail(
+                "state-directory-revalidation-failed",
+                f"could not inspect state directory name during {phase}: {path}: {exc}",
+            )
+        named_signal = (*self._state_directory_stat_signal(named, path), opened[6])
+        if named_signal[:3] != binding.signal[:3]:
+            _fail(
+                "state-directory-replaced",
+                f"state directory name was rebound during {phase}: {path}",
+            )
+        if named_signal[3:] != binding.signal[3:]:
+            _fail(
+                "state-directory-policy-changed",
+                f"state directory name policy changed during {phase}: {path}",
+            )
+
+    def _bind_state_namespace(self, phase: str) -> None:
+        """Revalidate the absolute root and every retained root-relative directory."""
+
+        self._bind_state_chain(phase)
+        for parts in sorted(self._directory_bindings, key=lambda item: (len(item), item)):
+            binding = self._directory_bindings[parts]
+            parent_fd = self.root_fd if len(parts) == 1 else self._directory_bindings[parts[:-1]].fd
+            if binding.parent_fd != parent_fd:
+                _fail(
+                    "invalid-state-directory-binding",
+                    f"state directory parent binding is inconsistent: {Path(*parts)}",
+                )
+            self._validate_state_directory_binding(binding, phase)
+
+    def _retain_state_directory(
+        self,
+        parts: tuple[str, ...],
+        parent_fd: int,
+        fd: int,
+    ) -> _StateDirectoryBinding:
+        if len(self._directory_bindings) >= MAX_RETAINED_STATE_DIRECTORIES:
+            os.close(fd)
+            _fail(
+                "state-directory-binding-limit",
+                "retained state directory binding limit exceeded",
+            )
+        try:
+            signal = self._state_directory_signal(fd, parts)
+            binding = _StateDirectoryBinding(parts, fd, parent_fd, signal)
+            self._validate_state_directory_binding(binding, "initial binding")
+        except Exception:
+            os.close(fd)
+            raise
+        self._directory_bindings[parts] = binding
+        return binding
+
+    def _create_state_directory(
+        self,
+        parts: tuple[str, ...],
+        parent_fd: int,
+    ) -> _StateDirectoryBinding:
+        path = self.root / Path(*parts)
+        name = parts[-1]
+        temporary = f".{name}.dir-{os.getpid()}-{secrets.token_hex(8)}"
+        if len(self._directory_bindings) >= MAX_RETAINED_STATE_DIRECTORIES:
+            _fail(
+                "state-directory-binding-limit",
+                "retained state directory binding limit exceeded",
+            )
+        self._bind_state_namespace("before state directory creation")
+        try:
+            os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        except PermissionError as exc:
+            _fail(
+                "state-directory-unreadable",
+                f"state directory creation target is unreadable: {path}: {exc}",
+            )
+        except OSError as exc:
+            _fail(
+                "state-directory-revalidation-failed",
+                f"could not inspect state directory creation target {path}: {exc}",
+            )
+        else:
+            _fail(
+                "state-directory-replaced",
+                f"state directory appeared during creation: {path}",
+            )
+        fd = -1
+        temporary_binding: _StateDirectoryBinding | None = None
+        published = False
+        try:
+            os.mkdir(temporary, 0o700, dir_fd=parent_fd)
+        except FileExistsError:
+            _fail(
+                "state-directory-replaced",
+                f"state directory temporary unexpectedly exists: {path}",
+            )
+        except PermissionError as exc:
+            _fail(
+                "state-directory-unreadable",
+                f"cannot create state directory {path}: {exc}",
+            )
+        except OSError as exc:
+            _fail(
+                "state-directory-revalidation-failed",
+                f"could not create state directory {path}: {exc}",
+            )
+        try:
+            try:
+                fd = self._open_state_directory_component(parent_fd, temporary, path)
+            except FileNotFoundError:
+                _fail(
+                    "state-directory-missing",
+                    f"new state directory disappeared before binding: {path}",
+                )
+            signal = self._state_directory_signal(fd, parts)
+            temporary_binding = _StateDirectoryBinding(parts, fd, parent_fd, signal)
+            temporary_binding.name = temporary
+            self._validate_state_directory_binding(
+                temporary_binding,
+                "initial temporary directory binding",
+            )
+            self._bind_state_namespace("before state directory publication")
+            self._validate_state_directory_binding(
+                temporary_binding,
+                "before state directory publication",
+            )
+            try:
+                _rename_state_directory_noreplace(parent_fd, temporary, name, path)
+            except FileExistsError:
+                _fail(
+                    "state-directory-replaced",
+                    f"state directory creation lost a no-replace race: {path}",
+                )
+            published = True
+            os.fsync(parent_fd)
+            binding = _StateDirectoryBinding(parts, fd, parent_fd, signal)
+            self._validate_state_directory_binding(binding, "after directory publication")
+            self._directory_bindings[parts] = binding
+            fd = -1
+            self._bind_state_namespace("after state directory creation")
+            return binding
+        except Exception:
+            if not published and temporary_binding is not None:
+                try:
+                    try:
+                        os.stat(temporary, dir_fd=parent_fd, follow_symlinks=False)
+                    except FileNotFoundError:
+                        pass
+                    else:
+                        self._validate_state_directory_binding(
+                            temporary_binding,
+                            "failed directory publication cleanup",
+                        )
+                        os.rmdir(temporary, dir_fd=parent_fd)
+                        os.fsync(parent_fd)
+                except Exception as cleanup_exc:
+                    raise StateError(
+                        "state-directory-cleanup-failed",
+                        f"failed to remove the exact temporary state directory: {path}",
+                    ) from cleanup_exc
+            raise
+        finally:
+            if fd >= 0:
+                os.close(fd)
+
     @contextmanager
     def open_dir(self, relative: Path | str, *, create: bool = False) -> Iterator[int]:
         parts = _safe_relative_parts(relative)
-        current = os.dup(self.root_fd)
-        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
-        try:
-            for component in parts:
+        self._bind_state_namespace("before root-relative directory open")
+        parent_fd = self.root_fd
+        binding: _StateDirectoryBinding | None = None
+        prefix: list[str] = []
+        for component in parts:
+            prefix.append(component)
+            key = tuple(prefix)
+            binding = self._directory_bindings.get(key)
+            if binding is None:
+                path = self.root / Path(*key)
                 try:
-                    child = os.open(component, flags, dir_fd=current)
+                    fd = self._open_state_directory_component(parent_fd, component, path)
                 except FileNotFoundError:
                     if not create:
                         raise
-                    try:
-                        os.mkdir(component, 0o700, dir_fd=current)
-                        os.fsync(current)
-                    except FileExistsError:
-                        pass
-                    child = os.open(component, flags, dir_fd=current)
-                info = os.fstat(child)
-                _validate_private_stat(info, self.root / Path(*parts), directory=True)
-                _acl_digest(child, str(self.root / Path(*parts)), sensitive=True)
-                os.close(current)
-                current = child
+                    binding = self._create_state_directory(key, parent_fd)
+                else:
+                    binding = self._retain_state_directory(key, parent_fd, fd)
+                    self._bind_state_namespace("after state directory binding")
+            elif binding.parent_fd != parent_fd:
+                _fail(
+                    "invalid-state-directory-binding",
+                    f"state directory parent binding is inconsistent: {Path(*key)}",
+                )
+            self._validate_state_directory_binding(binding, "before directory traversal")
+            parent_fd = binding.fd
+        assert binding is not None
+        self._bind_state_namespace("before root-relative directory use")
+        current = os.dup(binding.fd)
+        try:
             yield current
         finally:
             os.close(current)
+            self._bind_state_namespace("after root-relative directory use")
 
     def exists(self, relative: Path | str) -> bool:
         parts = _safe_relative_parts(relative)
@@ -2091,7 +2486,7 @@ class StateStore:
             )
             if hashlib.sha256(current).hexdigest() != expected_digest:
                 _fail("rollback-target-drift", f"rollback target changed: {Path(*parts)}")
-            self._bind_state_chain("before exact rollback")
+            self._bind_state_namespace("before exact rollback")
             if self.lock_fd >= 0:
                 self._bind_lock("before exact rollback")
             try:
@@ -2103,7 +2498,7 @@ class StateStore:
                 _fail("rollback-target-replaced", f"rollback target was rebound: {Path(*parts)}")
             os.unlink(parts[-1], dir_fd=parent_fd)
             os.fsync(parent_fd)
-            self._bind_state_chain("after exact rollback")
+            self._bind_state_namespace("after exact rollback")
         finally:
             if context is not None:
                 context.__exit__(None, None, None)
@@ -2329,7 +2724,7 @@ class StateStore:
                     offset += os.write(fd, payload[offset:])
                 os.fsync(fd)
                 temp_info = os.fstat(fd)
-                self._bind_state_chain("before publication")
+                self._bind_state_namespace("before publication")
                 if self.lock_fd >= 0:
                     self._bind_lock("before publication")
                 named_temp = os.stat(temporary, dir_fd=parent_fd, follow_symlinks=False)
@@ -2364,6 +2759,7 @@ class StateStore:
                 else:
                     os.replace(temporary, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
                     os.fsync(parent_fd)
+                self._bind_state_namespace("after publication")
             finally:
                 os.close(fd)
             try:
@@ -2374,14 +2770,17 @@ class StateStore:
             final = self._read_named(parent_fd, name, Path(*parts), max_bytes=limit)
             if final != payload:
                 _fail("write-verification-failed", f"stored bytes differ: {Path(*parts)}")
+            self._bind_state_namespace("after publication verification")
             return digest
         finally:
             try:
-                os.unlink(temporary, dir_fd=parent_fd)
-            except FileNotFoundError:
-                pass
-            if context is not None:
-                context.__exit__(None, None, None)
+                try:
+                    os.unlink(temporary, dir_fd=parent_fd)
+                except FileNotFoundError:
+                    pass
+            finally:
+                if context is not None:
+                    context.__exit__(*sys.exc_info())
 
 
 _ACTIVE_STORE: contextvars.ContextVar[StateStore | None] = contextvars.ContextVar(
@@ -3059,6 +3458,7 @@ def _verify_committed_legacy_external_after_images(intent: Mapping[str, Any]) ->
 
 
 def _apply_wal_intent(store: StateStore, intent: Mapping[str, Any]) -> None:
+    store._bind_state_namespace("before WAL after-image application")
     if intent["operation"] == "complete-audit":
         _validate_complete_audit_intent_receipts(store, intent)
     _preflight_external_writes(intent)
@@ -3099,6 +3499,7 @@ def _apply_wal_intent(store: StateStore, intent: Mapping[str, Any]) -> None:
                 )[1]
         if final_digest != write["after_sha256"]:
             _fail("wal-write-failed", f"WAL target did not reach after-image: {target}")
+    store._bind_state_namespace("after WAL after-image application")
 
 
 def _repair_committed_external_after_images(intent: Mapping[str, Any]) -> None:
@@ -3150,10 +3551,11 @@ def _commit_wal(store: StateStore, intent: Mapping[str, Any]) -> None:
     with store.capture_immutable_publication(commit_path, expected_file_digest) as publication:
         try:
             with _external_after_image_custody(intent):
-                store._bind_state_chain("before transaction commit")
+                store._bind_state_namespace("before transaction commit")
                 stored_digest = store.write_json(commit_path, commit, immutable=True)
                 if stored_digest != expected_file_digest:
                     _fail("wal-commit-write-failed", "WAL commit write returned the wrong digest")
+                store._bind_state_namespace("after transaction commit")
         except Exception:
             # Roll back only when this exact write won the no-replace link.  An
             # identical pre-existing or concurrent winner has no capture and is
@@ -3195,6 +3597,7 @@ def _run_transaction(
 ) -> dict[str, Any]:
     """Create or replay a deterministic after-image transaction."""
 
+    store._bind_state_namespace("before transaction")
     captured_at = _timestamp(captured_at, "transaction.captured_at")
     request_digest = _digest(request)
     intent_path, commit_path = _wal_paths(operation, natural_key)
@@ -3260,10 +3663,12 @@ def _run_transaction(
     else:
         _apply_wal_intent(store, intent)
         _commit_wal(store, intent)
+    store._bind_state_namespace("after transaction")
     return dict(_require_object(intent["result"], "wal.result"))
 
 
 def _recover_pending_wal(store: StateStore) -> None:
+    store._bind_state_namespace("before WAL recovery")
     validated: list[tuple[str, Path, Path | None, str, str | None, bool]] = []
     try:
         operations = store.list_names(Path("wal"))
@@ -3377,6 +3782,7 @@ def _recover_pending_wal(store: StateStore) -> None:
             continue
         _apply_wal_intent(store, intent)
         _commit_wal(store, intent)
+    store._bind_state_namespace("after WAL recovery")
 
 
 def _require_committed_transaction(
