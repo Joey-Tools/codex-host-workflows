@@ -892,16 +892,23 @@ class CommandRunner:
             mirror = config.repo_path(repo)
             expected = mirror_guard_hook_callable(mirror)
             common_dir = git_common_dir_callable(mirror)
-            hooks_dir = common_dir / "hooks"
-            hooks_dir.mkdir(parents=True, exist_ok=True)
             for hook_name in guard_hooks:
                 hook = bound_mirror_guard_path(mirror, hook_name)
-                if not hook.is_relative_to(common_dir):
+                expected_hook = common_dir / "hooks" / hook_name
+                if hook != expected_hook:
                     raise error_factory(
-                        f"effective {hook_name} hook path is outside git common dir: {hook}"
+                        f"effective {hook_name} hook path is not the exact managed leaf: {hook}"
                     )
-                hook.write_text(expected, encoding="utf-8")
-                hook.chmod(0o755)
+            try:
+                _install_managed_mirror_guard_hooks(
+                    common_dir,
+                    guard_hooks,
+                    expected.encode("utf-8"),
+                )
+            except (OSError, SetupError) as error:
+                raise error_factory(
+                    f"{repo.name} mirror guard installation blocked: {error}"
+                ) from error
 
         namespace["load_config"] = bound_load_config
         namespace["mirror_guard_path"] = bound_mirror_guard_path
@@ -1989,6 +1996,448 @@ def _retire_directory_leaf(
         ) from error
     os.fsync(parent_fd)
     _directory_path_matches(parent_path, parent_binding, label=f"{label} parent")
+
+
+def _managed_mirror_guard_snapshot(
+    hooks_fd: int,
+    hooks_path: Path,
+    hook_name: str,
+    expected_data: bytes,
+) -> FileSnapshot | None:
+    """Read one hook leaf without following it and accept only managed state."""
+
+    hook_path = hooks_path / hook_name
+    try:
+        metadata = os.stat(hook_name, dir_fd=hooks_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise SetupError(
+            f"mirror guard hook leaf could not be inspected: {hook_path}: "
+            f"{error.strerror or type(error).__name__}"
+        ) from error
+    if stat.S_ISLNK(metadata.st_mode):
+        raise SetupError(f"mirror guard hook leaf is a symlink: {hook_path}")
+    if not stat.S_ISREG(metadata.st_mode):
+        raise SetupError(f"mirror guard hook leaf is not a regular file: {hook_path}")
+    snapshot = _snapshot_at(
+        hooks_fd,
+        hook_name,
+        max_bytes=MAX_CONFIG_BYTES,
+        label=f"mirror guard hook {hook_path}",
+    )
+    assert snapshot is not None
+    if snapshot.data != expected_data:
+        raise SetupError(f"existing mirror guard hook has non-managed content: {hook_path}")
+    if stat.S_IMODE(snapshot.binding.mode) != 0o755:
+        raise SetupError(f"existing mirror guard hook has non-managed access policy: {hook_path}")
+    return snapshot
+
+
+def _revalidate_managed_hooks_directory(
+    common_fd: int,
+    common_path: Path,
+    common_binding: Binding,
+    hooks_fd: int,
+    hooks_path: Path,
+    hooks_binding: Binding,
+) -> None:
+    """Rebind the retained hook directory without treating child churn as mutation."""
+
+    current = _binding_from_fd(
+        hooks_fd,
+        label="mirror guard hooks directory",
+        sensitive_leaf=True,
+    )
+    if _directory_binding_tuple(current) != _directory_binding_tuple(hooks_binding):
+        raise SetupError(
+            f"mirror guard hooks directory identity or access policy changed: {hooks_path}"
+        )
+    try:
+        linked = os.stat("hooks", dir_fd=common_fd, follow_symlinks=False)
+    except OSError as error:
+        raise SetupError(
+            f"mirror guard hooks directory link could not be rebound: {hooks_path}: "
+            f"{error.strerror or type(error).__name__}"
+        ) from error
+    if not stat.S_ISDIR(linked.st_mode) or _directory_stat_tuple(
+        Binding.from_stat(linked)
+    ) != _directory_stat_tuple(hooks_binding):
+        raise SetupError(f"mirror guard hooks directory was replaced: {hooks_path}")
+    _directory_path_matches(common_path, common_binding, label="mirror guard Git common dir")
+    _directory_path_matches(hooks_path, hooks_binding, label="mirror guard hooks directory")
+
+
+def _publish_missing_mirror_guard_hook(
+    *,
+    common_fd: int,
+    common_path: Path,
+    common_binding: Binding,
+    hooks_fd: int,
+    hooks_path: Path,
+    hooks_binding: Binding,
+    hook_name: str,
+    expected_data: bytes,
+    renamer: AtomicRenamer,
+) -> FileSnapshot:
+    """Publish one missing hook through an owner-private no-replace stage."""
+
+    hook_path = hooks_path / hook_name
+    stage = f".{hook_name}.stage-{os.getpid()}-{secrets.token_hex(8)}"
+    stage_fd: int | None = None
+    stage_created = False
+    moved = False
+    owned_snapshot: FileSnapshot | None = None
+    try:
+        _revalidate_managed_hooks_directory(
+            common_fd,
+            common_path,
+            common_binding,
+            hooks_fd,
+            hooks_path,
+            hooks_binding,
+        )
+        if (
+            _managed_mirror_guard_snapshot(
+                hooks_fd,
+                hooks_path,
+                hook_name,
+                expected_data,
+            )
+            is not None
+        ):
+            raise SetupError(f"mirror guard hook appeared after preflight: {hook_path}")
+        stage_fd = os.open(
+            stage,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=hooks_fd,
+        )
+        stage_created = True
+        os.fchmod(stage_fd, 0o600)
+        remaining = memoryview(expected_data)
+        while remaining:
+            written = os.write(stage_fd, remaining)
+            if written <= 0:
+                raise OSError(errno.EIO, "mirror guard stage write made no progress")
+            remaining = remaining[written:]
+        os.fsync(stage_fd)
+        staged = _snapshot_at(
+            hooks_fd,
+            stage,
+            max_bytes=MAX_CONFIG_BYTES,
+            label=f"mirror guard private stage {hooks_path / stage}",
+        )
+        assert staged is not None
+        if staged.data != expected_data or stat.S_IMODE(staged.binding.mode) != 0o600:
+            raise SetupError(f"mirror guard private stage did not verify: {hooks_path / stage}")
+        owned_snapshot = staged
+        if (
+            _managed_mirror_guard_snapshot(
+                hooks_fd,
+                hooks_path,
+                hook_name,
+                expected_data,
+            )
+            is not None
+        ):
+            raise SetupError(f"mirror guard hook appeared before publish: {hook_path}")
+        try:
+            renamer.no_replace(hooks_fd, stage, hook_name)
+        except OSError as error:
+            if error.errno in {errno.EEXIST, errno.ENOTEMPTY}:
+                raise SetupError(
+                    f"foreign mirror guard hook appeared during no-replace publish: {hook_path}"
+                ) from error
+            raise
+        moved = True
+        os.fchmod(stage_fd, 0o755)
+        os.fsync(stage_fd)
+        owned_snapshot = FileSnapshot(
+            binding=_binding_from_fd(
+                stage_fd,
+                label=f"published mirror guard hook {hook_path}",
+                sensitive_leaf=True,
+            ),
+            data=expected_data,
+        )
+        if stat.S_IMODE(owned_snapshot.binding.mode) != 0o755:
+            raise SetupError(f"published mirror guard hook mode did not verify: {hook_path}")
+        installed = _snapshot_at(
+            hooks_fd,
+            hook_name,
+            max_bytes=MAX_CONFIG_BYTES,
+            label=f"published mirror guard hook {hook_path}",
+        )
+        assert installed is not None
+        if installed != owned_snapshot:
+            raise SetupError(f"published mirror guard hook identity did not verify: {hook_path}")
+        os.fsync(hooks_fd)
+        _revalidate_managed_hooks_directory(
+            common_fd,
+            common_path,
+            common_binding,
+            hooks_fd,
+            hooks_path,
+            hooks_binding,
+        )
+        return installed
+    except BaseException as original_error:
+        recovery_error: BaseException | None = None
+        try:
+            if moved and owned_snapshot is not None:
+                current = _snapshot_at(
+                    hooks_fd,
+                    hook_name,
+                    max_bytes=MAX_CONFIG_BYTES,
+                    label="failed mirror guard publish target",
+                )
+                if current != owned_snapshot:
+                    raise SetupError(
+                        f"failed mirror guard publish retained recovery object: {hook_path}"
+                    )
+                _retire_regular_leaf(
+                    hooks_fd,
+                    parent_path=hooks_path,
+                    parent_binding=hooks_binding,
+                    target=hook_name,
+                    expected=owned_snapshot,
+                    max_bytes=MAX_CONFIG_BYTES,
+                    renamer=renamer,
+                    label="failed mirror guard publish recovery",
+                )
+            elif stage_created and owned_snapshot is not None:
+                _retire_regular_leaf(
+                    hooks_fd,
+                    parent_path=hooks_path,
+                    parent_binding=hooks_binding,
+                    target=stage,
+                    expected=owned_snapshot,
+                    max_bytes=MAX_CONFIG_BYTES,
+                    renamer=renamer,
+                    label="failed mirror guard stage recovery",
+                )
+            elif stage_created:
+                raise SetupError(
+                    f"unverified mirror guard stage retained for recovery: {hooks_path / stage}"
+                )
+        except BaseException as error:
+            recovery_error = error
+        if recovery_error is not None:
+            raise SetupError(
+                f"mirror guard publish failed ({original_error}); recovery failed "
+                f"({recovery_error})"
+            ) from original_error
+        raise
+    finally:
+        if stage_fd is not None:
+            os.close(stage_fd)
+
+
+def _install_managed_mirror_guard_hooks(
+    common_dir: Path,
+    hook_names: Sequence[str],
+    expected_data: bytes,
+    *,
+    renamer: AtomicRenamer | None = None,
+) -> tuple[FileSnapshot, ...]:
+    """Install exact guard hooks without following or overwriting a hook leaf."""
+
+    common_dir = _normalized_absolute(common_dir, field="mirror guard Git common dir")
+    if len(expected_data) > MAX_CONFIG_BYTES:
+        raise SetupError("mirror guard hook content exceeds the byte limit")
+    names = tuple(hook_names)
+    if (
+        not names
+        or len(set(names)) != len(names)
+        or any(not name or "/" in name or "\0" in name or name in {".", ".."} for name in names)
+    ):
+        raise SetupError("mirror guard hook names are not unique safe leaf names")
+
+    common_fd, common_binding = _open_real_directory(
+        common_dir,
+        label="mirror guard Git common dir",
+        require_current_owner=True,
+    )
+    hooks_path = common_dir / "hooks"
+    hooks_fd: int | None = None
+    hooks_binding: Binding | None = None
+    hooks_created = False
+    active_renamer = renamer
+    installed: dict[str, FileSnapshot] = {}
+    try:
+        directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+        directory_flags |= getattr(os, "O_NONBLOCK", 0)
+        try:
+            hooks_fd = os.open("hooks", directory_flags, dir_fd=common_fd)
+        except FileNotFoundError:
+            try:
+                os.mkdir("hooks", mode=0o700, dir_fd=common_fd)
+            except FileExistsError as error:
+                raise SetupError(
+                    f"foreign object appeared while creating mirror guard hooks directory: "
+                    f"{hooks_path}"
+                ) from error
+            hooks_created = True
+            os.fsync(common_fd)
+            try:
+                hooks_fd = os.open("hooks", directory_flags, dir_fd=common_fd)
+            except OSError as error:
+                raise SetupError(
+                    f"created mirror guard hooks directory could not be rebound and was "
+                    f"retained for inspection: {hooks_path}"
+                ) from error
+        except OSError as error:
+            raise SetupError(
+                f"mirror guard hooks directory could not be opened without following links: "
+                f"{hooks_path}: {error.strerror or type(error).__name__}"
+            ) from error
+
+        metadata = os.fstat(hooks_fd)
+        _validate_directory_metadata(
+            metadata,
+            label="mirror guard hooks directory",
+            require_current_owner=True,
+        )
+        hooks_binding = _binding_from_fd(
+            hooks_fd,
+            label="mirror guard hooks directory",
+            sensitive_leaf=True,
+        )
+        linked = os.stat("hooks", dir_fd=common_fd, follow_symlinks=False)
+        if not stat.S_ISDIR(linked.st_mode) or _directory_stat_tuple(
+            Binding.from_stat(linked)
+        ) != _directory_stat_tuple(hooks_binding):
+            raise SetupError(
+                f"mirror guard hooks directory was replaced while opening: {hooks_path}"
+            )
+        _revalidate_managed_hooks_directory(
+            common_fd,
+            common_dir,
+            common_binding,
+            hooks_fd,
+            hooks_path,
+            hooks_binding,
+        )
+
+        preflight = {
+            name: _managed_mirror_guard_snapshot(
+                hooks_fd,
+                hooks_path,
+                name,
+                expected_data,
+            )
+            for name in names
+        }
+        if hooks_created:
+            active_renamer = active_renamer or AtomicRenamer()
+        for name in names:
+            expected = preflight[name]
+            current = _managed_mirror_guard_snapshot(
+                hooks_fd,
+                hooks_path,
+                name,
+                expected_data,
+            )
+            if current != expected:
+                raise SetupError(f"mirror guard hook changed after preflight: {hooks_path / name}")
+            if current is not None:
+                continue
+            active_renamer = active_renamer or AtomicRenamer()
+            installed[name] = _publish_missing_mirror_guard_hook(
+                common_fd=common_fd,
+                common_path=common_dir,
+                common_binding=common_binding,
+                hooks_fd=hooks_fd,
+                hooks_path=hooks_path,
+                hooks_binding=hooks_binding,
+                hook_name=name,
+                expected_data=expected_data,
+                renamer=active_renamer,
+            )
+            preflight[name] = installed[name]
+
+        final: list[FileSnapshot] = []
+        for name in names:
+            current = _managed_mirror_guard_snapshot(
+                hooks_fd,
+                hooks_path,
+                name,
+                expected_data,
+            )
+            if current != preflight[name] or current is None:
+                raise SetupError(
+                    f"mirror guard hook identity or access policy changed: {hooks_path / name}"
+                )
+            final.append(current)
+        os.fsync(hooks_fd)
+        _revalidate_managed_hooks_directory(
+            common_fd,
+            common_dir,
+            common_binding,
+            hooks_fd,
+            hooks_path,
+            hooks_binding,
+        )
+        return tuple(final)
+    except BaseException as original_error:
+        recovery_errors: list[str] = []
+        if hooks_fd is not None and hooks_binding is not None:
+            if installed:
+                try:
+                    active_renamer = active_renamer or AtomicRenamer()
+                except SetupError as error:
+                    recovery_errors.append(str(error))
+                else:
+                    for name, expected in reversed(tuple(installed.items())):
+                        try:
+                            current = _snapshot_at(
+                                hooks_fd,
+                                name,
+                                max_bytes=MAX_CONFIG_BYTES,
+                                label="mirror guard transaction rollback target",
+                            )
+                            if current != expected:
+                                raise SetupError(
+                                    f"mirror guard rollback refused a replaced target: "
+                                    f"{hooks_path / name}"
+                                )
+                            _retire_regular_leaf(
+                                hooks_fd,
+                                parent_path=hooks_path,
+                                parent_binding=hooks_binding,
+                                target=name,
+                                expected=expected,
+                                max_bytes=MAX_CONFIG_BYTES,
+                                renamer=active_renamer,
+                                label="mirror guard transaction rollback",
+                            )
+                        except (OSError, SetupError) as error:
+                            recovery_errors.append(str(error))
+            if hooks_created:
+                try:
+                    active_renamer = active_renamer or AtomicRenamer()
+                    _retire_directory_leaf(
+                        common_fd,
+                        parent_path=common_dir,
+                        parent_binding=common_binding,
+                        target="hooks",
+                        expected_binding=hooks_binding,
+                        renamer=active_renamer,
+                        label="mirror guard hooks directory rollback",
+                    )
+                except (OSError, SetupError) as error:
+                    recovery_errors.append(str(error))
+        if recovery_errors:
+            raise SetupError(
+                f"mirror guard installation failed ({original_error}); recovery incomplete: "
+                + "; ".join(recovery_errors)
+            ) from original_error
+        raise
+    finally:
+        if hooks_fd is not None:
+            os.close(hooks_fd)
+        os.close(common_fd)
 
 
 @dataclasses.dataclass

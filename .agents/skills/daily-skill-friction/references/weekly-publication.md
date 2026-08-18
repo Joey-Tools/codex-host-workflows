@@ -89,11 +89,14 @@ the per-case semantic selection binding.
 The output parent must already exist and be owner-private. The WAL persists the
 complete parent-visible name chain plus each directory's device/inode/type and
 effective POSIX owner/mode policy (including group identity only when the group
-and other permission classes differ). On Darwin, the same retained descriptors
-also bind the canonical kernel-ordered extended-ACL digest. Sensitive state and
-external artifact leaves must have no extended ACL; custody ancestors may have
-deny-only entries, but any allow entry fails closed. Other platforms persist the
-explicit POSIX-only ACL model without claiming extended-ACL enforcement. Recovery
+and other permission classes differ). Every custody ancestor must be owned by
+root or the current effective user and must not be group/world writable. The only
+writable-ancestor exception is a root-owned sticky directory such as the system
+temporary directory. On Darwin, the same retained descriptors also bind the
+canonical kernel-ordered extended-ACL digest. Sensitive state and external
+artifact leaves must have no extended ACL; custody ancestors may have deny-only
+entries, but any allow entry fails closed. Other platforms persist the explicit
+POSIX-only ACL model without claiming extended-ACL enforcement. Recovery
 reopens the exact chain with `create=False` before any state after-image, again at
 the external write, and again before commit. Commit publication retains
 descriptors for the bound parent and exact private after-image leaf, then

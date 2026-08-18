@@ -8,6 +8,7 @@ import os
 import stat
 import subprocess
 import sys
+import tempfile
 import uuid
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -2455,6 +2456,24 @@ def test_weekly_wal_recovery_rejects_external_parent_access_policy_drift(
         output_parent.chmod(0o700)
 
 
+def test_weekly_wal_recovery_rejects_unsafe_external_custody_ancestor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    output_custody = tmp_path / "output-custody"
+    output_parent = output_custody / "external"
+    root, selection_path, output, _ = _leave_pending_weekly_external_write(
+        tmp_path, monkeypatch, output_parent=output_parent
+    )
+    output_custody.chmod(0o770)
+    try:
+        with pytest.raises(fs.StateError, match="parent policy changed") as raised:
+            fs.weekly_plan(root, selection_path, output, "2026-07-11T09:01:00Z")
+        assert raised.value.code == "external-parent-policy-changed"
+        assert not output.exists()
+    finally:
+        output_custody.chmod(0o700)
+
+
 @pytest.mark.skipif(sys.platform != "darwin", reason="Darwin extended ACL contract")
 def test_weekly_wal_recovery_rejects_external_parent_acl_drift(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -2464,7 +2483,7 @@ def test_weekly_wal_recovery_rejects_external_parent_acl_drift(
         tmp_path, monkeypatch, output_parent=output_parent
     )
     subprocess.run(
-        ["chmod", "+a", "everyone deny delete", str(output_parent)],
+        ["/bin/chmod", "+a", "everyone deny delete", str(output_parent)],
         check=True,
         capture_output=True,
         text=True,
@@ -2475,7 +2494,7 @@ def test_weekly_wal_recovery_rejects_external_parent_acl_drift(
         assert raised.value.code == "external-parent-policy-changed"
         assert not output.exists()
     finally:
-        subprocess.run(["chmod", "-N", str(output_parent)], check=True, capture_output=True)
+        subprocess.run(["/bin/chmod", "-N", str(output_parent)], check=True, capture_output=True)
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="Darwin extended ACL contract")
@@ -2485,7 +2504,7 @@ def test_weekly_wal_accepts_and_revalidates_preexisting_deny_only_parent_acl(
     output_parent = tmp_path / "external"
     output_parent.mkdir(mode=0o700)
     subprocess.run(
-        ["chmod", "+a", "everyone deny delete", str(output_parent)],
+        ["/bin/chmod", "+a", "everyone deny delete", str(output_parent)],
         check=True,
         capture_output=True,
         text=True,
@@ -2498,7 +2517,7 @@ def test_weekly_wal_accepts_and_revalidates_preexisting_deny_only_parent_acl(
         assert recovered["status"] == "planned"
         assert output.exists()
     finally:
-        subprocess.run(["chmod", "-N", str(output_parent)], check=True, capture_output=True)
+        subprocess.run(["/bin/chmod", "-N", str(output_parent)], check=True, capture_output=True)
 
 
 def test_weekly_wal_recovery_ignores_external_parent_child_churn(
@@ -3659,6 +3678,106 @@ def test_state_chain_binds_ancestor_access_policy_but_ignores_metadata_churn(
         store.close()
 
 
+def test_state_store_rejects_unsafe_initial_ancestor_policy(tmp_path: Path) -> None:
+    ancestor = tmp_path / "unsafe-initial-ancestor"
+    ancestor.mkdir(mode=0o700)
+    root = ancestor / "state"
+    ancestor.chmod(0o770)
+    try:
+        with pytest.raises(fs.StateError, match="group/world writable") as raised:
+            fs.StateStore(root)
+        assert raised.value.code == "unsafe-state-chain-policy"
+        assert not root.exists()
+    finally:
+        ancestor.chmod(0o700)
+
+
+def test_state_store_rejects_unsafe_ancestor_mode_drift_across_calls(
+    tmp_path: Path,
+) -> None:
+    ancestor = tmp_path / "cross-call-policy-ancestor"
+    ancestor.mkdir(mode=0o700)
+    root = ancestor / "state"
+    initial = fs.StateStore(root)
+    initial.close()
+
+    ancestor.chmod(0o770)
+    try:
+        with pytest.raises(fs.StateError, match="group/world writable") as raised:
+            fs.StateStore(root, create=False)
+        assert raised.value.code == "unsafe-state-chain-policy"
+    finally:
+        ancestor.chmod(0o700)
+
+
+def test_state_store_allows_root_owned_sticky_custody_ancestor() -> None:
+    sticky_parent = next(
+        (
+            path
+            for path in (Path("/private/tmp"), Path("/tmp"))
+            if path.is_dir()
+            and not path.is_symlink()
+            and path.stat().st_uid == 0
+            and stat.S_IMODE(path.stat().st_mode) & stat.S_ISVTX
+            and stat.S_IMODE(path.stat().st_mode) & (stat.S_IWGRP | stat.S_IWOTH)
+        ),
+        None,
+    )
+    if sticky_parent is None:
+        pytest.skip("host has no root-owned writable sticky directory")
+
+    with tempfile.TemporaryDirectory(prefix="dsf-sticky-custody-", dir=sticky_parent) as scope:
+        scope_path = Path(scope)
+        scope_path.chmod(0o700)
+        store = fs.StateStore(scope_path / "state")
+        try:
+            store.acquire_lock()
+            store.finish()
+        finally:
+            store.close()
+
+
+def test_state_store_ignores_benign_ancestor_child_churn_across_calls(
+    tmp_path: Path,
+) -> None:
+    ancestor = tmp_path / "cross-call-churn-ancestor"
+    ancestor.mkdir(mode=0o700)
+    root = ancestor / "state"
+    initial = fs.StateStore(root)
+    initial.close()
+
+    transient = ancestor / "transient"
+    transient.mkdir(mode=0o700)
+    transient.rmdir()
+    reopened = fs.StateStore(root, create=False)
+    reopened.close()
+
+
+def test_state_store_classifies_unreadable_initial_ancestor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ancestor = tmp_path / "unreadable-ancestor"
+    ancestor.mkdir(mode=0o700)
+    root = ancestor / "state"
+    real_open = fs.os.open
+
+    def deny_ancestor(
+        name: str,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        if name == ancestor.name:
+            raise PermissionError(fs.errno.EACCES, "injected unreadable ancestor", name)
+        return real_open(name, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(fs.os, "open", deny_ancestor)
+    with pytest.raises(fs.StateError, match="custody component is unreadable") as raised:
+        fs.StateStore(root, create=False)
+    assert raised.value.code == "state-chain-unreadable"
+
+
 def test_acl_policy_normalization_preserves_entry_order_and_separates_leaf_policy() -> None:
     first = {
         "index": 0,
@@ -3724,7 +3843,7 @@ def test_darwin_acl_fd_policy_accepts_deny_custody_rejects_allow_and_binds_marke
     deny_ancestor = tmp_path / "deny-ancestor"
     deny_ancestor.mkdir(mode=0o700)
     subprocess.run(
-        ["chmod", "+a", "everyone deny delete", str(deny_ancestor)],
+        ["/bin/chmod", "+a", "everyone deny delete", str(deny_ancestor)],
         check=True,
         capture_output=True,
         text=True,
@@ -3742,7 +3861,7 @@ def test_darwin_acl_fd_policy_accepts_deny_custody_rejects_allow_and_binds_marke
 
     case_path = root / staged["case_path"]
     subprocess.run(
-        ["chmod", "+a", "everyone deny delete", str(case_path)],
+        ["/bin/chmod", "+a", "everyone deny delete", str(case_path)],
         check=True,
         capture_output=True,
         text=True,
@@ -3756,9 +3875,9 @@ def test_darwin_acl_fd_policy_accepts_deny_custody_rejects_allow_and_binds_marke
             )
         assert leaf.value.code == "state-acl-present"
     finally:
-        subprocess.run(["chmod", "-N", str(case_path)], check=True, capture_output=True)
+        subprocess.run(["/bin/chmod", "-N", str(case_path)], check=True, capture_output=True)
 
-    subprocess.run(["chmod", "-N", str(deny_ancestor)], check=True, capture_output=True)
+    subprocess.run(["/bin/chmod", "-N", str(deny_ancestor)], check=True, capture_output=True)
     try:
         with pytest.raises(fs.StateError, match="ACL chain no longer matches") as changed:
             fs.stage_candidate(
@@ -3769,7 +3888,7 @@ def test_darwin_acl_fd_policy_accepts_deny_custody_rejects_allow_and_binds_marke
         assert changed.value.code == "state-chain-policy-changed"
     finally:
         subprocess.run(
-            ["chmod", "+a", "everyone deny delete", str(deny_ancestor)],
+            ["/bin/chmod", "+a", "everyone deny delete", str(deny_ancestor)],
             check=True,
             capture_output=True,
         )
@@ -3777,7 +3896,7 @@ def test_darwin_acl_fd_policy_accepts_deny_custody_rejects_allow_and_binds_marke
     allow_ancestor = tmp_path / "allow-ancestor"
     allow_ancestor.mkdir(mode=0o700)
     subprocess.run(
-        ["chmod", "+a", "everyone allow read", str(allow_ancestor)],
+        ["/bin/chmod", "+a", "everyone allow read", str(allow_ancestor)],
         check=True,
         capture_output=True,
         text=True,
@@ -3787,8 +3906,8 @@ def test_darwin_acl_fd_policy_accepts_deny_custody_rejects_allow_and_binds_marke
             fs.StateStore(allow_ancestor / "state")
         assert allowing.value.code == "custody-acl-allows-access"
     finally:
-        subprocess.run(["chmod", "-N", str(allow_ancestor)], check=True, capture_output=True)
-        subprocess.run(["chmod", "-N", str(deny_ancestor)], check=True, capture_output=True)
+        subprocess.run(["/bin/chmod", "-N", str(allow_ancestor)], check=True, capture_output=True)
+        subprocess.run(["/bin/chmod", "-N", str(deny_ancestor)], check=True, capture_output=True)
 
 
 def test_immutable_output_is_first_writer_wins(

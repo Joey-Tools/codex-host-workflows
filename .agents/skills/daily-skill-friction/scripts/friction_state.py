@@ -1649,19 +1649,68 @@ class StateStore:
             self.close()
             raise
 
+    @staticmethod
+    def _open_chain_component(
+        name: str,
+        flags: int,
+        path: Path | str,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        """Open one custody directory and classify pathname failures."""
+
+        try:
+            return os.open(name, flags, dir_fd=dir_fd)
+        except FileNotFoundError:
+            raise
+        except PermissionError as exc:
+            _fail(
+                "state-chain-unreadable",
+                f"state custody component is unreadable: {path}: {exc}",
+            )
+        except OSError as exc:
+            if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+                _fail(
+                    "state-chain-replaced",
+                    f"state custody component is no longer a directory: {path}",
+                )
+            _fail(
+                "state-chain-revalidation-failed",
+                f"could not open state custody component {path}: {exc}",
+            )
+
     def _open_root(self, *, create: bool) -> None:
         flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
-        current = os.open(self.root.anchor, flags)
+        try:
+            current = self._open_chain_component(
+                self.root.anchor,
+                flags,
+                self.root.anchor,
+            )
+        except FileNotFoundError:
+            _fail("missing-state-root", f"state custody root is missing: {self.root.anchor}")
         self._ancestor_fds.append(current)
         self._chain_names.append(None)
         self._chain_signals.append(
-            self._directory_signal(current, os.fstat(current), self.root.anchor, sensitive=False)
+            self._directory_signal(
+                current,
+                os.fstat(current),
+                self.root.anchor,
+                sensitive=False,
+                custody_error_code="unsafe-state-chain-policy",
+            )
         )
         parts = self.root.parts[1:]
         for index, component in enumerate(parts):
             final = index == len(parts) - 1
+            component_path = Path(self.root.anchor, *parts[: index + 1])
             try:
-                child = os.open(component, flags, dir_fd=current)
+                child = self._open_chain_component(
+                    component,
+                    flags,
+                    component_path,
+                    dir_fd=current,
+                )
             except FileNotFoundError:
                 if not create:
                     _fail("missing-state-root", f"state root is not initialized: {self.root}")
@@ -1670,13 +1719,45 @@ class StateStore:
                     os.fsync(current)
                 except FileExistsError:
                     pass
-                child = os.open(component, flags, dir_fd=current)
-            child_signal = self._directory_signal(
-                child,
-                os.fstat(child),
-                Path(self.root.anchor, *parts[: index + 1]),
-                sensitive=final and self._sensitive_root,
-            )
+                except PermissionError as exc:
+                    _fail(
+                        "state-chain-unreadable",
+                        f"cannot create state custody component {component_path}: {exc}",
+                    )
+                except OSError as exc:
+                    if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+                        _fail(
+                            "state-chain-replaced",
+                            f"state custody component was rebound during creation: "
+                            f"{component_path}",
+                        )
+                    _fail(
+                        "state-chain-revalidation-failed",
+                        f"could not create state custody component {component_path}: {exc}",
+                    )
+                try:
+                    child = self._open_chain_component(
+                        component,
+                        flags,
+                        component_path,
+                        dir_fd=current,
+                    )
+                except FileNotFoundError:
+                    _fail(
+                        "state-chain-replaced",
+                        f"state custody component disappeared during creation: {component_path}",
+                    )
+            try:
+                child_signal = self._directory_signal(
+                    child,
+                    os.fstat(child),
+                    component_path,
+                    sensitive=final and self._sensitive_root,
+                    custody_error_code="unsafe-state-chain-policy",
+                )
+            except Exception:
+                os.close(child)
+                raise
             self._chain_names.append(component)
             self._chain_signals.append(child_signal)
             if final:
@@ -1713,12 +1794,26 @@ class StateStore:
         path: Path | str,
         *,
         sensitive: bool,
+        custody_error_code: str,
     ) -> tuple[int, int, int, int, int, int, str]:
         """Return only object-identity, type, and access-policy signals."""
 
         if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
             _fail("unsafe-state-chain", f"state path component is not a directory: {path}")
         permissions = stat.S_IMODE(info.st_mode)
+        if info.st_uid not in {0, os.geteuid()}:
+            _fail(
+                custody_error_code,
+                f"state custody ancestor has an untrusted owner: {path}",
+            )
+        writable_by_others = bool(permissions & (stat.S_IWGRP | stat.S_IWOTH))
+        root_owned_sticky = info.st_uid == 0 and bool(permissions & stat.S_ISVTX)
+        if writable_by_others and not root_owned_sticky:
+            _fail(
+                custody_error_code,
+                "state custody ancestor is group/world writable without root-owned "
+                f"sticky protection: {path}",
+            )
         group_bits = (permissions & stat.S_IRWXG) >> 3
         other_bits = permissions & stat.S_IRWXO
         # Group identity changes no mode-based access when the group and other
@@ -1760,6 +1855,7 @@ class StateStore:
                 opened,
                 component_path,
                 sensitive=(index == len(chain_fds) - 1 and self._sensitive_root),
+                custody_error_code="state-chain-policy-changed",
             )
             if opened_signal[:3] != expected[:3]:
                 _fail(
@@ -2541,15 +2637,32 @@ def _bound_external_parent(
                 "external-parent-missing",
                 f"bound external output parent disappeared: {absolute.parent}",
             )
-        if exc.code in {"unsafe-owner", "unsafe-permissions"}:
+        if exc.code in {
+            "unsafe-owner",
+            "unsafe-permissions",
+            "unsafe-state-chain-policy",
+            "state-chain-policy-changed",
+            "custody-acl-allows-access",
+            "state-acl-present",
+        }:
             _fail(
                 "external-parent-policy-changed",
                 f"bound external output parent policy changed: {absolute.parent}",
             )
-        if exc.code in {"unsafe-path", "unsafe-state-chain"}:
+        if exc.code in {"unsafe-path", "unsafe-state-chain", "state-chain-replaced"}:
             _fail(
                 "external-parent-replaced",
-                f"bound external output parent is no longer a directory: {absolute.parent}",
+                f"bound external output parent is no longer the directory chain: {absolute.parent}",
+            )
+        if exc.code == "state-chain-unreadable":
+            _fail(
+                "external-parent-unreadable",
+                f"bound external output parent became unreadable: {absolute.parent}",
+            )
+        if exc.code in {"state-chain-revalidation-failed", "acl-revalidation-failed"}:
+            _fail(
+                "external-parent-revalidation-failed",
+                f"could not open bound external output parent: {absolute.parent}",
             )
         raise
     except OSError as exc:

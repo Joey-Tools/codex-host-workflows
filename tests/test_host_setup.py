@@ -7,6 +7,7 @@ import os
 import plistlib
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -558,6 +559,9 @@ def _write_bound_helper_fixture(path: Path, *, loaded_marker: Path | None = None
         "    config_path = Path(args[args.index('--config') + 1])\n"
         "    config = load_config(config_path)\n"
         f"{marker_statement}"
+        "    if 'ensure' in args:\n"
+        "        for repo in config.repos:\n"
+        "            install_mirror_guard(config, repo)\n"
         "    print(json.dumps({\n"
         "        'root': str(config.root),\n"
         "        'cache_root': str(config.cache_root),\n"
@@ -2105,6 +2109,197 @@ def test_retirement_restores_foreign_replacement_and_stage_collision_is_preserve
             parent / "other.json", b"managed", mode=0o600, expected=None, max_bytes=100
         )
     assert stage.read_bytes() == b"foreign-stage"
+
+
+def test_mirror_guard_install_is_atomic_idempotent_and_allows_child_churn(
+    tmp_path: Path,
+) -> None:
+    common_dir = tmp_path / "mirror" / ".git"
+    hooks_dir = common_dir / "hooks"
+    common_dir.mkdir(parents=True)
+    expected = b"#!/bin/sh\nexit 1\n"
+    churned = False
+
+    def churn(
+        operation: str,
+        _source_fd: int,
+        _source: str,
+        target_fd: int,
+        _target: str,
+    ) -> None:
+        nonlocal churned
+        if operation == "no-replace" and not churned:
+            churned = True
+            descriptor = os.open(
+                "benign-sibling",
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=target_fd,
+            )
+            try:
+                os.write(descriptor, b"benign")
+            finally:
+                os.close(descriptor)
+
+    names = ("pre-commit", "prepare-commit-msg")
+    first = hs._install_managed_mirror_guard_hooks(
+        common_dir,
+        names,
+        expected,
+        renamer=hs.AtomicRenamer(churn),
+    )
+
+    assert churned
+    assert hooks_dir.joinpath("benign-sibling").read_bytes() == b"benign"
+    for name, snapshot in zip(names, first, strict=True):
+        hook = hooks_dir / name
+        metadata = hook.lstat()
+        assert stat.S_ISREG(metadata.st_mode)
+        assert stat.S_IMODE(metadata.st_mode) == 0o755
+        assert hook.read_bytes() == expected
+        assert snapshot.binding.dev == metadata.st_dev
+        assert snapshot.binding.ino == metadata.st_ino
+    identities = {name: (hooks_dir / name).lstat().st_ino for name in names}
+
+    second = hs._install_managed_mirror_guard_hooks(common_dir, names, expected)
+
+    assert second == first
+    assert {name: (hooks_dir / name).lstat().st_ino for name in names} == identities
+    assert list(hooks_dir.glob(".*.stage-*")) == []
+
+
+@pytest.mark.parametrize(
+    "hostile_kind",
+    ["directory", "foreign-content", "foreign-access-policy"],
+)
+def test_mirror_guard_preflight_rejects_nonmanaged_leaves_before_any_write(
+    tmp_path: Path,
+    hostile_kind: str,
+) -> None:
+    common_dir = tmp_path / "mirror" / ".git"
+    hooks_dir = common_dir / "hooks"
+    hooks_dir.mkdir(parents=True)
+    missing = hooks_dir / "pre-commit"
+    hostile = hooks_dir / "prepare-commit-msg"
+    managed = b"#!/bin/sh\nexit 1\n"
+    if hostile_kind == "directory":
+        hostile.mkdir()
+        expected_error = "not a regular file"
+    elif hostile_kind == "foreign-content":
+        hostile.write_bytes(b"foreign")
+        hostile.chmod(0o711)
+        expected_error = "non-managed content"
+    else:
+        hostile.write_bytes(managed)
+        hostile.chmod(0o644)
+        expected_error = "non-managed access policy"
+    hostile_binding = hs.Binding.from_stat(hostile.lstat())
+
+    with pytest.raises(hs.SetupError, match=expected_error):
+        hs._install_managed_mirror_guard_hooks(
+            common_dir,
+            (missing.name, hostile.name),
+            managed,
+        )
+
+    assert not missing.exists()
+    assert hs.Binding.from_stat(hostile.lstat()) == hostile_binding
+    if hostile_kind == "directory":
+        assert hostile.is_dir()
+    elif hostile_kind == "foreign-content":
+        assert hostile.read_bytes() == b"foreign"
+        assert stat.S_IMODE(hostile.stat().st_mode) == 0o711
+    else:
+        assert hostile.read_bytes() == managed
+        assert stat.S_IMODE(hostile.stat().st_mode) == 0o644
+    assert list(hooks_dir.glob(".*.stage-*")) == []
+
+
+def test_mirror_guard_transaction_rolls_back_owned_hooks_after_publish_race(
+    tmp_path: Path,
+) -> None:
+    common_dir = tmp_path / "mirror" / ".git"
+    hooks_dir = common_dir / "hooks"
+    hooks_dir.mkdir(parents=True)
+    collided = False
+
+    def collide(
+        operation: str,
+        _source_fd: int,
+        _source: str,
+        target_fd: int,
+        target: str,
+    ) -> None:
+        nonlocal collided
+        if operation == "no-replace" and target == "prepare-commit-msg" and not collided:
+            collided = True
+            os.mkdir(target, mode=0o700, dir_fd=target_fd)
+
+    with pytest.raises(hs.SetupError, match="foreign mirror guard hook appeared"):
+        hs._install_managed_mirror_guard_hooks(
+            common_dir,
+            ("pre-commit", "prepare-commit-msg"),
+            b"#!/bin/sh\nexit 1\n",
+            renamer=hs.AtomicRenamer(collide),
+        )
+
+    assert collided
+    assert not hooks_dir.joinpath("pre-commit").exists()
+    assert hooks_dir.joinpath("prepare-commit-msg").is_dir()
+    assert list(hooks_dir.glob(".*.stage-*")) == []
+    assert list(hooks_dir.glob(".*.retire-*")) == []
+
+
+def test_apply_ensure_rejects_symlinked_guard_without_touching_external_target(
+    tmp_path: Path,
+) -> None:
+    fixture = _build_host(tmp_path)
+    _write_bound_helper_fixture(fixture.config.workspace_helper)
+    hook = fixture.config.control_mirror / ".git" / "hooks" / "pre-commit"
+    external = tmp_path / "owner-writable-external-hook"
+    external.write_bytes(b"external\n")
+    external.chmod(0o640)
+    external_before = (external.read_bytes(), stat.S_IMODE(external.stat().st_mode))
+    hook.symlink_to(external)
+
+    with pytest.raises(hs.SetupError, match="mirror guard hook leaf is a symlink"):
+        hs.apply_setup(
+            fixture.config,
+            fixture.home,
+            ForkTestRunner(timeout_seconds=10),
+            ensure=True,
+            no_launchctl=True,
+        )
+
+    assert hook.is_symlink()
+    assert Path(os.readlink(hook)) == external
+    assert (external.read_bytes(), stat.S_IMODE(external.stat().st_mode)) == external_before
+
+
+def test_bound_helper_installs_and_reuses_exact_managed_guard_hooks(tmp_path: Path) -> None:
+    fixture = _build_host(tmp_path)
+    active = _active(fixture)
+    _write_bound_helper_fixture(active.workspace_helper)
+    manifest = hs._load_main_manifest(active)
+    runner = ForkTestRunner(timeout_seconds=10)
+
+    first = hs._run_helper(active, manifest, ["ensure"], runner)
+
+    assert first.returncode == 0, first.stderr
+    identities: dict[Path, tuple[int, int]] = {}
+    for repo in manifest.repos:
+        mirror = manifest.repo_path(repo)
+        hook = mirror / ".git" / "hooks" / "pre-commit"
+        metadata = hook.lstat()
+        assert stat.S_ISREG(metadata.st_mode)
+        assert stat.S_IMODE(metadata.st_mode) == 0o755
+        assert hook.read_bytes() == f"guard:{mirror}\n".encode()
+        identities[hook] = (metadata.st_dev, metadata.st_ino)
+
+    second = hs._run_helper(active, manifest, ["ensure"], runner)
+
+    assert second.returncode == 0, second.stderr
+    assert {hook: (hook.lstat().st_dev, hook.lstat().st_ino) for hook in identities} == identities
 
 
 def test_manifest_identity_stamp_names_python_and_zero_age_guards(tmp_path: Path) -> None:

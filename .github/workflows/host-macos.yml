@@ -59,5 +59,5 @@ jobs:
       - name: Validate LaunchAgent plists with macOS
         run: plutil -lint launchd/*.plist
 
-      - name: Test host-control behavior on macOS
-        run: uv run pytest -q tests/test_host_setup.py
+      - name: Test host-control and state behavior on macOS
+        run: uv run pytest -q tests/test_host_setup.py tests/test_friction_state.py
