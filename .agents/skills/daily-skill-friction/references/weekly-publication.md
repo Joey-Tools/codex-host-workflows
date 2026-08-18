@@ -139,12 +139,21 @@ The helper accepts at most 32 active transactions and 128 MiB of aggregate activ
 JSON, while retaining the 64 MiB per-intent ceiling. A retained-directory,
 streaming stat-only inventory first classifies every final/helper name and caps
 all transaction keys, namespace entries, and distinct final/helper objects before
-any active payload read, helper cleanup, or replay. Before publishing any new
-intent or after-image, the helper also proves capacity for that transaction's
-compact checkpoint. At the next successfully validated transaction boundary, it
-compacts older committed pairs into `wal-history/<operation>/<key>.json`; rejected inputs
-with an already-known exact transaction key/request do not trigger this
-maintenance. The six public approval/audit/selection/publication entry points
+any active payload read, helper cleanup, or replay. Recovery then performs one
+complete read-only domain preflight across every bounded active pending or
+committed transaction, including operation-specific after-images and committed
+external-output state. A later invalid record therefore blocks cleanup, replay,
+external repair, commit, and retirement of every earlier record. Compact
+checkpoints are validated from their immutable authorities rather than treated as
+if they retained full intent payloads. Each pending state target must be its exact
+before- or after-image. Each committed immutable target must be its exact
+after-image; a committed mutable target may contain a later legal value but must
+still exist and remain readable. Before publishing any new intent or after-image,
+the helper also proves capacity for that transaction's compact checkpoint. At the
+next successfully validated transaction boundary, it compacts older committed
+pairs into `wal-history/<operation>/<key>.json`; rejected inputs with an
+already-known exact transaction key/request do not trigger this maintenance. The
+six public approval/audit/selection/publication entry points
 whose key and request are known before recovery perform that read-only binding
 check at lock entry. Stage and dormancy derive their key from recovered live
 state, so required pending recovery can precede their binding check; after the
@@ -277,8 +286,8 @@ For each selected case returned in the validated Weekly plan:
    Do not mix cases or control-plane changes.
 7. Freeze a publication entry binding case ID/revision, branch, commit SHA, base
    SHA, changed paths, validation result, and verified signature evidence. The
-   prepared commit SHA must differ from the bound base SHA; the base tree itself
-   is not a prepared case commit.
+   prepared commit SHA must use the same Git object-ID width as the bound base SHA
+   and must differ from it; the base tree itself is not a prepared case commit.
 
 A signing failure is a blocker. Do not try alternate identities, unsigned commits,
 or a replacement branch. An already prepared exact commit is immutable.
@@ -302,8 +311,9 @@ preapproval finalization envelope. Then call:
 Require JSON `status: finalized`, manifest path, and manifest digest. The helper
 must revalidate the registered immutable plan, the selected cases' unchanged
 integer revisions and canonical semantic digests, the exact prepared set, branch,
-base, a commit SHA distinct from that base, changed paths, local validation, and
-signature evidence before atomically writing the final batch manifest. A newer
+base, a commit SHA with that base's object-ID width and distinct from that base,
+changed paths, local validation, and signature evidence before atomically writing
+the final batch manifest. A newer
 Daily snapshot or a same-outcome change only to `currentness_checked_at` may be
 recorded but cannot block finalization by itself. Preserve the helper's
 `finalized_against_current_snapshot_digest` as additional provenance, fixed
@@ -311,6 +321,9 @@ ordering, and full digest. Semantic drift blocks finalization; never repair it b
 moving a branch or replacing a commit. The helper measures the actual prepared
 receipt, manifest, and finalize WAL against the selection's approved
 publication/finalization bounds before creating that transaction.
+Pending finalization WAL replay repeats the exact registered-plan,
+prepared-receipt, and identical state/external manifest validation before any
+after-image is written.
 
 The state helper never executes Git and therefore validates structured bindings,
 not the external repository by itself. Obtain every prepared field from direct
@@ -332,6 +345,22 @@ after verifying the approved publication outcome may that separate workflow call
 scheduled Weekly never creates either receipt or calls that command. Publication
 approval and a finalized manifest never authorize the later repair decision; that
 requires a distinct interactive receipt after the exact `published` closure.
+For each published entry, `ledger_commit` must use the registered plan base SHA's
+object-ID width and differ from that base. The helper enforces this before closure
+publication, before any recovery or same-key idempotent result, and again before
+replaying a pending closure WAL. Active and retired close authority is likewise
+reconstructed against the registered plan, so an invalid persisted published
+commit cannot produce a successful retry. A later repair approval revalidates the
+whole registered plan, prepared receipt, manifest, exact finalize transaction and
+external path, closure transaction, and active record; a legacy prepared commit
+with a different object-ID width is not rescued by a width-valid closure commit.
+The closure case tuple must be a unique exact manifest entry. A close WAL binds
+exactly one immutable closure path plus one mutable active path per closure entry;
+extra or redirected writes are rejected before replay.
+The protected property is one repository object-ID format plus non-identity with
+the plan base; the helper does not claim to prove Git ancestry. Filesystem
+timestamp churn or a case's benign currentness-only refresh is not evidence that
+the published commit differs from the plan base.
 
 The manifest defines the exact scope that Joey's later publish approval may bind:
 

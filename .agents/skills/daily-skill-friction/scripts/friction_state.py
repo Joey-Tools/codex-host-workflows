@@ -2978,8 +2978,9 @@ class StateStore:
         relative: Path | str,
         *,
         names: Sequence[str] | None = None,
+        recover: bool = True,
     ) -> None:
-        """Remove only unambiguous pre-publication WAL temporaries."""
+        """Validate or remove only unambiguous WAL publication temporaries."""
 
         relative_path = Path(*_safe_relative_parts(relative))
         with self.open_dir(relative_path) as directory_fd:
@@ -2993,6 +2994,12 @@ class StateStore:
             # removes only its exact same-inode helper alias.
             for name in ordered_names:
                 if WAL_LEAF_RE.fullmatch(name) is None:
+                    continue
+                if not recover:
+                    self.read_bytes_without_publication_recovery(
+                        relative_path / name,
+                        max_bytes=MAX_WAL_JSON_BYTES,
+                    )
                     continue
                 try:
                     fd = os.open(
@@ -3017,6 +3024,67 @@ class StateStore:
                     )
                 finally:
                     os.close(fd)
+
+            if not recover:
+                temporaries: dict[str, str] = {}
+                for name in ordered_names:
+                    if not name.startswith("."):
+                        continue
+                    match = WAL_TEMP_RE.fullmatch(name)
+                    if match is None:
+                        _fail("unsafe-helper-temp", f"foreign WAL temporary entry: {name}")
+                    leaf = match.group("leaf")
+                    if leaf in temporaries:
+                        _fail("unsafe-helper-temp", f"ambiguous WAL temporaries for {leaf}")
+                    try:
+                        info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                    except OSError as exc:
+                        _fail(
+                            "unsafe-helper-temp", f"could not inspect WAL temporary: {name}: {exc}"
+                        )
+                    try:
+                        final_info = os.stat(leaf, dir_fd=directory_fd, follow_symlinks=False)
+                    except FileNotFoundError:
+                        final_info = None
+                    expected_links = 1
+                    if final_info is not None:
+                        same_object = (info.st_dev, info.st_ino) == (
+                            final_info.st_dev,
+                            final_info.st_ino,
+                        )
+                        if not same_object or info.st_nlink != 2 or final_info.st_nlink != 2:
+                            _fail(
+                                "unsafe-helper-temp",
+                                f"WAL temporary remains beside an existing final leaf: {leaf}",
+                            )
+                        expected_links = 2
+                    _validate_helper_temp_stat(
+                        info,
+                        self.root / relative_path / name,
+                        expected_links=expected_links,
+                    )
+                    temp_fd = os.open(
+                        name,
+                        os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC,
+                        dir_fd=directory_fd,
+                    )
+                    try:
+                        opened = os.fstat(temp_fd)
+                        if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
+                            _fail("unsafe-helper-temp", f"helper temporary was rebound: {name}")
+                        _read_fd_stable(
+                            temp_fd,
+                            str(self.root / relative_path / name),
+                            private=True,
+                            max_bytes=MAX_WAL_JSON_BYTES,
+                            expected_parent_fd=directory_fd,
+                            expected_name=name,
+                            expected_links=expected_links,
+                        )
+                    finally:
+                        os.close(temp_fd)
+                    temporaries[leaf] = name
+                return
 
             temporaries: dict[str, str] = {}
             for name in ordered_names:
@@ -3923,8 +3991,7 @@ def _read_wal_history_usage(
     *,
     recover: bool = True,
 ) -> dict[str, Any]:
-    if recover:
-        store.recover_wal_history_temporary(WAL_HISTORY_USAGE)
+    store.recover_wal_history_temporary(WAL_HISTORY_USAGE, recover=recover)
     if not store.exists(WAL_HISTORY_USAGE):
         return _new_wal_history_usage()
     if recover:
@@ -4045,6 +4112,98 @@ def _checkpoint_external_outputs(checkpoint: Mapping[str, Any]) -> list[dict[str
     ]
 
 
+def _checkpoint_state_after_images(
+    checkpoint: Mapping[str, Any],
+    operation: str,
+) -> dict[str, dict[str, Any]]:
+    """Return the closed state-write projection for one retired transaction."""
+
+    result: dict[str, dict[str, Any]] = {}
+    for raw in _require_list(checkpoint["after_images"], "wal.checkpoint.after_images"):
+        image = _require_object(raw, "wal.checkpoint.after_image")
+        if image.get("scope") != "state":
+            _fail(
+                "invalid-wal-history",
+                f"{operation} checkpoint cannot contain external after-images",
+            )
+        path = _require_string(image.get("path"), "wal.checkpoint.after_image.path")
+        if path in result:
+            _fail(
+                "invalid-wal-history",
+                f"{operation} checkpoint repeats a state after-image",
+            )
+        result[path] = image
+    return result
+
+
+def _validate_approve_repair_checkpoint_projection(
+    checkpoint: Mapping[str, Any],
+    approval_path: str,
+    approval_record: Mapping[str, Any],
+    index_path: str,
+    index_record: Mapping[str, Any],
+) -> None:
+    """Bind a retired approval checkpoint to exactly its two authorities."""
+
+    images = _checkpoint_state_after_images(checkpoint, "approve-repair")
+    expected = {
+        approval_path: hashlib.sha256(_canonical_bytes(approval_record)).hexdigest(),
+        index_path: hashlib.sha256(_canonical_bytes(index_record)).hexdigest(),
+    }
+    if set(images) != set(expected):
+        _fail(
+            "invalid-wal-history",
+            "approve-repair checkpoint state after-images differ from its authorities",
+        )
+    for path, after_sha256 in expected.items():
+        image = images[path]
+        if (
+            image.get("before_sha256") is not None
+            or image.get("after_sha256") != after_sha256
+            or image.get("immutable") is not True
+        ):
+            _fail(
+                "invalid-wal-history",
+                "approve-repair checkpoint authority projection is invalid",
+            )
+
+
+def _validate_close_publication_checkpoint_projection(
+    checkpoint: Mapping[str, Any],
+    closure_path: str,
+    closure: Mapping[str, Any],
+    entries: Sequence[Mapping[str, Any]],
+) -> None:
+    """Bind a retired closure checkpoint to its closed state target set."""
+
+    images = _checkpoint_state_after_images(checkpoint, "close-publication")
+    active_paths = {f"publication/active/{entry['case_id']}.json" for entry in entries}
+    expected_paths = {closure_path, *active_paths}
+    if set(images) != expected_paths:
+        _fail(
+            "invalid-wal-history",
+            "close-publication checkpoint state after-images differ from its closure",
+        )
+    closure_image = images[closure_path]
+    closure_digest = hashlib.sha256(_canonical_bytes(closure)).hexdigest()
+    if (
+        closure_image.get("before_sha256") is not None
+        or closure_image.get("after_sha256") != closure_digest
+        or closure_image.get("immutable") is not True
+    ):
+        _fail(
+            "invalid-wal-history",
+            "close-publication checkpoint closure projection is invalid",
+        )
+    for path in active_paths:
+        image = images[path]
+        if image.get("before_sha256") is None or image.get("immutable") is not False:
+            _fail(
+                "invalid-wal-history",
+                "close-publication checkpoint active projection is invalid",
+            )
+
+
 def _verify_checkpoint_external_outputs(
     store: StateStore,
     checkpoint: Mapping[str, Any],
@@ -4120,6 +4279,38 @@ def _reconstruct_checkpoint_result(
     operation = checkpoint["operation"]
     if operation == "stage":
         path, receipt = _one_checkpoint_authority(authorities, prefix=("receipts", "stage"))
+        receipt_id = _safe_object_id(receipt.get("receipt_id"), "receipt.receipt_id")
+        if path != f"receipts/stage/{receipt_id}.json":
+            _fail("invalid-wal-history", "stage checkpoint receipt path is invalid")
+        _validate_persisted_receipt(receipt, "stage", receipt_id)
+        consumption_authorities = [
+            (authority_path, value)
+            for authority_path, value in authorities.items()
+            if Path(authority_path).parts[:2] == ("repairs", "consumptions")
+        ]
+        if len(consumption_authorities) > 1:
+            _fail("invalid-wal-history", "stage checkpoint has multiple repair consumptions")
+        if consumption_authorities:
+            consumption_path, consumption = consumption_authorities[0]
+            approval_id = _safe_object_id(
+                consumption.get("approval_id"),
+                "repair_consumption.approval_id",
+            )
+            consumption_body = {
+                key: value for key, value in consumption.items() if key != "consumption_digest"
+            }
+            if (
+                consumption_path != f"repairs/consumptions/{approval_id}.json"
+                or consumption.get("kind") != "repair-approval-consumption"
+                or consumption.get("stage_receipt_id") != receipt_id
+                or consumption.get("consumption_digest") != _digest(consumption_body)
+                or receipt.get("repair_approval")
+                != {
+                    "approval_id": approval_id,
+                    "approval_digest": consumption.get("approval_digest"),
+                }
+            ):
+                _fail("invalid-wal-history", "stage checkpoint repair consumption is invalid")
         result = {**receipt, "path": str(store.root / path)}
     elif operation == "dormancy":
         path, receipt = _one_checkpoint_authority(authorities, prefix=("receipts", "dormancy"))
@@ -4160,7 +4351,14 @@ def _reconstruct_checkpoint_result(
             "skipped": _require_list(plan["skipped"], "plan.skipped"),
         }
     elif operation == "finalize-publication":
-        _, manifest = _one_checkpoint_authority(authorities, prefix=("publication", "manifests"))
+        _, prepared = _one_checkpoint_authority(
+            authorities,
+            prefix=("publication", "prepared"),
+        )
+        _, manifest = _one_checkpoint_authority(
+            authorities,
+            prefix=("publication", "manifests"),
+        )
         outputs = _checkpoint_external_outputs(checkpoint)
         if len(outputs) != 1:
             _fail("invalid-wal-history", "finalize checkpoint must bind one external manifest")
@@ -4171,26 +4369,154 @@ def _reconstruct_checkpoint_result(
             "manifest_digest": manifest["manifest_digest"],
             "entry_count": len(_require_list(manifest["entries"], "manifest.entries")),
         }
+        selection_id = _safe_object_id(manifest.get("selection_id"), "manifest.selection_id")
+        plan = _read_state_json(
+            store,
+            Path("publication") / "plans" / f"{selection_id}.json",
+            recover_publication=recover_publication,
+        )
+        _validate_manifest(manifest, plan, prepared)
+        _validate_finalize_transaction_authority(
+            {
+                "kind": "retired-state-transaction",
+                "operation": operation,
+                "natural_key": checkpoint["natural_key"],
+                "request_digest": checkpoint["request_digest"],
+                "writes": checkpoint["after_images"],
+                "result": result,
+            },
+            plan,
+            prepared,
+            manifest,
+        )
     elif operation == "close-publication":
-        _, closure = _one_checkpoint_authority(authorities, prefix=("publication", "closures"))
+        closure_path, closure = _one_checkpoint_authority(
+            authorities,
+            prefix=("publication", "closures"),
+        )
+        _validate_persisted_closure_record(closure)
+        if (
+            checkpoint["natural_key"] != closure["closure_id"]
+            or closure_path != f"publication/closures/{closure['closure_id']}.json"
+        ):
+            _fail(
+                "invalid-wal-history",
+                "close checkpoint key or authority path does not bind closure_id",
+            )
+        entries = [
+            _require_object(raw, "closure.entry")
+            for raw in _require_list(closure["entries"], "closure.entries")
+        ]
+        if closure.get("reason") == "published":
+            _validate_published_closure_entries_against_plans(
+                store,
+                entries,
+                recover_publication=recover_publication,
+            )
+        _validate_close_publication_checkpoint_projection(
+            checkpoint,
+            closure_path,
+            closure,
+            entries,
+        )
         result = {
             "version": VERSION,
             "status": "closed",
             "closure_id": closure["closure_id"],
             "closure_digest": closure["closure_digest"],
-            "closed_count": len(_require_list(closure["entries"], "closure.entries")),
+            "closed_count": len(entries),
         }
     elif operation == "approve-repair":
-        _, approval = _one_checkpoint_authority(authorities, prefix=("repairs", "approvals"))
-        _, index = _one_checkpoint_authority(authorities, prefix=("repairs", "approval-index"))
-        result = {
+        approval_path, approval_record = _one_checkpoint_authority(
+            authorities,
+            prefix=("repairs", "approvals"),
+        )
+        index_path, index = _one_checkpoint_authority(
+            authorities,
+            prefix=("repairs", "approval-index"),
+        )
+        approval_digest = _raw_sha256(
+            approval_record.get("approval_digest"),
+            "repair_approval.approval_digest",
+        )
+        approval_body = {
+            key: value for key, value in approval_record.items() if key != "approval_digest"
+        }
+        approval = _normalize_repair_approval(approval_body)
+        if approval_digest != _digest(approval):
+            _fail("invalid-repair-approval", "checkpoint repair approval digest is invalid")
+        approval_key = _repair_approval_index_key(approval["source"], approval["target"])
+        if (
+            checkpoint["natural_key"] != approval["approval_id"]
+            or approval_path != f"repairs/approvals/{approval['approval_id']}.json"
+            or index_path != f"repairs/approval-index/{approval_key}.json"
+        ):
+            _fail(
+                "invalid-wal-history",
+                "repair approval checkpoint authority paths or key are invalid",
+            )
+        _exact_fields(
+            index,
+            "repair_approval_index",
+            {
+                "version",
+                "kind",
+                "approval_key",
+                "approval_id",
+                "approval_digest",
+                "source",
+                "target",
+                "index_digest",
+            },
+        )
+        index_body = {key: value for key, value in index.items() if key != "index_digest"}
+        if (
+            index.get("version") != VERSION
+            or index.get("kind") != "repair-approval-index"
+            or index.get("approval_key") != approval_key
+            or index.get("approval_id") != approval["approval_id"]
+            or index.get("approval_digest") != approval_digest
+            or index.get("source") != approval["source"]
+            or index.get("target") != approval["target"]
+            or index.get("index_digest") != _digest(index_body)
+        ):
+            _fail("invalid-repair-approval-index", "checkpoint repair approval index is invalid")
+        legacy_result = {
             "version": VERSION,
             "status": "approved",
             "approval_id": approval["approval_id"],
-            "approval_digest": approval["approval_digest"],
-            "approval_key": index["approval_key"],
+            "approval_digest": approval_digest,
+            "approval_key": approval_key,
             "expires_at": approval["expires_at"],
         }
+        current_result = {
+            **legacy_result,
+            "target_lifecycle_changed_at": approval["interaction"]["approved_at"],
+        }
+        matching_results = [
+            candidate
+            for candidate in (legacy_result, current_result)
+            if _digest(candidate) == checkpoint["result_digest"]
+        ]
+        if len(matching_results) != 1:
+            _fail(
+                "wal-history-result-drift",
+                "repair approval authority matches neither legacy nor current WAL result",
+            )
+        result = matching_results[0]
+        _validate_published_closure_authority(
+            store,
+            approval["publication"],
+            approval["source"],
+            recover_publication=recover_publication,
+        )
+        _validate_approve_repair_checkpoint_projection(
+            checkpoint,
+            approval_path,
+            approval_record,
+            index_path,
+            index,
+        )
     else:
         _fail("invalid-wal-history", f"unsupported checkpoint operation: {operation}")
     if _digest(result) != checkpoint["result_digest"]:
@@ -4839,6 +5165,17 @@ def _read_optional_external(
     )
 
 
+def _read_state_json(
+    store: StateStore,
+    relative: Path | str,
+    *,
+    recover_publication: bool,
+) -> dict[str, Any]:
+    if recover_publication:
+        return store.read_json(relative)[0]
+    return store.read_json_without_publication_recovery(relative)[0]
+
+
 def _planned_external_write(
     store: StateStore, path: Path, value: Mapping[str, Any], *, immutable: bool
 ) -> dict[str, Any]:
@@ -5006,7 +5343,12 @@ def _validate_wal_commit(commit: Mapping[str, Any], intent: Mapping[str, Any]) -
         _fail("invalid-wal", "WAL commit does not bind its exact intent")
 
 
-def _preflight_external_writes(intent: Mapping[str, Any], *, require_after: bool = False) -> None:
+def _preflight_external_writes(
+    intent: Mapping[str, Any],
+    *,
+    require_after: bool = False,
+    recover_publication: bool = True,
+) -> None:
     """Reject rebound external destinations before applying any state after-image."""
 
     for raw_write in intent["writes"]:
@@ -5015,7 +5357,11 @@ def _preflight_external_writes(intent: Mapping[str, Any], *, require_after: bool
             continue
         target = Path(write["path"])
         with _bound_external_parent(target, write["parent_binding"]) as (parent, _):
-            current = _read_optional_external(parent, target)
+            current = _read_optional_external(
+                parent,
+                target,
+                recover_publication=recover_publication,
+            )
             current_digest = current[1] if current is not None else None
             allowed = (
                 {write["after_sha256"]}
@@ -5031,6 +5377,54 @@ def _preflight_external_writes(intent: Mapping[str, Any], *, require_after: bool
                         else f"WAL target is neither its before nor after image: {target}"
                     ),
                 )
+
+
+def _preflight_state_writes(
+    store: StateStore,
+    intent: Mapping[str, Any],
+    *,
+    committed: bool,
+    recover_publication: bool = True,
+) -> None:
+    """Validate every state target before any transaction after-image is applied."""
+
+    for raw_write in intent["writes"]:
+        write = _require_object(raw_write, "wal.write")
+        if write["scope"] != "state":
+            continue
+        target = Path(write["path"])
+        if store.exists(target):
+            current = (
+                store.read_bytes(target)
+                if recover_publication
+                else store.read_bytes_without_publication_recovery(target)
+            )
+            current_digest = current[1]
+        else:
+            current_digest = None
+        if committed and write["immutable"] is not True:
+            # A later committed transaction may legitimately advance a mutable
+            # case, pointer, or active publication record, but cannot erase it.
+            if current_digest is None:
+                _fail(
+                    "wal-target-drift",
+                    f"committed mutable WAL target is missing: {target}",
+                )
+            continue
+        allowed = (
+            {write["after_sha256"]}
+            if committed
+            else {write["before_sha256"], write["after_sha256"]}
+        )
+        if current_digest not in allowed:
+            _fail(
+                "wal-target-drift",
+                (
+                    f"committed immutable WAL target is not its exact after-image: {target}"
+                    if committed
+                    else f"WAL target is neither its before nor after image: {target}"
+                ),
+            )
 
 
 @contextmanager
@@ -5090,7 +5484,11 @@ def _external_after_image_custody(intent: Mapping[str, Any]) -> Iterator[None]:
                 )
 
 
-def _verify_committed_legacy_external_after_images(intent: Mapping[str, Any]) -> None:
+def _verify_committed_legacy_external_after_images(
+    intent: Mapping[str, Any],
+    *,
+    recover_publication: bool = True,
+) -> None:
     """Read-only check for committed v1 outputs that predate parent bindings."""
 
     for raw_write in intent["writes"]:
@@ -5099,7 +5497,11 @@ def _verify_committed_legacy_external_after_images(intent: Mapping[str, Any]) ->
             continue
         target = Path(write["path"])
         with _bound_external_parent(target) as (parent, _):
-            current = _read_optional_external(parent, target)
+            current = _read_optional_external(
+                parent,
+                target,
+                recover_publication=recover_publication,
+            )
             if current is None or current[1] != write["after_sha256"]:
                 _fail(
                     "legacy-external-wal-unbound",
@@ -5108,10 +5510,55 @@ def _verify_committed_legacy_external_after_images(intent: Mapping[str, Any]) ->
                 )
 
 
+def _validate_wal_intent_domain(
+    store: StateStore,
+    intent: Mapping[str, Any],
+    *,
+    committed: bool,
+    recover_publication: bool,
+) -> None:
+    if intent["operation"] == "stage":
+        _validate_stage_intent_domain(
+            store,
+            intent,
+            recover_publication=recover_publication,
+        )
+    elif intent["operation"] == "approve-repair":
+        _validate_approve_repair_intent_lifecycle(
+            store,
+            intent,
+            allow_legacy_result=committed,
+            recover_publication=recover_publication,
+        )
+    elif intent["operation"] == "complete-audit":
+        _validate_complete_audit_intent_receipts(
+            store,
+            intent,
+            recover_publication=recover_publication,
+        )
+    elif intent["operation"] == "finalize-publication":
+        _validate_finalize_publication_intent(
+            store,
+            intent,
+            recover_publication=recover_publication,
+        )
+    elif intent["operation"] == "close-publication":
+        _validate_close_publication_intent_commits(
+            store,
+            intent,
+            recover_publication=recover_publication,
+        )
+
+
 def _apply_wal_intent(store: StateStore, intent: Mapping[str, Any]) -> None:
     store._bind_state_namespace("before WAL after-image application")
-    if intent["operation"] == "complete-audit":
-        _validate_complete_audit_intent_receipts(store, intent)
+    _validate_wal_intent_domain(
+        store,
+        intent,
+        committed=False,
+        recover_publication=True,
+    )
+    _preflight_state_writes(store, intent, committed=False)
     _preflight_external_writes(intent)
     for raw_write in intent["writes"]:
         write = _require_object(raw_write, "wal.write")
@@ -5519,6 +5966,82 @@ def _preflight_transaction_binding_read_only(
         )
 
 
+def _preflight_existing_transaction_domain_read_only(
+    store: StateStore,
+    *,
+    operation: str,
+    natural_key: str,
+) -> None:
+    """Validate an existing active or retired domain authority without mutation."""
+
+    intent_path, commit_path = _wal_paths(operation, natural_key)
+    history_path = _wal_history_path(operation, natural_key)
+    has_intent = store.exists(intent_path)
+    has_commit = store.exists(commit_path)
+    has_history = store.exists(history_path)
+    if not has_intent:
+        if has_commit:
+            _fail("invalid-wal-layout", "WAL commit exists without its intent")
+        if not has_history:
+            return
+        checkpoint = _load_wal_checkpoint_binding_read_only(store, operation, natural_key)
+        assert checkpoint is not None
+        _reconstruct_checkpoint_result(
+            store,
+            checkpoint,
+            recover_publication=False,
+        )
+        return
+    intent = store.read_json_without_publication_recovery(
+        intent_path,
+        max_bytes=MAX_WAL_JSON_BYTES,
+    )[0]
+    legacy_external = _validate_wal_intent(
+        store,
+        intent,
+        operation,
+        allow_committed_legacy_external=(has_commit or has_history),
+    )
+    if intent.get("natural_key") != natural_key:
+        _fail("invalid-wal-layout", "WAL intent natural key differs from its lookup key")
+    if has_commit:
+        commit = store.read_json_without_publication_recovery(
+            commit_path,
+            max_bytes=MAX_WAL_JSON_BYTES,
+        )[0]
+        _validate_wal_commit(commit, intent)
+    _validate_wal_intent_domain(
+        store,
+        intent,
+        committed=(has_commit or has_history),
+        recover_publication=False,
+    )
+    _preflight_state_writes(
+        store,
+        intent,
+        committed=(has_commit or has_history),
+        recover_publication=False,
+    )
+    if legacy_external:
+        _verify_committed_legacy_external_after_images(
+            intent,
+            recover_publication=False,
+        )
+    else:
+        _preflight_external_writes(
+            intent,
+            recover_publication=False,
+        )
+    if has_history:
+        checkpoint = _load_wal_checkpoint_binding_read_only(store, operation, natural_key)
+        assert checkpoint is not None
+        _reconstruct_checkpoint_result(
+            store,
+            checkpoint,
+            recover_publication=False,
+        )
+
+
 def _run_transaction(
     store: StateStore,
     *,
@@ -5807,13 +6330,15 @@ def _recover_pending_wal(
 ) -> None:
     store._bind_state_namespace("before WAL recovery")
     validated: list[dict[str, Any]] = []
-    active_transaction_count = 0
-    active_bytes = 0
     inventory = _preflight_active_wal_namespace(store)
     for operation, inventory_names in inventory:
         directory = Path("wal") / operation
         try:
-            store.recover_wal_temporaries(directory, names=inventory_names)
+            store.recover_wal_temporaries(
+                directory,
+                names=inventory_names,
+                recover=False,
+            )
         except OSError as exc:
             _fail(
                 "invalid-wal-layout",
@@ -5836,28 +6361,13 @@ def _recover_pending_wal(
                 f"WAL commit exists without its intent: {commit_paths[orphan_commits[0]]}",
             )
 
-        active_transaction_count += len(intent_paths)
-        if active_transaction_count > MAX_ACTIVE_WAL_TRANSACTIONS:
-            _fail(
-                "active-wal-count-limit",
-                f"active WAL exceeds {MAX_ACTIVE_WAL_TRANSACTIONS} transactions",
-            )
-        for path in [*intent_paths.values(), *commit_paths.values()]:
-            size = store.private_file_size(path)
-            if size > MAX_WAL_JSON_BYTES:
-                _fail("active-wal-byte-limit", f"active WAL leaf is too large: {path}")
-            active_bytes += size
-            if active_bytes > MAX_ACTIVE_WAL_BYTES:
-                _fail(
-                    "active-wal-byte-limit",
-                    f"active WAL exceeds {MAX_ACTIVE_WAL_BYTES} aggregate bytes",
-                )
-
         for key, intent_path in sorted(intent_paths.items()):
             try:
-                intent, intent_file_digest, intent_identity, _ = store.read_json_with_identity(
-                    intent_path,
-                    max_bytes=MAX_WAL_JSON_BYTES,
+                intent, intent_file_digest, intent_identity, _ = (
+                    store.read_json_without_publication_recovery_with_identity(
+                        intent_path,
+                        max_bytes=MAX_WAL_JSON_BYTES,
+                    )
                 )
             except OSError as exc:
                 _fail(
@@ -5888,9 +6398,11 @@ def _recover_pending_wal(
             commit: dict[str, Any] | None = None
             if candidate_commit is not None:
                 try:
-                    commit, commit_file_digest, commit_identity, _ = store.read_json_with_identity(
-                        candidate_commit,
-                        max_bytes=MAX_WAL_JSON_BYTES,
+                    commit, commit_file_digest, commit_identity, _ = (
+                        store.read_json_without_publication_recovery_with_identity(
+                            candidate_commit,
+                            max_bytes=MAX_WAL_JSON_BYTES,
+                        )
                     )
                 except OSError as exc:
                     _fail(
@@ -5899,12 +6411,15 @@ def _recover_pending_wal(
                     )
                 _validate_wal_commit(commit, intent)
             history_candidate = _wal_history_path(operation, intent["natural_key"])
-            store.recover_wal_history_temporary(history_candidate)
+            store.recover_wal_history_temporary(history_candidate, recover=False)
             if store.exists(history_candidate):
                 history_path = history_candidate
-                checkpoint, _, _, checkpoint_size = store.read_json_with_identity(
-                    history_path,
-                    max_bytes=MAX_WAL_HISTORY_RECORD_BYTES,
+                checkpoint, _, _, checkpoint_size = (
+                    store.read_json_without_publication_recovery_with_identity(
+                        history_path,
+                        max_bytes=MAX_WAL_HISTORY_RECORD_BYTES,
+                        fixed_helper_name=_wal_history_fixed_temp_name(history_path.name),
+                    )
                 )
                 checkpoint = _validate_wal_checkpoint(
                     store,
@@ -5929,13 +6444,41 @@ def _recover_pending_wal(
                 )
                 if checkpoint != expected_checkpoint:
                     _fail("wal-history-conflict", "checkpoint differs from active WAL")
-                _reconstruct_checkpoint_result(store, checkpoint, verify_external=False)
+                _reconstruct_checkpoint_result(
+                    store,
+                    checkpoint,
+                    verify_external=False,
+                    recover_publication=False,
+                )
             if commit is None and checkpoint is None and candidate_commit is None:
                 # This is the sole replayable state: a full bound intent without
                 # either commit or checkpoint.
                 pass
             elif commit is None:
                 _fail("invalid-wal-layout", "committed WAL state has no reconstructable commit")
+            logically_committed = candidate_committed or checkpoint is not None
+            _validate_wal_intent_domain(
+                store,
+                intent,
+                committed=logically_committed,
+                recover_publication=False,
+            )
+            _preflight_state_writes(
+                store,
+                intent,
+                committed=logically_committed,
+                recover_publication=False,
+            )
+            if legacy_external:
+                _verify_committed_legacy_external_after_images(
+                    intent,
+                    recover_publication=False,
+                )
+            else:
+                _preflight_external_writes(
+                    intent,
+                    recover_publication=False,
+                )
             validated.append(
                 {
                     "operation": operation,
@@ -5946,6 +6489,7 @@ def _recover_pending_wal(
                     "intent_identity": intent_identity,
                     "commit_identity": commit_identity,
                     "legacy_external": legacy_external,
+                    "history_candidate": history_candidate,
                     "checkpoint": checkpoint,
                     "checkpoint_size": checkpoint_size,
                     "commit": commit,
@@ -5974,7 +6518,7 @@ def _recover_pending_wal(
             os.fsencode(record["natural_key"]),
         ),
     )
-    projected_usage = _read_wal_history_usage(store)
+    projected_usage = _read_wal_history_usage(store, recover=False)
     for record in checkpoint_records:
         checkpoint = record["checkpoint"]
         checkpoint_size = record["checkpoint_size"]
@@ -6028,15 +6572,16 @@ def _recover_pending_wal(
         )
     validated = [*checkpoint_records, *checkpoint_free_records]
 
-    # Only replay or repair after the complete WAL namespace and every existing
-    # pair have passed canonical-name, private-file, JSON, and exact-binding
-    # validation.  Re-read each leaf and compare its content digest so the
-    # validation-to-use boundary does not rely on timestamp metadata.
+    # Re-read and domain-validate every bounded active record before any helper
+    # cleanup, replay, external repair, commit, or retirement can mutate state.
     for record in validated:
         operation = record["operation"]
         intent_path = record["intent_path"]
         current_intent, current_intent_digest, current_intent_identity, _ = (
-            store.read_json_with_identity(intent_path, max_bytes=MAX_WAL_JSON_BYTES)
+            store.read_json_without_publication_recovery_with_identity(
+                intent_path,
+                max_bytes=MAX_WAL_JSON_BYTES,
+            )
         )
         if (
             current_intent_digest != record["intent_file_digest"]
@@ -6055,7 +6600,7 @@ def _recover_pending_wal(
         commit = record["commit"]
         if record["commit_path"] is not None:
             commit, current_commit_digest, current_commit_identity, _ = (
-                store.read_json_with_identity(
+                store.read_json_without_publication_recovery_with_identity(
                     record["commit_path"],
                     max_bytes=MAX_WAL_JSON_BYTES,
                 )
@@ -6069,6 +6614,86 @@ def _recover_pending_wal(
                     f"WAL commit changed during recovery: {record['commit_path']}",
                 )
             _validate_wal_commit(commit, intent)
+        logically_committed = commit is not None or record["checkpoint"] is not None
+        _validate_wal_intent_domain(
+            store,
+            intent,
+            committed=logically_committed,
+            recover_publication=False,
+        )
+        _preflight_state_writes(
+            store,
+            intent,
+            committed=logically_committed,
+            recover_publication=False,
+        )
+        if record["legacy_external"]:
+            _verify_committed_legacy_external_after_images(
+                intent,
+                recover_publication=False,
+            )
+        else:
+            _preflight_external_writes(
+                intent,
+                recover_publication=False,
+            )
+        record["intent"] = intent
+        record["commit"] = commit
+
+    # Domain-valid helper churn is benign metadata.  Converge it only after the
+    # complete active set has passed the protected semantic/content checks.
+    for operation, inventory_names in inventory:
+        store.recover_wal_temporaries(
+            Path("wal") / operation,
+            names=inventory_names,
+        )
+    store.recover_wal_history_temporary(WAL_HISTORY_USAGE)
+    for history_candidate in sorted(
+        {record["history_candidate"] for record in validated},
+        key=lambda path: os.fsencode(str(path)),
+    ):
+        store.recover_wal_history_temporary(history_candidate)
+
+    # Helper cleanup does not change the selected final objects or bytes.  Bind
+    # every active leaf once more before the mutation phase begins.
+    for record in validated:
+        intent, intent_digest, intent_identity, _ = (
+            store.read_json_without_publication_recovery_with_identity(
+                record["intent_path"],
+                max_bytes=MAX_WAL_JSON_BYTES,
+            )
+        )
+        if (
+            intent_digest != record["intent_file_digest"]
+            or intent_identity != record["intent_identity"]
+            or intent != record["intent"]
+        ):
+            _fail(
+                "wal-layout-changed",
+                f"WAL intent changed during helper recovery: {record['intent_path']}",
+            )
+        if record["commit_path"] is not None:
+            commit, commit_digest, commit_identity, _ = (
+                store.read_json_without_publication_recovery_with_identity(
+                    record["commit_path"],
+                    max_bytes=MAX_WAL_JSON_BYTES,
+                )
+            )
+            if (
+                commit_digest != record["commit_file_digest"]
+                or commit_identity != record["commit_identity"]
+                or commit != record["commit"]
+            ):
+                _fail(
+                    "wal-layout-changed",
+                    f"WAL commit changed during helper recovery: {record['commit_path']}",
+                )
+
+    for record in validated:
+        operation = record["operation"]
+        intent_path = record["intent_path"]
+        intent = record["intent"]
+        commit = record["commit"]
         if commit is not None:
             if record["legacy_external"]:
                 _verify_committed_legacy_external_after_images(intent)
@@ -6107,11 +6732,30 @@ def _recover_pending_wal(
 
 
 def _require_committed_transaction(
-    store: StateStore, operation: str, natural_key: str
+    store: StateStore,
+    operation: str,
+    natural_key: str,
+    *,
+    recover_publication: bool = True,
 ) -> dict[str, Any]:
     intent_path, commit_path = _wal_paths(operation, natural_key)
     if not store.exists(intent_path) and not store.exists(commit_path):
-        retired = _load_wal_checkpoint(store, operation, natural_key)
+        if recover_publication:
+            retired = _load_wal_checkpoint(store, operation, natural_key)
+        else:
+            checkpoint = _load_wal_checkpoint_binding_read_only(store, operation, natural_key)
+            retired = (
+                None
+                if checkpoint is None
+                else (
+                    checkpoint,
+                    _reconstruct_checkpoint_result(
+                        store,
+                        checkpoint,
+                        recover_publication=False,
+                    ),
+                )
+            )
         if retired is None:
             _fail(
                 "missing-authority-transaction",
@@ -6132,8 +6776,16 @@ def _require_committed_transaction(
         }
     if not store.exists(intent_path) or not store.exists(commit_path):
         _fail("missing-authority-transaction", f"{operation} has no committed control transaction")
-    intent, _ = store.read_json(intent_path)
-    commit, _ = store.read_json(commit_path)
+    intent = _read_state_json(
+        store,
+        intent_path,
+        recover_publication=recover_publication,
+    )
+    commit = _read_state_json(
+        store,
+        commit_path,
+        recover_publication=recover_publication,
+    )
     legacy_external = _validate_wal_intent(
         store,
         intent,
@@ -6141,10 +6793,29 @@ def _require_committed_transaction(
         allow_committed_legacy_external=True,
     )
     _validate_wal_commit(commit, intent)
+    _validate_wal_intent_domain(
+        store,
+        intent,
+        committed=True,
+        recover_publication=recover_publication,
+    )
+    _preflight_state_writes(
+        store,
+        intent,
+        committed=True,
+        recover_publication=recover_publication,
+    )
     if legacy_external:
-        _verify_committed_legacy_external_after_images(intent)
+        _verify_committed_legacy_external_after_images(
+            intent,
+            recover_publication=recover_publication,
+        )
     else:
-        _preflight_external_writes(intent, require_after=True)
+        _preflight_external_writes(
+            intent,
+            require_after=True,
+            recover_publication=recover_publication,
+        )
     return intent
 
 
@@ -7005,10 +7676,24 @@ def _validate_published_closure_authority(
     store: StateStore,
     publication: Mapping[str, Any],
     source_tuple: Mapping[str, Any],
+    *,
+    recover_publication: bool = True,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
+    plan, _, manifest, _ = _validate_registered_finalized_publication_authority(
+        store,
+        selection_id=publication["selection_id"],
+        plan_digest=publication["plan_digest"],
+        manifest_digest=publication["manifest_digest"],
+        recover_publication=recover_publication,
+    )
     closure_id = publication["closure_id"]
     closure_relative = Path("publication") / "closures" / f"{closure_id}.json"
-    closure = store.read_json(closure_relative)[0]
+    closure = _read_state_json(
+        store,
+        closure_relative,
+        recover_publication=recover_publication,
+    )
+    _validate_persisted_closure_record(closure)
     body = {key: value for key, value in closure.items() if key != "closure_digest"}
     if (
         closure.get("kind") != "publication-closure"
@@ -7037,11 +7722,23 @@ def _validate_published_closure_authority(
     }
     if any(entry.get(field) != expected_value for field, expected_value in expected.items()):
         _fail("invalid-repair-publication", "published closure provenance does not match")
-    intent = _require_committed_transaction(store, "close-publication", closure_id)
+    _validate_manifest_closure_entry(manifest, entry)
+    _validate_published_ledger_commit(entry, plan)
+    intent = _require_committed_transaction(
+        store,
+        "close-publication",
+        closure_id,
+        recover_publication=recover_publication,
+    )
     if intent["result"].get("closure_digest") != publication["closure_digest"]:
         _fail("missing-authority-transaction", "closure WAL does not bind repair publication")
     active_relative = Path("publication") / "active" / f"{source_tuple['case_id']}.json"
-    active = store.read_json(active_relative)[0]
+    active = _read_state_json(
+        store,
+        active_relative,
+        recover_publication=recover_publication,
+    )
+    _validate_pending_record(active, source_tuple["case_id"])
     if any(
         active.get(field) != expected_value
         for field, expected_value in {
@@ -7073,6 +7770,312 @@ def _validate_repair_approval_times(
         _fail("repair-approval-too-long", "repair approval validity cannot exceed seven days")
 
 
+def _validate_repair_approval_lifecycle_time(
+    approval: Mapping[str, Any], target: Mapping[str, Any]
+) -> None:
+    target_case = _require_object(target.get("case"), "target.case")
+    if target_case.get("lifecycle_changed_at") != approval["interaction"]["approved_at"]:
+        _fail(
+            "repair-approval-lifecycle-mismatch",
+            "approved target lifecycle_changed_at must equal repair approved_at",
+        )
+
+
+def _validate_approve_repair_intent_lifecycle(
+    store: StateStore,
+    intent: Mapping[str, Any],
+    *,
+    allow_legacy_result: bool = False,
+    recover_publication: bool = True,
+) -> None:
+    """Validate approval/index, lifecycle witness, and publication authority."""
+
+    approvals: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    indexes: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    writes = _require_list(intent["writes"], "wal.writes")
+    if len(writes) != 2:
+        _fail("invalid-wal", "approve-repair intent must contain exactly two authority writes")
+    for index, raw_write in enumerate(writes):
+        write = _require_object(raw_write, f"wal.writes[{index}]")
+        if write.get("scope") != "state":
+            continue
+        after = _require_object(write.get("after"), f"wal.writes[{index}].after")
+        if after.get("kind") == "repair-approval":
+            approvals.append((write, after))
+        elif after.get("kind") == "repair-approval-index":
+            indexes.append((write, after))
+    if len(approvals) != 1 or len(indexes) != 1:
+        _fail(
+            "invalid-wal",
+            "approve-repair intent must contain one approval and one index record",
+        )
+    approval_write, record = approvals[0]
+    approval_digest = _raw_sha256(
+        record.get("approval_digest"), "wal.repair_approval.approval_digest"
+    )
+    approval_body = {key: value for key, value in record.items() if key != "approval_digest"}
+    approval = _normalize_repair_approval(approval_body)
+    if approval_digest != _digest(approval):
+        _fail("invalid-repair-approval", "approve-repair WAL approval digest is invalid")
+    approval_key = _repair_approval_index_key(approval["source"], approval["target"])
+    index_write, index_record = indexes[0]
+    _exact_fields(
+        index_record,
+        "wal.repair_approval_index",
+        {
+            "version",
+            "kind",
+            "approval_key",
+            "approval_id",
+            "approval_digest",
+            "source",
+            "target",
+            "index_digest",
+        },
+    )
+    index_body = {key: value for key, value in index_record.items() if key != "index_digest"}
+    if (
+        index_record.get("version") != VERSION
+        or index_record.get("kind") != "repair-approval-index"
+        or index_record.get("approval_key") != approval_key
+        or index_record.get("approval_id") != approval["approval_id"]
+        or index_record.get("approval_digest") != approval_digest
+        or index_record.get("source") != approval["source"]
+        or index_record.get("target") != approval["target"]
+        or index_record.get("index_digest") != _digest(index_body)
+    ):
+        _fail("invalid-repair-approval-index", "approve-repair WAL index is invalid")
+    if (
+        intent.get("natural_key") != approval["approval_id"]
+        or approval_write.get("path") != f"repairs/approvals/{approval['approval_id']}.json"
+        or index_write.get("path") != f"repairs/approval-index/{approval_key}.json"
+        or approval_write.get("immutable") is not True
+        or index_write.get("immutable") is not True
+    ):
+        _fail("invalid-wal", "approve-repair WAL authority paths or mutability are invalid")
+    result = _require_object(intent.get("result"), "wal.result")
+    legacy_fields = {
+        "version",
+        "status",
+        "approval_id",
+        "approval_digest",
+        "approval_key",
+        "expires_at",
+    }
+    has_lifecycle_witness = "target_lifecycle_changed_at" in result
+    _exact_fields(
+        result,
+        "wal.result",
+        legacy_fields | ({"target_lifecycle_changed_at"} if has_lifecycle_witness else set()),
+    )
+    expected = {
+        "version": VERSION,
+        "status": "approved",
+        "approval_id": approval["approval_id"],
+        "approval_digest": approval_digest,
+        "approval_key": approval_key,
+        "expires_at": approval["expires_at"],
+    }
+    if any(result.get(field) != value for field, value in expected.items()):
+        _fail("invalid-repair-approval", "approve-repair WAL result is invalid")
+    if not has_lifecycle_witness:
+        if not allow_legacy_result:
+            _fail(
+                "repair-approval-lifecycle-mismatch",
+                "pending approve-repair WAL lacks its target lifecycle decision-time witness",
+            )
+    else:
+        target_lifecycle_changed_at = _timestamp(
+            result["target_lifecycle_changed_at"],
+            "wal.result.target_lifecycle_changed_at",
+        )
+        if target_lifecycle_changed_at != approval["interaction"]["approved_at"]:
+            _fail(
+                "repair-approval-lifecycle-mismatch",
+                "approve-repair WAL target lifecycle_changed_at must equal repair approved_at",
+            )
+    _validate_published_closure_authority(
+        store,
+        approval["publication"],
+        approval["source"],
+        recover_publication=recover_publication,
+    )
+
+
+def _validate_stage_intent_repair_approval_lifecycle(
+    store: StateStore,
+    intent: Mapping[str, Any],
+    *,
+    recover_publication: bool = True,
+) -> None:
+    """Revalidate the approved lifecycle timestamp before replaying a stage WAL."""
+
+    consumptions: list[dict[str, Any]] = []
+    candidates: list[dict[str, Any]] = []
+    for index, raw_write in enumerate(_require_list(intent["writes"], "wal.writes")):
+        write = _require_object(raw_write, f"wal.writes[{index}]")
+        if write.get("scope") != "state":
+            continue
+        after = _require_object(write.get("after"), f"wal.writes[{index}].after")
+        if after.get("kind") == "repair-approval-consumption":
+            consumptions.append(after)
+        elif isinstance(after.get("case"), dict) and isinstance(after.get("control"), dict):
+            candidates.append(after)
+    if not consumptions:
+        return
+    if len(consumptions) != 1:
+        _fail("invalid-wal", "approval-bound stage intent must contain one consumption")
+    consumption = consumptions[0]
+    _exact_fields(
+        consumption,
+        "wal.repair_approval_consumption",
+        {
+            "version",
+            "kind",
+            "approval_id",
+            "approval_digest",
+            "case_id",
+            "revision",
+            "semantic_digest",
+            "repair_binding",
+            "consumed_at",
+            "stage_receipt_id",
+            "consumption_digest",
+        },
+    )
+    consumption_body = {
+        key: value for key, value in consumption.items() if key != "consumption_digest"
+    }
+    if (
+        consumption.get("version") != VERSION
+        or consumption.get("kind") != "repair-approval-consumption"
+        or consumption.get("consumption_digest") != _digest(consumption_body)
+    ):
+        _fail("invalid-repair-consumption", "stage WAL repair consumption is invalid")
+    approval_id = _safe_object_id(consumption.get("approval_id"), "wal.consumption.approval_id")
+    approval_digest = _raw_sha256(
+        consumption.get("approval_digest"), "wal.consumption.approval_digest"
+    )
+    case_id = _validate_case_id(consumption.get("case_id"), "wal.consumption.case_id")
+    matching_candidates = [
+        candidate
+        for candidate in candidates
+        if _require_object(candidate.get("case"), "wal.candidate.case").get("id") == case_id
+    ]
+    if len(matching_candidates) != 1:
+        _fail("invalid-wal", "approval-bound stage intent must contain one target case")
+    target = matching_candidates[0]
+    validate_candidate(target)
+    target_tuple = _case_tuple(target)
+    if any(
+        consumption.get(field) != target_tuple[field]
+        for field in ("case_id", "revision", "semantic_digest")
+    ):
+        _fail("invalid-wal", "stage consumption does not bind its target case")
+
+    approval_relative = Path("repairs") / "approvals" / f"{approval_id}.json"
+    record = _read_state_json(
+        store,
+        approval_relative,
+        recover_publication=recover_publication,
+    )
+    persisted_digest = _raw_sha256(record.get("approval_digest"), "repair_approval.approval_digest")
+    approval_body = {key: value for key, value in record.items() if key != "approval_digest"}
+    approval = _normalize_repair_approval(approval_body)
+    if (
+        persisted_digest != _digest(approval)
+        or persisted_digest != approval_digest
+        or approval["approval_id"] != approval_id
+        or approval["target"] != target_tuple
+    ):
+        _fail("invalid-repair-approval", "stage WAL repair approval binding is invalid")
+    approval_key = _repair_approval_index_key(approval["source"], approval["target"])
+    authority_intent = _require_committed_transaction(
+        store,
+        "approve-repair",
+        approval_id,
+        recover_publication=recover_publication,
+    )
+    if (
+        authority_intent["result"].get("approval_digest") != approval_digest
+        or authority_intent["result"].get("approval_key") != approval_key
+    ):
+        _fail("missing-authority-transaction", "stage WAL has no exact approval authority")
+    authority_lifecycle = authority_intent["result"].get("target_lifecycle_changed_at")
+    if (
+        authority_lifecycle is not None
+        and authority_lifecycle != approval["interaction"]["approved_at"]
+    ):
+        _fail(
+            "repair-approval-lifecycle-mismatch",
+            "approve-repair WAL target lifecycle_changed_at must equal repair approved_at",
+        )
+    closure, _ = _validate_published_closure_authority(
+        store,
+        approval["publication"],
+        approval["source"],
+        recover_publication=recover_publication,
+    )
+    _validate_repair_approval_times(approval, closure, intent["captured_at"])
+    _validate_repair_approval_lifecycle_time(approval, target)
+
+
+def _validate_stage_intent_domain(
+    store: StateStore,
+    intent: Mapping[str, Any],
+    *,
+    recover_publication: bool = True,
+) -> None:
+    receipts: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    candidates: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for index, raw_write in enumerate(_require_list(intent["writes"], "wal.writes")):
+        write = _require_object(raw_write, f"wal.writes[{index}]")
+        if write.get("scope") != "state":
+            continue
+        after = _require_object(write.get("after"), f"wal.writes[{index}].after")
+        if after.get("kind") == "stage":
+            receipts.append((write, after))
+        elif isinstance(after.get("case"), dict) and isinstance(after.get("control"), dict):
+            candidates.append((write, after))
+    if len(receipts) != 1:
+        _fail("invalid-wal", "stage intent must contain one immutable stage receipt")
+    receipt_write, receipt = receipts[0]
+    receipt_id = _safe_object_id(receipt.get("receipt_id"), "receipt.receipt_id")
+    _validate_persisted_receipt(receipt, "stage", receipt_id)
+    expected_receipt_path = f"receipts/stage/{receipt_id}.json"
+    if (
+        receipt_write.get("path") != expected_receipt_path
+        or receipt_write.get("immutable") is not True
+    ):
+        _fail("invalid-wal", "stage receipt after-image path or mutability is invalid")
+    matching_candidates = [
+        (write, candidate)
+        for write, candidate in candidates
+        if _require_object(candidate.get("case"), "wal.candidate.case").get("id")
+        == receipt["case_id"]
+    ]
+    if len(matching_candidates) != 1:
+        _fail("invalid-wal", "stage intent must contain one case after-image for its receipt")
+    candidate_write, candidate = matching_candidates[0]
+    summary = validate_candidate(candidate)
+    if (
+        candidate_write.get("path") != receipt["case_path"]
+        or summary["revision"] != receipt["revision"]
+        or summary["semantic_digest"] != receipt["semantic_digest"]
+        or hashlib.sha256(_canonical_bytes(candidate)).hexdigest() != receipt["wrapper_file_sha256"]
+        or hashlib.sha256(_canonical_bytes(candidate["case"])).hexdigest() != receipt["case_sha256"]
+    ):
+        _fail("invalid-wal", "stage case after-image differs from its receipt")
+    expected_result = {**receipt, "path": str(store.root / expected_receipt_path)}
+    if intent.get("result") != expected_result:
+        _fail("invalid-wal", "stage WAL result differs from its receipt")
+    _validate_stage_intent_repair_approval_lifecycle(
+        store,
+        intent,
+        recover_publication=recover_publication,
+    )
+
+
 def approve_repair(
     state_root: Path,
     candidate_path: Path,
@@ -7096,6 +8099,7 @@ def approve_repair(
     target_tuple = _case_tuple(candidate)
     if approval["target"] != target_tuple:
         _fail("repair-approval-mismatch", "approval does not bind the exact target tuple")
+    _validate_repair_approval_lifecycle_time(approval, candidate)
     request = {"approval": approval, "target": target_tuple}
     approval_id = approval["approval_id"]
     with _state_lock(
@@ -7108,6 +8112,18 @@ def approve_repair(
             operation="approve-repair",
             natural_key=approval_id,
             request=request,
+        )
+        preflight_closure, _ = _validate_published_closure_authority(
+            store,
+            approval["publication"],
+            approval["source"],
+            recover_publication=False,
+        )
+        _validate_repair_approval_times(approval, preflight_closure, now_value)
+        _preflight_existing_transaction_domain_read_only(
+            store,
+            operation="approve-repair",
+            natural_key=approval_id,
         )
         _read_marker(state_root)
         _recover_pending_wal(store)
@@ -7169,6 +8185,7 @@ def approve_repair(
             "approval_digest": approval_digest,
             "approval_key": approval_key,
             "expires_at": approval["expires_at"],
+            "target_lifecycle_changed_at": candidate["case"]["lifecycle_changed_at"],
         }
         return _run_transaction(
             store,
@@ -7237,12 +8254,22 @@ def _load_unconsumed_repair_approval(
         or approval["target"] != target_tuple
     ):
         _fail("invalid-repair-approval", "persisted repair approval binding is invalid")
+    _validate_repair_approval_lifecycle_time(approval, target)
     authority_intent = _require_committed_transaction(store, "approve-repair", approval_id)
     if (
         authority_intent["result"].get("approval_digest") != approval_digest
         or authority_intent["result"].get("approval_key") != approval_key
     ):
         _fail("missing-authority-transaction", "approve-repair WAL does not bind authority")
+    authority_lifecycle = authority_intent["result"].get("target_lifecycle_changed_at")
+    if (
+        authority_lifecycle is not None
+        and authority_lifecycle != approval["interaction"]["approved_at"]
+    ):
+        _fail(
+            "repair-approval-lifecycle-mismatch",
+            "approve-repair WAL target lifecycle_changed_at must equal repair approved_at",
+        )
     closure, _ = _validate_published_closure_authority(store, approval["publication"], source_tuple)
     _validate_repair_approval_times(approval, closure, now_value)
     consumption_relative = Path("repairs") / "consumptions" / f"{approval_id}.json"
@@ -8141,7 +9168,12 @@ def _receipt_objects(root: Path, category: str, anchor: str | None) -> list[dict
     return result
 
 
-def _validate_complete_audit_intent_receipts(store: StateStore, intent: Mapping[str, Any]) -> None:
+def _validate_complete_audit_intent_receipts(
+    store: StateStore,
+    intent: Mapping[str, Any],
+    *,
+    recover_publication: bool = True,
+) -> None:
     """Reject a persisted completion intent whose snapshot misstates its receipts."""
 
     snapshots: list[dict[str, Any]] = []
@@ -8165,14 +9197,43 @@ def _validate_complete_audit_intent_receipts(store: StateStore, intent: Mapping[
     dormancy_refs = _normalize_receipt_refs(
         snapshot["dormancy_receipts"], "snapshot.dormancy_receipts"
     )
-    if stage_refs != _receipt_files(store.root, "stage", anchor):
+    if recover_publication:
+        receipt_objects = {
+            category: _receipt_objects(store.root, category, anchor)
+            for category in ("stage", "dormancy")
+        }
+    else:
+        receipt_objects: dict[str, list[dict[str, Any]]] = {}
+        for category in ("stage", "dormancy"):
+            directory = Path("receipts") / category
+            objects: list[dict[str, Any]] = []
+            for name in store.list_names(directory):
+                if not name.endswith(".json") or SAFE_OBJECT_ID_RE.fullmatch(name[:-5]) is None:
+                    _fail("unsafe-receipt-layout", f"unexpected receipt entry: {name}")
+                receipt = _read_state_json(
+                    store,
+                    directory / name,
+                    recover_publication=False,
+                )
+                _validate_persisted_receipt(receipt, category, name[:-5])
+                if receipt.get("anchor_snapshot_digest") == anchor:
+                    objects.append(receipt)
+            receipt_objects[category] = sorted(
+                objects,
+                key=lambda receipt: receipt["receipt_id"],
+            )
+    expected_stage_refs = [
+        {"receipt_id": receipt["receipt_id"], "digest": receipt["digest"]}
+        for receipt in receipt_objects["stage"]
+    ]
+    expected_dormancy_refs = [
+        {"receipt_id": receipt["receipt_id"], "digest": receipt["digest"]}
+        for receipt in receipt_objects["dormancy"]
+    ]
+    if stage_refs != expected_stage_refs:
         _fail("invalid-wal", "complete-audit snapshot does not bind every stage receipt")
-    if dormancy_refs != _receipt_files(store.root, "dormancy", anchor):
+    if dormancy_refs != expected_dormancy_refs:
         _fail("invalid-wal", "complete-audit snapshot does not bind every dormancy receipt")
-    receipt_objects = {
-        category: _receipt_objects(store.root, category, anchor)
-        for category in ("stage", "dormancy")
-    }
     started = _parse_time(snapshot["started_at"], "snapshot.started_at")
     ended = _parse_time(snapshot["ended_at"], "snapshot.ended_at")
     for category in ("stage", "dormancy"):
@@ -9359,6 +10420,11 @@ def _validate_prepared_entry(
     commit_sha = _require_string(entry.get("commit_sha"), "commit_sha")
     if GIT_SHA_RE.fullmatch(commit_sha) is None:
         _fail("invalid-git-sha", f"invalid commit SHA for {case_id}")
+    if len(commit_sha) != len(entry["base_sha"]):
+        _fail(
+            "prepared-commit-format",
+            f"prepared commit must use the bound base SHA object-ID width for {case_id}",
+        )
     if commit_sha == entry["base_sha"]:
         _fail(
             "prepared-base-commit",
@@ -9560,6 +10626,197 @@ def _validate_manifest(
     return entries
 
 
+def _validate_finalize_transaction_authority(
+    transaction: Mapping[str, Any],
+    plan: Mapping[str, Any],
+    prepared: Mapping[str, Any],
+    manifest: Mapping[str, Any],
+) -> None:
+    selection_id = _safe_object_id(plan.get("selection_id"), "plan.selection_id")
+    plan_digest = _raw_sha256(plan.get("plan_digest"), "plan.plan_digest")
+    natural_key = f"{selection_id}:{plan_digest}"
+    if (
+        transaction.get("operation") != "finalize-publication"
+        or transaction.get("natural_key") != natural_key
+    ):
+        _fail("missing-authority-transaction", "finalize transaction key is invalid")
+    writes = [
+        _require_object(raw, f"finalize.writes[{index}]")
+        for index, raw in enumerate(_require_list(transaction.get("writes"), "finalize.writes"))
+    ]
+    prepared_path = f"publication/prepared/{selection_id}.json"
+    manifest_path = f"publication/manifests/{selection_id}.json"
+    prepared_sha = hashlib.sha256(_canonical_bytes(prepared)).hexdigest()
+    manifest_sha = hashlib.sha256(_canonical_bytes(manifest)).hexdigest()
+
+    def matches(write: Mapping[str, Any], *, scope: str, path: str, digest: str) -> bool:
+        return (
+            write.get("scope") == scope
+            and write.get("path") == path
+            and write.get("after_sha256") == digest
+            and write.get("immutable") is True
+        )
+
+    prepared_writes = [
+        write
+        for write in writes
+        if matches(write, scope="state", path=prepared_path, digest=prepared_sha)
+    ]
+    manifest_writes = [
+        write
+        for write in writes
+        if matches(write, scope="state", path=manifest_path, digest=manifest_sha)
+    ]
+    external_writes = [
+        write
+        for write in writes
+        if write.get("scope") == "external"
+        and write.get("after_sha256") == manifest_sha
+        and write.get("immutable") is True
+    ]
+    if (
+        len(writes) != 3
+        or len(prepared_writes) != 1
+        or len(manifest_writes) != 1
+        or len(external_writes) != 1
+    ):
+        _fail(
+            "missing-authority-transaction",
+            "finalize transaction does not bind exact prepared, manifest, and external output",
+        )
+    full_intent = transaction.get("kind") == "state-transaction-intent"
+    if full_intent:
+        if (
+            prepared_writes[0].get("after") != prepared
+            or manifest_writes[0].get("after") != manifest
+            or external_writes[0].get("after") != manifest
+        ):
+            _fail(
+                "missing-authority-transaction",
+                "finalize transaction after-images do not match immutable authorities",
+            )
+    elif transaction.get("kind") != "retired-state-transaction":
+        _fail("missing-authority-transaction", "finalize transaction kind is invalid")
+    external_path = _require_string(external_writes[0].get("path"), "finalize.output")
+    if not full_intent and external_writes[0].get("replica_path") != manifest_path:
+        _fail(
+            "missing-authority-transaction",
+            "retired finalize transaction does not bind its manifest replica",
+        )
+    expected_request_digest = _digest(
+        {"plan": dict(plan), "prepared": dict(prepared), "output": external_path}
+    )
+    expected_result = {
+        "version": VERSION,
+        "status": "finalized",
+        "manifest_path": external_path,
+        "manifest_digest": manifest["manifest_digest"],
+        "entry_count": len(_require_list(manifest["entries"], "manifest.entries")),
+    }
+    if (
+        transaction.get("request_digest") != expected_request_digest
+        or transaction.get("result") != expected_result
+    ):
+        _fail(
+            "missing-authority-transaction",
+            "finalize transaction does not bind exact request and result",
+        )
+
+
+def _validate_finalize_publication_intent(
+    store: StateStore,
+    intent: Mapping[str, Any],
+    *,
+    recover_publication: bool = True,
+) -> None:
+    """Revalidate prepared and manifest after-images for a full finalize WAL."""
+
+    if intent.get("kind") == "retired-state-transaction":
+        _fail("invalid-wal", "full finalize intent validation received a checkpoint projection")
+    prepared_receipts: list[dict[str, Any]] = []
+    state_manifests: list[dict[str, Any]] = []
+    external_manifests: list[dict[str, Any]] = []
+    for index, raw_write in enumerate(_require_list(intent["writes"], "wal.writes")):
+        write = _require_object(raw_write, f"wal.writes[{index}]")
+        after = _require_object(write.get("after"), f"wal.writes[{index}].after")
+        if after.get("kind") == "prepared-commits" and write.get("scope") == "state":
+            prepared_receipts.append(after)
+        elif after.get("kind") == "publication-manifest":
+            target = state_manifests if write.get("scope") == "state" else external_manifests
+            target.append(after)
+    if (
+        len(prepared_receipts) != 1
+        or len(state_manifests) != 1
+        or len(external_manifests) != 1
+        or state_manifests[0] != external_manifests[0]
+    ):
+        _fail(
+            "invalid-wal",
+            "finalize-publication intent must bind one prepared receipt and identical manifests",
+        )
+    prepared = prepared_receipts[0]
+    manifest = state_manifests[0]
+    selection_id = _safe_object_id(manifest.get("selection_id"), "manifest.selection_id")
+    plan_relative = Path("publication") / "plans" / f"{selection_id}.json"
+    plan = _read_state_json(
+        store,
+        plan_relative,
+        recover_publication=recover_publication,
+    )
+    _validate_manifest(manifest, plan, prepared)
+    _validate_finalize_transaction_authority(intent, plan, prepared, manifest)
+
+
+def _validate_registered_finalized_publication_authority(
+    store: StateStore,
+    *,
+    selection_id: str,
+    plan_digest: str,
+    manifest_digest: str,
+    recover_publication: bool,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
+    plan_relative = Path("publication") / "plans" / f"{selection_id}.json"
+    prepared_relative = Path("publication") / "prepared" / f"{selection_id}.json"
+    manifest_relative = Path("publication") / "manifests" / f"{selection_id}.json"
+    plan = _read_state_json(
+        store,
+        plan_relative,
+        recover_publication=recover_publication,
+    )
+    prepared = _read_state_json(
+        store,
+        prepared_relative,
+        recover_publication=recover_publication,
+    )
+    manifest = _read_state_json(
+        store,
+        manifest_relative,
+        recover_publication=recover_publication,
+    )
+    _validate_plan(plan)
+    if plan.get("selection_id") != selection_id or plan.get("plan_digest") != plan_digest:
+        _fail("unregistered-plan", "registered publication plan binding is invalid")
+    _validate_manifest(manifest, plan, prepared)
+    if manifest.get("manifest_digest") != manifest_digest:
+        _fail("publication-receipt-mismatch", "registered manifest digest mismatch")
+    weekly_intent = _require_committed_transaction(
+        store,
+        "weekly-plan",
+        selection_id,
+        recover_publication=recover_publication,
+    )
+    if weekly_intent["result"].get("plan_digest") != plan_digest:
+        _fail("unregistered-plan", "weekly transaction does not bind registered plan")
+    finalize_intent = _require_committed_transaction(
+        store,
+        "finalize-publication",
+        f"{selection_id}:{plan_digest}",
+        recover_publication=recover_publication,
+    )
+    _validate_finalize_transaction_authority(finalize_intent, plan, prepared, manifest)
+    return plan, prepared, manifest, finalize_intent
+
+
 def finalize_publication(
     state_root: Path, plan_path: Path, prepared_path: Path, output: Path, now: str
 ) -> dict[str, Any]:
@@ -9684,7 +10941,8 @@ def finalize_publication(
             existing_manifest = store.read_json(registry_output)[0]
             _validate_manifest(existing_manifest, plan, prepared)
             assert existing_finalize_intent is not None
-            _apply_wal_intent(store, existing_finalize_intent)
+            if existing_finalize_intent.get("kind") == "state-transaction-intent":
+                _apply_wal_intent(store, existing_finalize_intent)
             return {
                 "version": VERSION,
                 "status": "finalized",
@@ -9798,6 +11056,211 @@ def _validate_publication_approval(
     if normalized != expected:
         _fail("publication-approval-mismatch", "approval must bind the exact closure subset")
     return approved_at, _digest(approval)
+
+
+def _validate_published_ledger_commit(item: Mapping[str, Any], plan: Mapping[str, Any]) -> None:
+    case_id = _validate_case_id(item.get("case_id"), "closure.case_id")
+    base_intent = _require_object(plan.get("base_intent"), "plan.base_intent")
+    base_sha = _require_string(base_intent.get("base_sha"), "plan.base_sha")
+    ledger_commit = _require_string(item.get("ledger_commit"), "closure.ledger_commit")
+    if GIT_SHA_RE.fullmatch(base_sha) is None or COMMIT_RE.fullmatch(ledger_commit) is None:
+        _fail("invalid-git-sha", f"publication commit binding is invalid for {case_id}")
+    if len(ledger_commit) != len(base_sha):
+        _fail(
+            "ledger-commit-format",
+            f"published ledger commit must use the plan base SHA object-ID width for {case_id}",
+        )
+    if ledger_commit == base_sha:
+        _fail(
+            "ledger-commit-base",
+            f"published ledger commit must differ from the plan base SHA for {case_id}",
+        )
+
+
+def _validate_manifest_closure_entry(manifest: Mapping[str, Any], item: Mapping[str, Any]) -> None:
+    if manifest.get("manifest_digest") != item.get("manifest_digest"):
+        _fail("publication-receipt-mismatch", "closure manifest digest mismatch")
+    case_id = _validate_case_id(item.get("case_id"), "closure.case_id")
+    matches = [
+        _require_object(raw, "manifest.entry")
+        for raw in _require_list(manifest.get("entries"), "manifest.entries")
+        if isinstance(raw, dict) and raw.get("case_id") == case_id
+    ]
+    if len(matches) != 1 or any(
+        matches[0].get(field) != item.get(field) for field in ("revision", "semantic_digest")
+    ):
+        _fail(
+            "publication-receipt-mismatch",
+            "closure case tuple is not an exact finalized manifest entry",
+        )
+
+
+def _validate_persisted_closure_record(closure: Mapping[str, Any]) -> None:
+    _exact_fields(
+        closure,
+        "publication_closure",
+        {
+            "version",
+            "kind",
+            "closure_id",
+            "interaction",
+            "reason",
+            "summary",
+            "entries",
+            "publication_approval_digest",
+            "recorded_at",
+            "closure_digest",
+        },
+    )
+    if (
+        closure.get("version") != VERSION
+        or closure.get("kind") != "publication-closure"
+        or closure.get("reason") not in {"published", "cancelled", "stale"}
+    ):
+        _fail("invalid-closure", "persisted publication closure is invalid")
+    _safe_object_id(closure.get("closure_id"), "closure.closure_id")
+    interaction = _require_object(closure.get("interaction"), "closure.interaction")
+    _exact_fields(interaction, "closure.interaction", {"interactive", "actor", "closed_at"})
+    if interaction.get("interactive") is not True or interaction.get("actor") != "Joey":
+        _fail("untrusted-closure", "persisted closure is not an interactive Joey decision")
+    closed_at = _timestamp(interaction.get("closed_at"), "closure.closed_at")
+    if closure.get("recorded_at") != closed_at:
+        _fail("invalid-closure", "persisted closure recorded_at differs from its decision time")
+    _bounded_string(closure.get("summary"), "closure.summary", 8, 500)
+    entries = _require_list(closure.get("entries"), "closure.entries")
+    if not entries:
+        _fail("empty-closure", "persisted publication closure has no entries")
+    prior = ""
+    for raw_entry in entries:
+        entry = _require_object(raw_entry, "closure.entry")
+        case_id = _validate_case_id(entry.get("case_id"), "closure.case_id")
+        if case_id <= prior:
+            _fail("duplicate-closure-entry", "persisted closure entries are not unique and sorted")
+        prior = case_id
+        _require_int(entry.get("revision"), "closure.revision", minimum=1)
+        _sha_digest(entry.get("semantic_digest"), "closure.semantic_digest")
+        _safe_object_id(entry.get("selection_id"), "closure.selection_id")
+        _raw_sha256(entry.get("plan_digest"), "closure.plan_digest")
+    body = {key: value for key, value in closure.items() if key != "closure_digest"}
+    if closure.get("closure_digest") != _digest(body):
+        _fail("invalid-closure", "persisted publication closure digest mismatch")
+
+
+def _validate_published_closure_entries_against_plans(
+    store: StateStore,
+    entries: Sequence[Mapping[str, Any]],
+    *,
+    recover_publication: bool,
+) -> None:
+    for raw_entry in entries:
+        item = _require_object(raw_entry, "closure.entry")
+        selection_id = _safe_object_id(item.get("selection_id"), "closure.selection_id")
+        plan_digest = _raw_sha256(item.get("plan_digest"), "closure.plan_digest")
+        manifest_digest = _raw_sha256(
+            item.get("manifest_digest"),
+            "closure.manifest_digest",
+        )
+        plan, _, manifest, _ = _validate_registered_finalized_publication_authority(
+            store,
+            selection_id=selection_id,
+            plan_digest=plan_digest,
+            manifest_digest=manifest_digest,
+            recover_publication=recover_publication,
+        )
+        _validate_manifest_closure_entry(manifest, item)
+        _validate_published_ledger_commit(item, plan)
+
+
+def _validate_close_publication_intent_commits(
+    store: StateStore,
+    intent: Mapping[str, Any],
+    *,
+    recover_publication: bool = True,
+) -> None:
+    """Revalidate closure after-images and published commit bindings."""
+
+    writes = _require_list(intent["writes"], "wal.writes")
+    closures: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for index, raw_write in enumerate(writes):
+        write = _require_object(raw_write, f"wal.writes[{index}]")
+        if write.get("scope") != "state":
+            continue
+        after = _require_object(write.get("after"), f"wal.writes[{index}].after")
+        if after.get("kind") == "publication-closure":
+            closures.append((write, after))
+    if len(closures) != 1:
+        _fail("invalid-wal", "close-publication intent must contain one closure record")
+    closure_write, closure = closures[0]
+    _validate_persisted_closure_record(closure)
+    if (
+        intent.get("natural_key") != closure["closure_id"]
+        or closure_write.get("path") != f"publication/closures/{closure['closure_id']}.json"
+        or closure_write.get("immutable") is not True
+    ):
+        _fail(
+            "invalid-wal",
+            "close-publication intent key, closure path, or mutability is invalid",
+        )
+    entries = [
+        _require_object(raw, "closure.entry")
+        for raw in _require_list(closure["entries"], "closure.entries")
+    ]
+    if len(writes) != len(entries) + 1:
+        _fail("invalid-wal", "close-publication intent has unexpected extra writes")
+    active_after_images: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
+    for index, raw_write in enumerate(writes):
+        write = _require_object(raw_write, f"wal.writes[{index}]")
+        if write.get("scope") != "state":
+            continue
+        after = _require_object(write.get("after"), f"wal.writes[{index}].after")
+        if after.get("kind") != "publication-pending":
+            continue
+        case_id = _validate_case_id(after.get("case_id"), "publication.active.case_id")
+        _validate_pending_record(after, case_id)
+        if case_id in active_after_images:
+            _fail("invalid-wal", "close-publication intent repeats an active after-image")
+        active_after_images[case_id] = (write, after)
+    if set(active_after_images) != {entry["case_id"] for entry in entries}:
+        _fail("invalid-wal", "close-publication intent active after-images differ from closure")
+    for entry in entries:
+        active_write, active = active_after_images[entry["case_id"]]
+        if (
+            active_write.get("path") != f"publication/active/{entry['case_id']}.json"
+            or active_write.get("immutable") is not False
+        ):
+            _fail(
+                "invalid-wal",
+                "close-publication active after-image path or mutability is invalid",
+            )
+        expected = {
+            "case_id": entry["case_id"],
+            "revision": entry["revision"],
+            "semantic_digest": entry["semantic_digest"],
+            "selection_id": entry["selection_id"],
+            "plan_digest": entry["plan_digest"],
+            "status": "closed",
+            "closure_id": closure["closure_id"],
+            "closure_digest": closure["closure_digest"],
+            "closure_reason": closure["reason"],
+            "closed_at": closure["recorded_at"],
+        }
+        if any(active.get(field) != value for field, value in expected.items()):
+            _fail("invalid-wal", "close-publication active after-image differs from closure")
+    expected_result = {
+        "version": VERSION,
+        "status": "closed",
+        "closure_id": closure["closure_id"],
+        "closure_digest": closure["closure_digest"],
+        "closed_count": len(entries),
+    }
+    if intent.get("result") != expected_result:
+        _fail("invalid-wal", "close-publication WAL result differs from closure")
+    if closure.get("reason") == "published":
+        _validate_published_closure_entries_against_plans(
+            store,
+            entries,
+            recover_publication=recover_publication,
+        )
 
 
 def close_publication(
@@ -9923,6 +11386,17 @@ def close_publication(
             operation="close-publication",
             natural_key=closure_id,
             request=request,
+        )
+        if reason == "published":
+            _validate_published_closure_entries_against_plans(
+                store,
+                normalized,
+                recover_publication=False,
+            )
+        _preflight_existing_transaction_domain_read_only(
+            store,
+            operation="close-publication",
+            natural_key=closure_id,
         )
         _read_marker(state_root)
         _recover_pending_wal(store)
@@ -10058,6 +11532,7 @@ def close_publication(
                     <= _parse_time(now_value, "now")
                 ):
                     _fail("clock-order", "manifest, approval, merge, and closure clocks unordered")
+                _validate_published_ledger_commit(item, plan)
             updated = dict(active)
             updated.update(
                 {

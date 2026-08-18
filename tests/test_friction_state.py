@@ -421,6 +421,93 @@ def _finalize_one(
     return root, plan, fs._load_json(manifest_path)
 
 
+def _published_closure_and_approval(
+    plan: dict[str, Any],
+    manifest: dict[str, Any],
+    *,
+    closure_id: str,
+    ledger_commit: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    entry = plan["entries"][0]
+    closure = {
+        "version": 1,
+        "kind": "publication-closure",
+        "closure_id": closure_id,
+        "interaction": {
+            "interactive": True,
+            "actor": "Joey",
+            "closed_at": "2026-07-11T08:36:00Z",
+        },
+        "reason": "published",
+        "summary": "Joey confirmed the exact approved ledger pull request was merged.",
+        "entries": [
+            {
+                "case_id": entry["case_id"],
+                "revision": entry["revision"],
+                "semantic_digest": entry["semantic_digest"],
+                "selection_id": plan["selection_id"],
+                "plan_digest": plan["plan_digest"],
+                "manifest_digest": manifest["manifest_digest"],
+                "pull_request_url": (
+                    "https://github.com/Joey-Tools/codex-skill-friction-ledger/pull/91"
+                ),
+                "ledger_commit": ledger_commit,
+                "merged_at": "2026-07-11T08:35:00Z",
+            }
+        ],
+    }
+    approval = {
+        "version": 1,
+        "kind": "publication-approval",
+        "approval_id": f"approval-{closure_id}",
+        "interaction": {
+            "interactive": True,
+            "actor": "Joey",
+            "approved_at": "2026-07-11T08:34:00Z",
+        },
+        "selection_id": plan["selection_id"],
+        "plan_digest": plan["plan_digest"],
+        "manifest_digest": manifest["manifest_digest"],
+        "entries": [
+            {
+                "case_id": entry["case_id"],
+                "revision": entry["revision"],
+                "semantic_digest": entry["semantic_digest"],
+            }
+        ],
+    }
+    return closure, approval
+
+
+def _copy_pending_stage_intent(
+    tmp_path: Path,
+    target_root: Path,
+    *,
+    valid_for_target: bool,
+) -> tuple[Path, dict[str, Any]]:
+    candidate = _candidate(occurrences=[_occurrence(7, root=f"root:pending-copy-{uuid.uuid4()}")])
+    scratch_root, _ = _stage(tmp_path / f"scratch-{uuid.uuid4()}", candidate)
+    scratch_intent = next((scratch_root / "wal" / "stage").glob("*.intent.json"))
+    intent = fs._load_json(scratch_intent)
+    receipt_write = next(
+        write
+        for write in intent["writes"]
+        if write["scope"] == "state" and write["after"].get("kind") == "stage"
+    )
+    if valid_for_target:
+        intent["writes"] = [write for write in intent["writes"] if write["path"] != fs.STATE_MARKER]
+        intent["result"]["path"] = str(target_root / receipt_write["path"])
+    body = {key: value for key, value in intent.items() if key != "intent_digest"}
+    intent["intent_digest"] = fs._digest(body)
+    intent_relative, commit_relative = fs._wal_paths("stage", intent["natural_key"])
+    intent_path = target_root / intent_relative
+    intent_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    intent_path.write_bytes(fs._canonical_bytes(intent))
+    intent_path.chmod(0o600)
+    assert not (target_root / commit_relative).exists()
+    return intent_path, candidate
+
+
 def _ledger_compatibility_case() -> dict[str, Any]:
     case_id = "DSF-01a00f29-e900-7000-8000-000000000001"
     return {
@@ -552,7 +639,7 @@ def _repair_lifecycle_candidates() -> list[dict[str, Any]]:
     approved = json.loads(json.dumps(proposed))
     approved["case"]["revision"] = 2
     approved["case"]["status"] = "approved"
-    approved["case"]["lifecycle_changed_at"] = "2026-06-02T12:00:00Z"
+    approved["case"]["lifecycle_changed_at"] = "2026-07-11T08:37:00Z"
     approved["case"]["repairs"][0]["state"] = "open"
     approved["case"]["repairs"][0]["pull_request_url"] = (
         "https://github.com/Joey-Tools/example/pull/1"
@@ -562,20 +649,20 @@ def _repair_lifecycle_candidates() -> list[dict[str, Any]]:
     implemented = json.loads(json.dumps(approved))
     implemented["case"]["revision"] = 3
     implemented["case"]["status"] = "implemented"
-    implemented["case"]["lifecycle_changed_at"] = "2026-06-03T12:00:00Z"
+    implemented["case"]["lifecycle_changed_at"] = "2026-07-11T08:45:00Z"
     implemented["case"]["repairs"][0]["state"] = "merged"
     implemented["case"]["repairs"][0]["commit"] = "a" * 40
-    implemented["case"]["repairs"][0]["installed_on"] = "2026-06-02"
+    implemented["case"]["repairs"][0]["installed_on"] = "2026-07-11"
     implemented["control"]["semantic_digest"] = fs.semantic_digest(implemented["case"])
 
     observing = json.loads(json.dumps(implemented))
     observing["case"]["revision"] = 4
     observing["case"]["status"] = "observing"
-    observing["case"]["lifecycle_changed_at"] = "2026-06-04T12:00:00Z"
+    observing["case"]["lifecycle_changed_at"] = "2026-07-11T08:50:00Z"
     observing["case"]["effectiveness"] = {
         "method": "deterministic",
         "state": "monitoring",
-        "checked_on": "2026-06-04",
+        "checked_on": "2026-07-11",
         "summary": "The installed deterministic authority gate is under observation.",
         "deterministic": {
             "test_ref": "tests/test_authority_gate.py",
@@ -589,9 +676,9 @@ def _repair_lifecycle_candidates() -> list[dict[str, Any]]:
     closed = json.loads(json.dumps(observing))
     closed["case"]["revision"] = 5
     closed["case"]["status"] = "closed"
-    closed["case"]["lifecycle_changed_at"] = "2026-06-20T12:00:00Z"
+    closed["case"]["lifecycle_changed_at"] = "2026-07-11T09:00:00Z"
     closed["case"]["effectiveness"]["state"] = "passed"
-    closed["case"]["effectiveness"]["checked_on"] = "2026-06-10"
+    closed["case"]["effectiveness"]["checked_on"] = "2026-07-11"
     closed["case"]["effectiveness"]["summary"] = (
         "The installed deterministic authority gate passed."
     )
@@ -642,6 +729,8 @@ def _publish_and_approve_repair(
     approval_id: str = "repair-approval-one",
     approved_at: str = "2026-07-11T08:37:00Z",
     expires_at: str = "2026-07-18T08:37:00Z",
+    ledger_commit: str = "c" * 40,
+    prepared_commit_sha: str | None = None,
     persist: bool = True,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     completed = _complete_live(tmp_path, root, [proposed_stage])
@@ -657,10 +746,14 @@ def _publish_and_approve_repair(
     )
     plan = fs._load_json(plan_path)
     manifest_path = tmp_path / "repair-manifest.json"
+    prepared = _prepared_receipt(plan)
+    if prepared_commit_sha is not None:
+        prepared["entries"][0]["commit_sha"] = prepared_commit_sha
+        prepared["entries"][0]["signature"]["commit_sha"] = prepared_commit_sha
     fs.finalize_publication(
         root,
         plan_path,
-        _write(tmp_path / "repair-prepared.json", _prepared_receipt(plan)),
+        _write(tmp_path / "repair-prepared.json", prepared),
         manifest_path,
         "2026-07-11T08:32:00Z",
     )
@@ -688,7 +781,7 @@ def _publish_and_approve_repair(
                 "pull_request_url": (
                     "https://github.com/Joey-Tools/codex-skill-friction-ledger/pull/1"
                 ),
-                "ledger_commit": "c" * 40,
+                "ledger_commit": ledger_commit,
                 "merged_at": "2026-07-11T08:35:00Z",
             }
         ],
@@ -756,8 +849,101 @@ def _publish_and_approve_repair(
     return repair_approval, authority
 
 
+def _persist_legacy_mismatched_repair_approval(
+    tmp_path: Path,
+    root: Path,
+    proposed: dict[str, Any],
+    target: dict[str, Any],
+    proposed_stage: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    approval_id: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    approval, _ = _publish_and_approve_repair(
+        tmp_path,
+        root,
+        proposed,
+        target,
+        proposed_stage,
+        approval_id=approval_id,
+        persist=False,
+    )
+    lifecycle_validator = fs._validate_repair_approval_lifecycle_time
+    intent_validator = fs._validate_approve_repair_intent_lifecycle
+    run_transaction = fs._run_transaction
+
+    def persist_legacy_authority(store: Any, **kwargs: Any) -> dict[str, Any]:
+        if kwargs.get("operation") == "approve-repair":
+            result = dict(kwargs["result"])
+            result["target_lifecycle_changed_at"] = approval["interaction"]["approved_at"]
+            kwargs["result"] = result
+        return run_transaction(store, **kwargs)
+
+    monkeypatch.setattr(
+        fs,
+        "_validate_repair_approval_lifecycle_time",
+        lambda approval_value, candidate: None,
+    )
+    monkeypatch.setattr(
+        fs,
+        "_validate_approve_repair_intent_lifecycle",
+        lambda store, intent, **kwargs: None,
+    )
+    monkeypatch.setattr(fs, "_run_transaction", persist_legacy_authority)
+    authority = fs.approve_repair(
+        root,
+        _write(tmp_path / f"{approval_id}-candidate.json", target),
+        _write(tmp_path / f"{approval_id}.json", approval),
+        "2026-07-11T08:38:00Z",
+        interactive_confirmed=True,
+    )
+    monkeypatch.setattr(
+        fs,
+        "_validate_repair_approval_lifecycle_time",
+        lifecycle_validator,
+    )
+    monkeypatch.setattr(fs, "_validate_approve_repair_intent_lifecycle", intent_validator)
+    monkeypatch.setattr(fs, "_run_transaction", run_transaction)
+    return approval, authority
+
+
+def _persist_legacy_repair_approval_result(
+    root: Path,
+    candidate_path: Path,
+    approval_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> dict[str, Any]:
+    intent_validator = fs._validate_approve_repair_intent_lifecycle
+    run_transaction = fs._run_transaction
+
+    def persist_legacy_result(store: Any, **kwargs: Any) -> dict[str, Any]:
+        if kwargs.get("operation") == "approve-repair":
+            result = dict(kwargs["result"])
+            result.pop("target_lifecycle_changed_at")
+            kwargs["result"] = result
+        return run_transaction(store, **kwargs)
+
+    monkeypatch.setattr(
+        fs,
+        "_validate_approve_repair_intent_lifecycle",
+        lambda store, intent, **kwargs: None,
+    )
+    monkeypatch.setattr(fs, "_run_transaction", persist_legacy_result)
+    authority = fs.approve_repair(
+        root,
+        candidate_path,
+        approval_path,
+        "2026-07-11T08:38:00Z",
+        interactive_confirmed=True,
+    )
+    monkeypatch.setattr(fs, "_validate_approve_repair_intent_lifecycle", intent_validator)
+    monkeypatch.setattr(fs, "_run_transaction", run_transaction)
+    assert "target_lifecycle_changed_at" not in authority
+    return authority
+
+
 def _closed_reopen_candidate(
-    closed: dict[str, Any], *, observed_at: str = "2026-06-21T12:00:00Z"
+    closed: dict[str, Any], *, observed_at: str = "2026-07-12T12:00:00Z"
 ) -> dict[str, Any]:
     wrapper = json.loads(json.dumps(closed))
     occurrence = _occurrence(1, root="root:reopen", observed_at=observed_at)
@@ -778,7 +964,7 @@ def _closed_reopen_candidate(
             "causal_signature_count": len({item["causal_signature"] for item in evidence}),
         }
     )
-    wrapper["case"]["lifecycle_changed_at"] = "2026-06-21T12:01:00Z"
+    wrapper["case"]["lifecycle_changed_at"] = "2026-07-12T12:01:00Z"
     wrapper["case"]["repairs"][0]["state"] = "superseded"
     repair_id = f"R{len(wrapper['case']['repairs']) + 1}"
     wrapper["case"]["repairs"].append(
@@ -910,6 +1096,34 @@ def _persistent_identity_snapshot(
             payload,
         )
     return result
+
+
+def _rewrite_wal_checkpoint_chain(
+    root: Path,
+    target_path: Path,
+    replacement: dict[str, Any],
+) -> None:
+    """Rewrite one tampered checkpoint and keep the synthetic usage chain self-consistent."""
+
+    history_root = root / "wal-history"
+    checkpoints = [
+        (path, fs._load_json(path))
+        for path in history_root.rglob("*.json")
+        if fs.WAL_HISTORY_LEAF_RE.fullmatch(path.name) is not None
+    ]
+    checkpoints.sort(key=lambda item: item[1]["sequence"])
+    assert any(path == target_path for path, _ in checkpoints)
+    usage = fs._new_wal_history_usage()
+    for path, checkpoint in checkpoints:
+        if path == target_path:
+            checkpoint = replacement
+        checkpoint["previous_usage_digest"] = usage["usage_digest"]
+        body = {key: value for key, value in checkpoint.items() if key != "checkpoint_digest"}
+        checkpoint["checkpoint_digest"] = fs._digest(body)
+        payload = fs._canonical_bytes(checkpoint)
+        path.write_bytes(payload)
+        usage = fs._project_wal_history_usage(usage, checkpoint, len(payload))
+    (root / fs.WAL_HISTORY_USAGE).write_bytes(fs._canonical_bytes(usage))
 
 
 @pytest.mark.parametrize(
@@ -1328,7 +1542,7 @@ def test_new_case_rejects_every_structurally_valid_skipped_lifecycle(
             fs.stage_candidate(
                 _write(tmp_path / status / "candidate.json", candidate),
                 root,
-                "2026-07-10T12:00:00Z",
+                "2026-07-12T12:00:00Z",
             )
         assert not (root / fs._case_relative_path(candidate)).exists()
 
@@ -1445,7 +1659,7 @@ def test_source_kind_cannot_bypass_initial_lifecycle(tmp_path: Path) -> None:
         fs.stage_candidate(
             _write(tmp_path / "legacy.json", legacy),
             tmp_path / "legacy-state",
-            "2026-07-10T12:00:00Z",
+            "2026-07-12T12:00:00Z",
         )
 
     origin = _candidate()
@@ -2150,6 +2364,21 @@ def test_finalize_rejects_base_commit_before_claiming_immutable_writer(tmp_path:
     assert not (root / "publication" / "manifests" / f"{plan['selection_id']}.json").exists()
     assert not (root / "publication" / "prepared" / f"{plan['selection_id']}.json").exists()
 
+    mismatched_prepared = _prepared_receipt(plan)
+    mismatched_prepared["entries"][0]["commit_sha"] = "d" * 64
+    mismatched_prepared["entries"][0]["signature"]["commit_sha"] = "d" * 64
+    with pytest.raises(fs.StateError, match="base SHA object-ID width") as mismatched:
+        fs.finalize_publication(
+            root,
+            plan_path,
+            _write(tmp_path / "mismatched-commit-prepared.json", mismatched_prepared),
+            output,
+            "2026-07-11T08:32:00Z",
+        )
+    assert mismatched.value.code == "prepared-commit-format"
+    assert _persistent_identity_snapshot(root) == before
+    assert not output.exists()
+
     valid_prepared = _prepared_receipt(plan)
     valid_prepared_path = _write(tmp_path / "advanced-commit-prepared.json", valid_prepared)
     first = fs.finalize_publication(
@@ -2168,6 +2397,168 @@ def test_finalize_rejects_base_commit_before_claiming_immutable_writer(tmp_path:
     )
     assert replay == first
     assert fs._load_json(output)["entries"][0]["commit_sha"] != base_sha
+
+
+@pytest.mark.parametrize(
+    ("commit_kind", "error_code", "error_match"),
+    [
+        ("base", "prepared-base-commit", "must differ from the bound base SHA"),
+        ("wrong-width", "prepared-commit-format", "bound base SHA object-ID width"),
+    ],
+)
+def test_pending_finalize_wal_revalidates_prepared_commit_before_replay(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    commit_kind: str,
+    error_code: str,
+    error_match: str,
+) -> None:
+    case = _candidate()
+    root, stage = _stage(tmp_path, case)
+    completed = _complete_live(tmp_path, root, [stage])
+    selection = _approved_selection(tmp_path, root, completed["snapshot_digest"], [case])
+    plan_path = tmp_path / "pending-invalid-plan.json"
+    fs.weekly_plan(
+        root,
+        _write(tmp_path / "pending-invalid-selection.json", selection),
+        plan_path,
+        "2026-07-11T08:01:00Z",
+    )
+    plan = fs._load_json(plan_path)
+    prepared = _prepared_receipt(plan)
+    commit_sha = plan["base_intent"]["base_sha"] if commit_kind == "base" else "d" * 64
+    prepared["entries"][0]["commit_sha"] = commit_sha
+    prepared["entries"][0]["signature"]["commit_sha"] = commit_sha
+    prepared_path = _write(tmp_path / f"pending-{commit_kind}-prepared.json", prepared)
+    output = tmp_path / f"pending-{commit_kind}-manifest.json"
+    prepared_relative = Path("publication") / "prepared" / f"{plan['selection_id']}.json"
+    manifest_relative = Path("publication") / "manifests" / f"{plan['selection_id']}.json"
+    entry_validator = fs._validate_prepared_entry
+    original_write = fs.StateStore.write_json
+
+    def accept_legacy_entry(
+        value: Any,
+        index: int,
+        plan_entry: dict[str, Any],
+        *,
+        plan_created_at: str,
+        now: str,
+    ) -> dict[str, Any]:
+        del index, plan_entry, plan_created_at, now
+        return value
+
+    def interrupt_prepared(
+        store: Any,
+        relative: Path | str,
+        value: dict[str, Any],
+        *,
+        immutable: bool = False,
+    ) -> str:
+        if Path(relative) == prepared_relative:
+            raise OSError("injected invalid prepared publication interruption")
+        return original_write(store, relative, value, immutable=immutable)
+
+    monkeypatch.setattr(fs, "_validate_prepared_entry", accept_legacy_entry)
+    monkeypatch.setattr(fs.StateStore, "write_json", interrupt_prepared)
+    with pytest.raises(OSError, match="injected invalid prepared publication interruption"):
+        fs.finalize_publication(
+            root,
+            plan_path,
+            prepared_path,
+            output,
+            "2026-07-11T08:32:00Z",
+        )
+    monkeypatch.setattr(fs, "_validate_prepared_entry", entry_validator)
+    monkeypatch.setattr(fs.StateStore, "write_json", original_write)
+
+    natural_key = f"{plan['selection_id']}:{plan['plan_digest']}"
+    intent_relative, commit_relative = fs._wal_paths("finalize-publication", natural_key)
+    assert (root / intent_relative).exists()
+    assert not (root / commit_relative).exists()
+    assert not (root / prepared_relative).exists()
+    assert not (root / manifest_relative).exists()
+    assert not output.exists()
+    before = _persistent_identity_snapshot(root)
+    recovery_candidate = _candidate(
+        case_id=fs.new_case_id("2026-06-02T12:00:00Z"),
+        occurrences=[_occurrence(0, root=f"root:pending-{commit_kind}-recovery")],
+    )
+
+    with pytest.raises(fs.StateError, match=error_match) as raised:
+        fs.stage_candidate(
+            _write(tmp_path / f"pending-{commit_kind}-recovery.json", recovery_candidate),
+            root,
+            "2026-07-12T08:00:00Z",
+        )
+
+    assert raised.value.code == error_code
+    assert _persistent_identity_snapshot(root) == before
+    assert not (root / prepared_relative).exists()
+    assert not (root / manifest_relative).exists()
+    assert not output.exists()
+
+
+def test_finalize_recovers_valid_pending_prepared_and_manifest_before_replay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    case = _candidate()
+    root, stage = _stage(tmp_path, case)
+    completed = _complete_live(tmp_path, root, [stage])
+    selection = _approved_selection(tmp_path, root, completed["snapshot_digest"], [case])
+    plan_path = tmp_path / "pending-valid-plan.json"
+    fs.weekly_plan(
+        root,
+        _write(tmp_path / "pending-valid-selection.json", selection),
+        plan_path,
+        "2026-07-11T08:01:00Z",
+    )
+    plan = fs._load_json(plan_path)
+    prepared_path = _write(tmp_path / "pending-valid-prepared.json", _prepared_receipt(plan))
+    output = tmp_path / "pending-valid-manifest.json"
+    prepared_relative = Path("publication") / "prepared" / f"{plan['selection_id']}.json"
+    original_write = fs.StateStore.write_json
+
+    def interrupt_prepared(
+        store: Any,
+        relative: Path | str,
+        value: dict[str, Any],
+        *,
+        immutable: bool = False,
+    ) -> str:
+        if Path(relative) == prepared_relative:
+            raise OSError("injected valid prepared publication interruption")
+        return original_write(store, relative, value, immutable=immutable)
+
+    monkeypatch.setattr(fs.StateStore, "write_json", interrupt_prepared)
+    with pytest.raises(OSError, match="injected valid prepared publication interruption"):
+        fs.finalize_publication(
+            root,
+            plan_path,
+            prepared_path,
+            output,
+            "2026-07-11T08:32:00Z",
+        )
+    monkeypatch.setattr(fs.StateStore, "write_json", original_write)
+    assert not (root / prepared_relative).exists()
+    assert not output.exists()
+
+    recovered = fs.finalize_publication(
+        root,
+        plan_path,
+        prepared_path,
+        output,
+        "2026-07-11T09:32:00Z",
+    )
+    replayed = fs.finalize_publication(
+        root,
+        plan_path,
+        prepared_path,
+        output,
+        "2026-07-11T10:32:00Z",
+    )
+    assert replayed == recovered
+    assert recovered["status"] == "finalized"
+    assert fs._load_json(output)["manifest_digest"] == recovered["manifest_digest"]
 
 
 def test_finalize_public_conflict_does_not_repair_prior_external_output(
@@ -3224,6 +3615,147 @@ def test_global_wal_layout_preflight_precedes_pending_replay(tmp_path: Path) -> 
     assert not pending_commit.exists()
 
 
+def test_global_domain_preflight_precedes_every_pending_replay(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proposed, approved = _repair_lifecycle_candidates()[:2]
+    root, proposed_stage = _stage(tmp_path, proposed)
+    approval, _ = _publish_and_approve_repair(
+        tmp_path,
+        root,
+        proposed,
+        approved,
+        proposed_stage,
+        approval_id="mixed-valid-pending-approval",
+        persist=False,
+    )
+    approval_relative = Path("repairs") / "approvals" / f"{approval['approval_id']}.json"
+    index_relative = (
+        Path("repairs")
+        / "approval-index"
+        / f"{fs._repair_approval_index_key(approval['source'], approval['target'])}.json"
+    )
+    original_write = fs.StateStore.write_json
+
+    def interrupt_approval(
+        store: Any,
+        relative: Path | str,
+        value: dict[str, Any],
+        *,
+        immutable: bool = False,
+        max_bytes: int | None = None,
+    ) -> str:
+        if Path(relative) == approval_relative:
+            raise OSError("injected valid pending approval")
+        return original_write(
+            store,
+            relative,
+            value,
+            immutable=immutable,
+            max_bytes=max_bytes,
+        )
+
+    monkeypatch.setattr(fs.StateStore, "write_json", interrupt_approval)
+    with pytest.raises(OSError, match="valid pending approval"):
+        fs.approve_repair(
+            root,
+            _write(tmp_path / "mixed-valid-approved.json", approved),
+            _write(tmp_path / "mixed-valid-approval.json", approval),
+            "2026-07-11T08:38:00Z",
+            interactive_confirmed=True,
+        )
+    monkeypatch.setattr(fs.StateStore, "write_json", original_write)
+    _copy_pending_stage_intent(tmp_path / "invalid-later", root, valid_for_target=False)
+    before = _persistent_identity_snapshot(root)
+
+    with fs._state_lock(root, create=False) as store:
+        with pytest.raises(fs.StateError, match="result differs from its receipt") as raised:
+            fs._recover_pending_wal(store)
+
+    assert raised.value.code == "invalid-wal"
+    assert _persistent_identity_snapshot(root) == before
+    assert not (root / approval_relative).exists()
+    assert not (root / index_relative).exists()
+
+
+def test_global_domain_preflight_precedes_committed_external_repair(tmp_path: Path) -> None:
+    root, _, _ = _finalize_one(tmp_path, _candidate())
+    manifest_output = tmp_path / "manifest.json"
+    manifest_output.unlink()
+    _copy_pending_stage_intent(tmp_path / "invalid-after-external", root, valid_for_target=False)
+    before = _persistent_identity_snapshot(root)
+
+    with fs._state_lock(root, create=False) as store:
+        with pytest.raises(fs.StateError, match="result differs from its receipt") as raised:
+            fs._recover_pending_wal(store)
+
+    assert raised.value.code == "invalid-wal"
+    assert _persistent_identity_snapshot(root) == before
+    assert not manifest_output.exists()
+
+
+def test_global_state_target_preflight_precedes_partial_pending_stage_replay(
+    tmp_path: Path,
+) -> None:
+    root, _ = _stage(tmp_path / "target", _candidate())
+    intent_path, _ = _copy_pending_stage_intent(
+        tmp_path / "pending-state-drift",
+        root,
+        valid_for_target=True,
+    )
+    intent = fs._load_json(intent_path)
+    candidate_write = next(
+        write for write in intent["writes"] if isinstance(write["after"].get("case"), dict)
+    )
+    receipt_write = next(
+        write for write in intent["writes"] if write["after"].get("kind") == "stage"
+    )
+    conflicting_receipt = root / receipt_write["path"]
+    conflicting_receipt.write_bytes(fs._canonical_bytes({"foreign": True}))
+    conflicting_receipt.chmod(0o600)
+    candidate_target = root / candidate_write["path"]
+    assert not candidate_target.exists()
+    before = _persistent_identity_snapshot(root)
+
+    with fs._state_lock(root, create=False) as store:
+        with pytest.raises(fs.StateError, match="neither its before nor after image") as raised:
+            fs._recover_pending_wal(store)
+
+    assert raised.value.code == "wal-target-drift"
+    assert _persistent_identity_snapshot(root) == before
+    assert not candidate_target.exists()
+
+
+def test_global_state_target_preflight_blocks_external_repair_and_pending_replay(
+    tmp_path: Path,
+) -> None:
+    root, plan, _ = _finalize_one(tmp_path / "finalized", _candidate())
+    prepared = root / "publication" / "prepared" / f"{plan['selection_id']}.json"
+    external_manifest = tmp_path / "finalized" / "manifest.json"
+    prepared.unlink()
+    external_manifest.unlink()
+    pending_intent, _ = _copy_pending_stage_intent(
+        tmp_path / "pending-after-missing-authority",
+        root,
+        valid_for_target=True,
+    )
+    pending = fs._load_json(pending_intent)
+    pending_candidate = root / next(
+        write["path"] for write in pending["writes"] if isinstance(write["after"].get("case"), dict)
+    )
+    before = _persistent_identity_snapshot(root)
+
+    with fs._state_lock(root, create=False) as store:
+        with pytest.raises(fs.StateError, match="immutable WAL target") as raised:
+            fs._recover_pending_wal(store)
+
+    assert raised.value.code == "wal-target-drift"
+    assert _persistent_identity_snapshot(root) == before
+    assert not external_manifest.exists()
+    assert not pending_candidate.exists()
+
+
 def test_global_wal_recovery_accepts_retired_history_and_one_pending_pair(
     tmp_path: Path,
 ) -> None:
@@ -3973,30 +4505,17 @@ def test_mixed_legacy_backlog_retires_existing_checkpoint_before_new_sequence(
 
     monkeypatch.setattr(fs.StateStore, "write_json", original_write)
     monkeypatch.setattr(fs.StateStore, "unlink_exact", original_unlink)
-    next_key = "different-next-natural-key"
-    next_authority = Path("receipts") / "stage" / f"{next_key}.json"
-    next_receipt = {"version": fs.VERSION, "kind": "synthetic-stage-receipt", "status": "next"}
-    with fs._state_lock(root, create=False) as store:
-        next_result = {**next_receipt, "path": str(root / next_authority)}
-        assert (
-            fs._run_transaction(
-                store,
-                operation="stage",
-                natural_key=next_key,
-                request={"operation": next_key},
-                captured_at="2026-07-10T12:02:00Z",
-                writes=[
-                    fs._planned_write(
-                        store,
-                        next_authority,
-                        next_receipt,
-                        immutable=True,
-                    )
-                ],
-                result=next_result,
-            )
-            == next_result
-        )
+    next_candidate = _candidate(
+        case_id=fs.new_case_id("2026-06-03T12:00:00Z"),
+        occurrences=[_occurrence(2, root="root:mixed-backlog-next")],
+    )
+    _, next_receipt = _stage(tmp_path, next_candidate, now="2026-07-10T12:02:00Z")
+    next_intent_payload = next(
+        fs._load_json(path)
+        for path in (root / "wal" / "stage").glob("*.intent.json")
+        if fs._load_json(path)["result"].get("receipt_id") == next_receipt["receipt_id"]
+    )
+    next_key = next_intent_payload["natural_key"]
 
     history = {
         checkpoint["natural_key"]: checkpoint
@@ -5261,14 +5780,14 @@ def test_transaction_rejects_rebound_wal_operation_before_commit_and_recovers(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     root = tmp_path / "state"
-    operation_dir = root / "wal" / "stage"
-    displaced = root / "wal" / ".stage-displaced"
+    operation_dir = root / "wal" / "dormancy"
+    displaced = root / "wal" / ".dormancy-displaced"
     store = fs.StateStore(root)
     store.acquire_lock()
     write = fs._planned_write(store, Path("probe.json"), {"value": 1}, immutable=False)
     authority = fs._planned_write(
         store,
-        Path("receipts") / "stage" / "rebound-wal-operation.json",
+        Path("receipts") / "dormancy" / "rebound-wal-operation.json",
         {"value": 1},
         immutable=True,
     )
@@ -5288,7 +5807,7 @@ def test_transaction_rejects_rebound_wal_operation_before_commit_and_recovers(
         with pytest.raises(fs.StateError, match="name was rebound") as raised:
             fs._run_transaction(
                 store,
-                operation="stage",
+                operation="dormancy",
                 natural_key="rebound-wal-operation",
                 request={"operation": "rebound-wal-operation"},
                 captured_at="2026-07-10T12:00:00Z",
@@ -5298,7 +5817,7 @@ def test_transaction_rejects_rebound_wal_operation_before_commit_and_recovers(
         assert raised.value.code == "state-directory-replaced"
         assert replaced
 
-        intent_path, commit_path = fs._wal_paths("stage", "rebound-wal-operation")
+        intent_path, commit_path = fs._wal_paths("dormancy", "rebound-wal-operation")
         assert not (root / commit_path).exists()
         assert (displaced / intent_path.name).exists()
         assert not (displaced / commit_path.name).exists()
@@ -5308,7 +5827,7 @@ def test_transaction_rejects_rebound_wal_operation_before_commit_and_recovers(
         monkeypatch.setattr(fs, "_apply_wal_intent", original_apply)
         result = fs._run_transaction(
             store,
-            operation="stage",
+            operation="dormancy",
             natural_key="rebound-wal-operation",
             request={"operation": "rebound-wal-operation"},
             captured_at="2026-07-10T12:00:00Z",
@@ -5343,7 +5862,7 @@ def test_transaction_rejects_rebound_after_image_directory_and_recovery_is_deter
     )
     authority = fs._planned_write(
         store,
-        Path("receipts") / "stage" / "rebound-after-image-directory.json",
+        Path("receipts") / "dormancy" / "rebound-after-image-directory.json",
         {"value": 1},
         immutable=True,
     )
@@ -5372,7 +5891,7 @@ def test_transaction_rejects_rebound_after_image_directory_and_recovery_is_deter
         with pytest.raises(fs.StateError, match="name was rebound") as raised:
             fs._run_transaction(
                 store,
-                operation="stage",
+                operation="dormancy",
                 natural_key="rebound-after-image-directory",
                 request={"operation": "rebound-after-image-directory"},
                 captured_at="2026-07-10T12:00:00Z",
@@ -5382,7 +5901,7 @@ def test_transaction_rejects_rebound_after_image_directory_and_recovery_is_deter
         assert raised.value.code == "state-directory-replaced"
         assert injected
 
-        intent_path, commit_path = fs._wal_paths("stage", "rebound-after-image-directory")
+        intent_path, commit_path = fs._wal_paths("dormancy", "rebound-after-image-directory")
         assert (root / intent_path).exists()
         assert not (root / commit_path).exists()
         assert not (year / "probe.json").exists()
@@ -5429,7 +5948,7 @@ def test_state_transaction_revalidates_full_ancestor_chain_before_commit(
         write = fs._planned_write(store, Path("probe.json"), {"value": 1}, immutable=False)
         authority = fs._planned_write(
             store,
-            Path("receipts") / "stage" / "ancestor-replacement.json",
+            Path("receipts") / "dormancy" / "ancestor-replacement.json",
             {"value": 1},
             immutable=True,
         )
@@ -5438,14 +5957,14 @@ def test_state_transaction_revalidates_full_ancestor_chain_before_commit(
         ):
             fs._run_transaction(
                 store,
-                operation="stage",
+                operation="dormancy",
                 natural_key="ancestor-replacement",
                 request={"operation": "ancestor-replacement"},
                 captured_at="2026-07-10T12:00:00Z",
                 writes=[write, authority],
                 result={"status": "must-not-commit"},
             )
-        _, commit_path = fs._wal_paths("stage", "ancestor-replacement")
+        _, commit_path = fs._wal_paths("dormancy", "ancestor-replacement")
         assert (displaced_ancestor / "state" / "probe.json").exists()
         assert not (displaced_ancestor / "state" / commit_path).exists()
         assert not (root / "probe.json").exists()
@@ -5769,14 +6288,14 @@ def test_closed_case_reopens_only_for_a_later_same_cause_recurrence(tmp_path: Pa
     receipt = fs.stage_candidate(
         _write(tmp_path / "reopened.json", reopened),
         root,
-        "2026-07-10T13:00:00Z",
+        "2026-07-12T13:00:00Z",
     )
     assert receipt["action"] == "updated"
     assert fs._load_json(root / receipt["case_path"])["case"]["status"] == "proposed"
     reapproved = json.loads(json.dumps(reopened))
     reapproved["case"]["revision"] += 1
     reapproved["case"]["status"] = "approved"
-    reapproved["case"]["lifecycle_changed_at"] = "2026-06-22T12:00:00Z"
+    reapproved["case"]["lifecycle_changed_at"] = "2026-07-12T13:01:00Z"
     reapproved["case"]["repairs"][-1]["state"] = "open"
     reapproved["case"]["repairs"][-1]["pull_request_url"] = (
         "https://github.com/Joey-Tools/example/pull/2"
@@ -5786,26 +6305,26 @@ def test_closed_case_reopens_only_for_a_later_same_cause_recurrence(tmp_path: Pa
         fs.stage_candidate(
             _write(tmp_path / "reapproved.json", reapproved),
             root,
-            "2026-07-10T14:00:00Z",
+            "2026-07-12T14:00:00Z",
         )
     assert fresh_approval.value.code == "missing-repair-approval"
 
     other_root, _ = _stage_repair_lifecycle(tmp_path / "invalid-reopen", lifecycle)
-    not_later = _closed_reopen_candidate(closed, observed_at="2026-06-20T12:00:00Z")
+    not_later = _closed_reopen_candidate(closed, observed_at="2026-07-11T09:00:00Z")
     with pytest.raises(fs.StateError, match="strictly follow"):
         fs.stage_candidate(
             _write(tmp_path / "not-later.json", not_later),
             other_root,
-            "2026-07-10T13:00:00Z",
+            "2026-07-12T13:00:00Z",
         )
 
     late_root, _ = _stage_repair_lifecycle(tmp_path / "late-reopen", lifecycle)
-    lifecycle_too_early = _closed_reopen_candidate(closed, observed_at="2026-06-22T12:00:00Z")
+    lifecycle_too_early = _closed_reopen_candidate(closed, observed_at="2026-07-12T12:02:00Z")
     with pytest.raises(fs.StateError, match="cannot predate recurrence"):
         fs.stage_candidate(
             _write(tmp_path / "reopen-clock.json", lifecycle_too_early),
             late_root,
-            "2026-07-10T13:00:00Z",
+            "2026-07-12T13:00:00Z",
         )
 
     method_root, _ = _stage_repair_lifecycle(tmp_path / "method-reopen", lifecycle)
@@ -5816,7 +6335,7 @@ def test_closed_case_reopens_only_for_a_later_same_cause_recurrence(tmp_path: Pa
         fs.stage_candidate(
             _write(tmp_path / "reopen-method-change.json", changed_method),
             method_root,
-            "2026-07-10T13:00:00Z",
+            "2026-07-12T13:00:00Z",
         )
 
 
@@ -5856,7 +6375,7 @@ def test_closed_reopen_freezes_every_prior_repair_provenance(tmp_path: Path) -> 
         fs.stage_candidate(
             _write(tmp_path / "changed-prior.json", changed_prior),
             root,
-            "2026-07-10T13:00:00Z",
+            "2026-07-12T13:00:00Z",
         )
     assert prior_error.value.code == "invalid-closed-reopen"
 
@@ -5869,14 +6388,14 @@ def test_closed_reopen_freezes_every_prior_repair_provenance(tmp_path: Path) -> 
         fs.stage_candidate(
             _write(tmp_path / "changed-active.json", changed_active),
             root,
-            "2026-07-10T13:01:00Z",
+            "2026-07-12T13:01:00Z",
         )
     assert active_error.value.code == "invalid-closed-reopen"
 
     receipt = fs.stage_candidate(
         _write(tmp_path / "legal-reopen.json", reopened),
         root,
-        "2026-07-10T13:02:00Z",
+        "2026-07-12T13:02:00Z",
     )
     assert receipt["action"] == "updated"
     persisted = fs._load_json(root / receipt["case_path"])["case"]
@@ -6206,6 +6725,39 @@ def test_published_closure_requires_exact_approval_and_replays_across_now(
         ],
     }
     approval_path = _write(tmp_path / "approval.json", approval)
+    invalid_commits = (
+        (
+            "published-base-commit",
+            plan["base_intent"]["base_sha"],
+            "ledger-commit-base",
+            "must differ from the plan base SHA",
+        ),
+        (
+            "published-mismatched-width",
+            "d" * 64,
+            "ledger-commit-format",
+            "plan base SHA object-ID width",
+        ),
+    )
+    for invalid_id, ledger_commit, error_code, error_match in invalid_commits:
+        invalid_closure = json.loads(json.dumps(closure))
+        invalid_closure["closure_id"] = invalid_id
+        invalid_closure["entries"][0]["ledger_commit"] = ledger_commit
+        before = _persistent_identity_snapshot(root)
+        with pytest.raises(fs.StateError, match=error_match) as invalid:
+            fs.close_publication(
+                root,
+                _write(tmp_path / f"{invalid_id}.json", invalid_closure),
+                "2026-07-11T08:37:00Z",
+                approval_path,
+            )
+        assert invalid.value.code == error_code
+        assert _persistent_identity_snapshot(root) == before
+        intent_relative, commit_relative = fs._wal_paths("close-publication", invalid_id)
+        assert not (root / intent_relative).exists()
+        assert not (root / commit_relative).exists()
+        assert not (root / "publication" / "closures" / f"{invalid_id}.json").exists()
+
     first = fs.close_publication(
         root,
         closure_path,
@@ -6222,6 +6774,500 @@ def test_published_closure_requires_exact_approval_and_replays_across_now(
     history = fs._load_json(root / "publication" / "closures" / f"{closure['closure_id']}.json")
     assert history["recorded_at"] == closure["interaction"]["closed_at"]
     assert history["publication_approval_digest"] == fs._digest(approval)
+
+
+@pytest.mark.parametrize(
+    ("commit_kind", "error_code", "error_match"),
+    [
+        ("base", "ledger-commit-base", "must differ from the plan base SHA"),
+        ("wrong-width", "ledger-commit-format", "plan base SHA object-ID width"),
+    ],
+)
+def test_pending_published_closure_wal_revalidates_commit_before_replay(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    commit_kind: str,
+    error_code: str,
+    error_match: str,
+) -> None:
+    case = _candidate()
+    root, plan, manifest = _finalize_one(tmp_path, case)
+    entry = plan["entries"][0]
+    closure_id = f"pending-published-{commit_kind}"
+    ledger_commit = plan["base_intent"]["base_sha"] if commit_kind == "base" else "d" * 64
+    closure = {
+        "version": 1,
+        "kind": "publication-closure",
+        "closure_id": closure_id,
+        "interaction": {
+            "interactive": True,
+            "actor": "Joey",
+            "closed_at": "2026-07-11T08:36:00Z",
+        },
+        "reason": "published",
+        "summary": "Joey confirmed the exact approved ledger pull request was merged.",
+        "entries": [
+            {
+                "case_id": entry["case_id"],
+                "revision": entry["revision"],
+                "semantic_digest": entry["semantic_digest"],
+                "selection_id": plan["selection_id"],
+                "plan_digest": plan["plan_digest"],
+                "manifest_digest": manifest["manifest_digest"],
+                "pull_request_url": (
+                    "https://github.com/Joey-Tools/codex-skill-friction-ledger/pull/3"
+                ),
+                "ledger_commit": ledger_commit,
+                "merged_at": "2026-07-11T08:35:00Z",
+            }
+        ],
+    }
+    approval = {
+        "version": 1,
+        "kind": "publication-approval",
+        "approval_id": f"pending-published-{commit_kind}-approval",
+        "interaction": {
+            "interactive": True,
+            "actor": "Joey",
+            "approved_at": "2026-07-11T08:34:00Z",
+        },
+        "selection_id": plan["selection_id"],
+        "plan_digest": plan["plan_digest"],
+        "manifest_digest": manifest["manifest_digest"],
+        "entries": [
+            {
+                "case_id": entry["case_id"],
+                "revision": entry["revision"],
+                "semantic_digest": entry["semantic_digest"],
+            }
+        ],
+    }
+    closure_path = _write(tmp_path / f"{closure_id}.json", closure)
+    approval_path = _write(tmp_path / f"{closure_id}-approval.json", approval)
+    history_relative = Path("publication") / "closures" / f"{closure_id}.json"
+    active_relative = Path("publication") / "active" / f"{entry['case_id']}.json"
+    original_validator = fs._validate_published_ledger_commit
+    original_write = fs.StateStore.write_json
+
+    def interrupt_history(
+        store: Any,
+        relative: Path | str,
+        value: dict[str, Any],
+        *,
+        immutable: bool = False,
+    ) -> str:
+        if Path(relative) == history_relative:
+            raise OSError("injected invalid published closure interruption")
+        return original_write(store, relative, value, immutable=immutable)
+
+    monkeypatch.setattr(fs, "_validate_published_ledger_commit", lambda item, bound_plan: None)
+    monkeypatch.setattr(fs.StateStore, "write_json", interrupt_history)
+    with pytest.raises(OSError, match="injected invalid published closure interruption"):
+        fs.close_publication(
+            root,
+            closure_path,
+            "2026-07-11T08:37:00Z",
+            approval_path,
+        )
+    monkeypatch.setattr(fs, "_validate_published_ledger_commit", original_validator)
+    monkeypatch.setattr(fs.StateStore, "write_json", original_write)
+
+    intent_relative, commit_relative = fs._wal_paths("close-publication", closure_id)
+    assert (root / intent_relative).exists()
+    assert not (root / commit_relative).exists()
+    assert not (root / history_relative).exists()
+    assert fs._load_json(root / active_relative)["status"] == "active"
+    before = _persistent_identity_snapshot(root)
+
+    with pytest.raises(fs.StateError, match=error_match) as raised:
+        fs.close_publication(
+            root,
+            closure_path,
+            "2026-07-11T09:37:00Z",
+            approval_path,
+        )
+
+    assert raised.value.code == error_code
+    assert _persistent_identity_snapshot(root) == before
+    assert not (root / history_relative).exists()
+    assert fs._load_json(root / active_relative)["status"] == "active"
+
+
+@pytest.mark.parametrize("tamper_kind", ["redirect-active", "forged-manifest-tuple"])
+def test_close_wal_projection_and_manifest_membership_fail_without_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tamper_kind: str,
+) -> None:
+    case = _repair_lifecycle_candidates()[0]
+    root, plan, manifest = _finalize_one(tmp_path, case)
+    closure, approval = _published_closure_and_approval(
+        plan,
+        manifest,
+        closure_id=f"legacy-close-{tamper_kind}",
+        ledger_commit="c" * 40,
+    )
+    history_relative = Path("publication") / "closures" / f"{closure['closure_id']}.json"
+    original_write = fs.StateStore.write_json
+
+    def interrupt_history(
+        store: Any,
+        relative: Path | str,
+        value: dict[str, Any],
+        *,
+        immutable: bool = False,
+        max_bytes: int | None = None,
+    ) -> str:
+        if Path(relative) == history_relative:
+            raise OSError("injected pending close projection")
+        return original_write(
+            store,
+            relative,
+            value,
+            immutable=immutable,
+            max_bytes=max_bytes,
+        )
+
+    monkeypatch.setattr(fs.StateStore, "write_json", interrupt_history)
+    with pytest.raises(OSError, match="pending close projection"):
+        fs.close_publication(
+            root,
+            _write(tmp_path / "projection-closure.json", closure),
+            "2026-07-11T08:37:00Z",
+            _write(tmp_path / "projection-approval.json", approval),
+        )
+    monkeypatch.setattr(fs.StateStore, "write_json", original_write)
+
+    intent_relative, commit_relative = fs._wal_paths(
+        "close-publication",
+        closure["closure_id"],
+    )
+    intent_path = root / intent_relative
+    intent = fs._load_json(intent_path)
+    closure_write = next(
+        write for write in intent["writes"] if write["after"].get("kind") == "publication-closure"
+    )
+    active_write = next(
+        write for write in intent["writes"] if write["after"].get("kind") == "publication-pending"
+    )
+    if tamper_kind == "redirect-active":
+        active_write["path"] = f"publication/active/{fs.new_case_id('2026-06-20T12:00:00Z')}.json"
+    else:
+        forged_revision = closure_write["after"]["entries"][0]["revision"] + 1
+        closure_write["after"]["entries"][0]["revision"] = forged_revision
+        closure_body = {
+            key: value for key, value in closure_write["after"].items() if key != "closure_digest"
+        }
+        forged_closure_digest = fs._digest(closure_body)
+        closure_write["after"]["closure_digest"] = forged_closure_digest
+        closure_write["after_sha256"] = hashlib.sha256(
+            fs._canonical_bytes(closure_write["after"])
+        ).hexdigest()
+        active_write["after"]["revision"] = forged_revision
+        active_write["after"]["closure_digest"] = forged_closure_digest
+        active_body = {
+            key: value for key, value in active_write["after"].items() if key != "record_digest"
+        }
+        active_write["after"]["record_digest"] = fs._digest(active_body)
+        active_write["after_sha256"] = hashlib.sha256(
+            fs._canonical_bytes(active_write["after"])
+        ).hexdigest()
+        intent["result"]["closure_digest"] = forged_closure_digest
+    intent_body = {key: value for key, value in intent.items() if key != "intent_digest"}
+    intent["intent_digest"] = fs._digest(intent_body)
+    intent_path.write_bytes(fs._canonical_bytes(intent))
+
+    if tamper_kind == "redirect-active":
+        before = _persistent_identity_snapshot(root)
+        with fs._state_lock(root, create=False) as store:
+            with pytest.raises(fs.StateError, match="path or mutability") as raised:
+                fs._recover_pending_wal(store)
+        assert raised.value.code == "invalid-wal"
+        assert _persistent_identity_snapshot(root) == before
+        assert not (root / commit_relative).exists()
+        return
+
+    membership_validator = fs._validate_manifest_closure_entry
+    monkeypatch.setattr(fs, "_validate_manifest_closure_entry", lambda manifest, item: None)
+    with fs._state_lock(root, create=False) as store:
+        fs._recover_pending_wal(store)
+    monkeypatch.setattr(fs, "_validate_manifest_closure_entry", membership_validator)
+    closure_record = fs._load_json(root / history_relative)
+    entry = closure_record["entries"][0]
+    publication = {
+        "closure_id": closure_record["closure_id"],
+        "closure_digest": closure_record["closure_digest"],
+        "selection_id": entry["selection_id"],
+        "plan_digest": entry["plan_digest"],
+        "manifest_digest": entry["manifest_digest"],
+        "pull_request_url": entry["pull_request_url"],
+        "ledger_commit": entry["ledger_commit"],
+        "merged_at": entry["merged_at"],
+    }
+    source_tuple = {field: entry[field] for field in ("case_id", "revision", "semantic_digest")}
+    before = _persistent_identity_snapshot(root)
+    with fs._state_lock(root, create=False) as store:
+        with pytest.raises(fs.StateError, match="exact finalized manifest entry") as raised:
+            fs._validate_published_closure_authority(
+                store,
+                publication,
+                source_tuple,
+                recover_publication=False,
+            )
+    assert raised.value.code == "publication-receipt-mismatch"
+    assert _persistent_identity_snapshot(root) == before
+
+
+@pytest.mark.parametrize(
+    ("tamper_kind", "error_match"),
+    [
+        ("active-path", "state after-images differ"),
+        ("closure-path", "key or authority path"),
+    ],
+)
+def test_retired_close_rejects_redirected_projection_without_mutation(
+    tmp_path: Path,
+    tamper_kind: str,
+    error_match: str,
+) -> None:
+    root, plan, manifest = _finalize_one(tmp_path, _candidate())
+    closure, approval = _published_closure_and_approval(
+        plan,
+        manifest,
+        closure_id="retired-redirected-close",
+        ledger_commit="c" * 40,
+    )
+    closure_path = _write(tmp_path / "retired-redirected-closure.json", closure)
+    approval_path = _write(tmp_path / "retired-redirected-approval.json", approval)
+    fs.close_publication(
+        root,
+        closure_path,
+        "2026-07-11T08:37:00Z",
+        approval_path,
+    )
+    with fs._state_lock(root, create=False) as store:
+        fs._recover_pending_wal(store, compact_committed=True)
+
+    checkpoint_path = root / fs._wal_history_path(
+        "close-publication",
+        closure["closure_id"],
+    )
+    checkpoint = fs._load_json(checkpoint_path)
+    if tamper_kind == "active-path":
+        active_image = next(
+            image
+            for image in checkpoint["after_images"]
+            if image["path"].startswith("publication/active/")
+        )
+        active_image["path"] = f"publication/active/{fs.new_case_id('2026-06-20T12:00:00Z')}.json"
+    else:
+        closure_authority = next(
+            authority
+            for authority in checkpoint["authorities"]
+            if authority["path"].startswith("publication/closures/")
+        )
+        original_path = closure_authority["path"]
+        redirected_path = "publication/closures/redirected-retired-close.json"
+        redirected = root / redirected_path
+        redirected.write_bytes((root / original_path).read_bytes())
+        redirected.chmod(0o600)
+        closure_authority["path"] = redirected_path
+        closure_image = next(
+            image for image in checkpoint["after_images"] if image["path"] == original_path
+        )
+        closure_image["path"] = redirected_path
+    _rewrite_wal_checkpoint_chain(root, checkpoint_path, checkpoint)
+
+    before_retry = _persistent_identity_snapshot(root)
+    with pytest.raises(fs.StateError, match=error_match) as retry:
+        fs.close_publication(
+            root,
+            closure_path,
+            "2026-07-11T09:37:00Z",
+            approval_path,
+        )
+    assert retry.value.code == "invalid-wal-history"
+    assert _persistent_identity_snapshot(root) == before_retry
+
+    before_audit = _persistent_identity_snapshot(root)
+    with pytest.raises(fs.StateError, match=error_match) as audit:
+        fs.audit_wal_history(root)
+    assert audit.value.code == "invalid-wal-history"
+    assert _persistent_identity_snapshot(root) == before_audit
+
+
+@pytest.mark.parametrize("retired", [False, True])
+def test_invalid_committed_or_retired_close_retry_precedes_unrelated_pending_recovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    retired: bool,
+) -> None:
+    root, plan, manifest = _finalize_one(tmp_path, _candidate())
+    closure, approval = _published_closure_and_approval(
+        plan,
+        manifest,
+        closure_id=f"legacy-invalid-close-{'retired' if retired else 'active'}",
+        ledger_commit=plan["base_intent"]["base_sha"],
+    )
+    closure_path = _write(tmp_path / f"{closure['closure_id']}.json", closure)
+    approval_path = _write(tmp_path / f"{approval['approval_id']}.json", approval)
+    commit_validator = fs._validate_published_ledger_commit
+    intent_validator = fs._validate_close_publication_intent_commits
+    monkeypatch.setattr(fs, "_validate_published_ledger_commit", lambda item, plan: None)
+    monkeypatch.setattr(
+        fs,
+        "_validate_close_publication_intent_commits",
+        lambda store, intent, **kwargs: None,
+    )
+    fs.close_publication(
+        root,
+        closure_path,
+        "2026-07-11T08:37:00Z",
+        approval_path,
+    )
+    if retired:
+        with fs._state_lock(root, create=False) as store:
+            fs._recover_pending_wal(store, compact_committed=True)
+    monkeypatch.setattr(fs, "_validate_published_ledger_commit", commit_validator)
+    monkeypatch.setattr(fs, "_validate_close_publication_intent_commits", intent_validator)
+
+    authority_before = _persistent_identity_snapshot(root)
+    with fs._state_lock(root, create=False) as store:
+        with pytest.raises(fs.StateError, match="must differ from the plan base SHA") as authority:
+            fs._require_committed_transaction(
+                store,
+                "close-publication",
+                closure["closure_id"],
+                recover_publication=False,
+            )
+    assert authority.value.code == "ledger-commit-base"
+    assert _persistent_identity_snapshot(root) == authority_before
+
+    pending_intent, pending_candidate = _copy_pending_stage_intent(
+        tmp_path / f"unrelated-pending-{retired}",
+        root,
+        valid_for_target=True,
+    )
+    _, pending_commit_relative = fs._wal_paths(
+        "stage",
+        fs._load_json(pending_intent)["natural_key"],
+    )
+    before_retry = _persistent_identity_snapshot(root)
+    with pytest.raises(fs.StateError, match="must differ from the plan base SHA") as retry:
+        fs.close_publication(
+            root,
+            closure_path,
+            "2026-07-11T09:37:00Z",
+            approval_path,
+        )
+    assert retry.value.code == "ledger-commit-base"
+    assert _persistent_identity_snapshot(root) == before_retry
+    assert pending_intent.exists()
+    assert not (root / pending_commit_relative).exists()
+    assert not (root / fs._case_relative_path(pending_candidate)).exists()
+
+
+def test_published_closure_recovers_history_active_gap_with_advanced_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    case = _candidate()
+    root, plan, manifest = _finalize_one(tmp_path, case)
+    entry = plan["entries"][0]
+    closure = {
+        "version": 1,
+        "kind": "publication-closure",
+        "closure_id": "published-gap",
+        "interaction": {
+            "interactive": True,
+            "actor": "Joey",
+            "closed_at": "2026-07-11T08:36:00Z",
+        },
+        "reason": "published",
+        "summary": "Joey confirmed the exact approved ledger pull request was merged.",
+        "entries": [
+            {
+                "case_id": entry["case_id"],
+                "revision": entry["revision"],
+                "semantic_digest": entry["semantic_digest"],
+                "selection_id": plan["selection_id"],
+                "plan_digest": plan["plan_digest"],
+                "manifest_digest": manifest["manifest_digest"],
+                "pull_request_url": (
+                    "https://github.com/Joey-Tools/codex-skill-friction-ledger/pull/2"
+                ),
+                "ledger_commit": "d" * 40,
+                "merged_at": "2026-07-11T08:35:00Z",
+            }
+        ],
+    }
+    approval = {
+        "version": 1,
+        "kind": "publication-approval",
+        "approval_id": "published-gap-approval",
+        "interaction": {
+            "interactive": True,
+            "actor": "Joey",
+            "approved_at": "2026-07-11T08:34:00Z",
+        },
+        "selection_id": plan["selection_id"],
+        "plan_digest": plan["plan_digest"],
+        "manifest_digest": manifest["manifest_digest"],
+        "entries": [
+            {
+                "case_id": entry["case_id"],
+                "revision": entry["revision"],
+                "semantic_digest": entry["semantic_digest"],
+            }
+        ],
+    }
+    closure_path = _write(tmp_path / "published-gap.json", closure)
+    approval_path = _write(tmp_path / "published-gap-approval.json", approval)
+    active_relative = Path("publication") / "active" / f"{entry['case_id']}.json"
+    original = fs.StateStore.write_json
+    injected = False
+
+    def fail_active(
+        store: Any,
+        relative: Path | str,
+        value: dict[str, Any],
+        *,
+        immutable: bool = False,
+    ) -> str:
+        nonlocal injected
+        if not injected and Path(relative) == active_relative:
+            injected = True
+            raise OSError("injected published active closure interruption")
+        return original(store, relative, value, immutable=immutable)
+
+    monkeypatch.setattr(fs.StateStore, "write_json", fail_active)
+    with pytest.raises(OSError, match="injected published active closure interruption"):
+        fs.close_publication(
+            root,
+            closure_path,
+            "2026-07-11T08:37:00Z",
+            approval_path,
+        )
+    monkeypatch.setattr(fs.StateStore, "write_json", original)
+    history_path = root / "publication" / "closures" / "published-gap.json"
+    history_bytes = history_path.read_bytes()
+    recovered = fs.close_publication(
+        root,
+        closure_path,
+        "2026-07-11T09:37:00Z",
+        approval_path,
+    )
+    assert history_path.read_bytes() == history_bytes
+    assert recovered["status"] == "closed"
+    assert fs._load_json(root / active_relative)["status"] == "closed"
+    assert (
+        fs.close_publication(
+            root,
+            closure_path,
+            "2026-07-11T10:37:00Z",
+            approval_path,
+        )
+        == recovered
+    )
 
 
 def test_closure_recovers_history_active_gap_across_now(
@@ -6343,6 +7389,7 @@ def test_repair_approval_binds_exact_scope_survives_currentness_and_is_consumed_
         tmp_path, root, proposed, approved, proposed_stage
     )
     assert authority["status"] == "approved"
+    assert authority["target_lifecycle_changed_at"] == approved["case"]["lifecycle_changed_at"]
     duplicate = json.loads(json.dumps(approval))
     duplicate["approval_id"] = "duplicate-exact-repair-authority"
     with pytest.raises(fs.StateError, match="already has a different approval") as conflict:
@@ -6455,13 +7502,13 @@ def test_consumed_repair_binding_rejects_replacement_supersession_and_later_inst
 
     implemented_r2 = json.loads(json.dumps(superseded))
     implemented_r2["case"]["status"] = "implemented"
-    implemented_r2["case"]["lifecycle_changed_at"] = "2026-06-03T12:00:00Z"
+    implemented_r2["case"]["lifecycle_changed_at"] = "2026-07-11T08:45:00Z"
     implemented_r2["case"]["repairs"][1].update(
         {
             "state": "merged",
             "pull_request_url": "https://github.com/Joey-Tools/example/pull/2",
             "commit": "b" * 40,
-            "installed_on": "2026-06-03",
+            "installed_on": "2026-07-11",
         }
     )
     implemented_r2["control"]["semantic_digest"] = fs.semantic_digest(implemented_r2["case"])
@@ -6555,6 +7602,356 @@ def test_repair_approval_rejects_forged_stale_and_unrelated_semantic_changes(
     assert expired.value.code == "repair-approval-clock-order"
 
 
+@pytest.mark.parametrize(
+    ("commit_kind", "error_code", "error_match"),
+    [
+        ("base", "ledger-commit-base", "must differ from the plan base SHA"),
+        ("wrong-width", "ledger-commit-format", "plan base SHA object-ID width"),
+    ],
+)
+def test_repair_approval_revalidates_legacy_published_commit_without_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    commit_kind: str,
+    error_code: str,
+    error_match: str,
+) -> None:
+    proposed, approved = _repair_lifecycle_candidates()[:2]
+    root, proposed_stage = _stage(tmp_path, proposed)
+    ledger_commit = "a" * 40 if commit_kind == "base" else "d" * 64
+    commit_validator = fs._validate_published_ledger_commit
+    monkeypatch.setattr(
+        fs,
+        "_validate_published_ledger_commit",
+        lambda item, plan: None,
+    )
+    approval, _ = _publish_and_approve_repair(
+        tmp_path,
+        root,
+        proposed,
+        approved,
+        proposed_stage,
+        approval_id=f"legacy-{commit_kind}-publication-authority",
+        ledger_commit=ledger_commit,
+        persist=False,
+    )
+    monkeypatch.setattr(fs, "_validate_published_ledger_commit", commit_validator)
+    before = _persistent_identity_snapshot(root)
+
+    with pytest.raises(fs.StateError, match=error_match) as raised:
+        fs.approve_repair(
+            root,
+            _write(tmp_path / f"legacy-{commit_kind}-candidate.json", approved),
+            _write(tmp_path / f"legacy-{commit_kind}-approval.json", approval),
+            "2026-07-11T08:38:00Z",
+            interactive_confirmed=True,
+        )
+
+    assert raised.value.code == error_code
+    assert _persistent_identity_snapshot(root) == before
+    assert not (root / "repairs" / "approvals" / f"{approval['approval_id']}.json").exists()
+
+
+def test_repair_approval_revalidates_legacy_prepared_object_id_width_without_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proposed, approved = _repair_lifecycle_candidates()[:2]
+    root, proposed_stage = _stage(tmp_path, proposed)
+    prepared_validator = fs._validate_prepared_entry
+
+    def accept_legacy_entry(
+        value: Any,
+        index: int,
+        plan_entry: dict[str, Any],
+        *,
+        plan_created_at: str,
+        now: str,
+    ) -> dict[str, Any]:
+        del index, plan_entry, plan_created_at, now
+        return value
+
+    monkeypatch.setattr(
+        fs,
+        "_validate_prepared_entry",
+        accept_legacy_entry,
+    )
+    approval, _ = _publish_and_approve_repair(
+        tmp_path,
+        root,
+        proposed,
+        approved,
+        proposed_stage,
+        approval_id="legacy-wide-prepared-chain",
+        prepared_commit_sha="d" * 64,
+        persist=False,
+    )
+    monkeypatch.setattr(fs, "_validate_prepared_entry", prepared_validator)
+    before = _persistent_identity_snapshot(root)
+
+    with pytest.raises(fs.StateError, match="object-ID width") as raised:
+        fs.approve_repair(
+            root,
+            _write(tmp_path / "legacy-wide-prepared-candidate.json", approved),
+            _write(tmp_path / "legacy-wide-prepared-approval.json", approval),
+            "2026-07-11T08:38:00Z",
+            interactive_confirmed=True,
+        )
+
+    assert raised.value.code == "prepared-commit-format"
+    assert _persistent_identity_snapshot(root) == before
+    assert not (root / "repairs" / "approvals" / f"{approval['approval_id']}.json").exists()
+
+
+@pytest.mark.parametrize("authority_state", ["fresh", "pending", "committed", "retired"])
+def test_approve_repair_chain_revalidation_precedes_recovery_or_idempotent_return(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    authority_state: str,
+) -> None:
+    proposed, approved = _repair_lifecycle_candidates()[:2]
+    root, proposed_stage = _stage(tmp_path, proposed)
+    prepared_validator = fs._validate_prepared_entry
+
+    def accept_legacy_entry(
+        value: Any,
+        index: int,
+        plan_entry: dict[str, Any],
+        *,
+        plan_created_at: str,
+        now: str,
+    ) -> dict[str, Any]:
+        del index, plan_entry, plan_created_at, now
+        return value
+
+    monkeypatch.setattr(fs, "_validate_prepared_entry", accept_legacy_entry)
+    approval, _ = _publish_and_approve_repair(
+        tmp_path,
+        root,
+        proposed,
+        approved,
+        proposed_stage,
+        approval_id=f"legacy-wide-{authority_state}-approve-wal",
+        prepared_commit_sha="d" * 64,
+        persist=False,
+    )
+    candidate_path = _write(tmp_path / f"{authority_state}-approved.json", approved)
+    approval_path = _write(tmp_path / f"{authority_state}-approval.json", approval)
+    approval_relative = Path("repairs") / "approvals" / f"{approval['approval_id']}.json"
+    original_write = fs.StateStore.write_json
+
+    if authority_state == "pending":
+
+        def interrupt_approval(
+            store: Any,
+            relative: Path | str,
+            value: dict[str, Any],
+            *,
+            immutable: bool = False,
+            max_bytes: int | None = None,
+        ) -> str:
+            if Path(relative) == approval_relative:
+                raise OSError("injected legacy pending approval")
+            return original_write(
+                store,
+                relative,
+                value,
+                immutable=immutable,
+                max_bytes=max_bytes,
+            )
+
+        monkeypatch.setattr(fs.StateStore, "write_json", interrupt_approval)
+        with pytest.raises(OSError, match="legacy pending approval"):
+            fs.approve_repair(
+                root,
+                candidate_path,
+                approval_path,
+                "2026-07-11T08:38:00Z",
+                interactive_confirmed=True,
+            )
+        monkeypatch.setattr(fs.StateStore, "write_json", original_write)
+    elif authority_state in {"committed", "retired"}:
+        fs.approve_repair(
+            root,
+            candidate_path,
+            approval_path,
+            "2026-07-11T08:38:00Z",
+            interactive_confirmed=True,
+        )
+        if authority_state == "retired":
+            with fs._state_lock(root, create=False) as store:
+                fs._recover_pending_wal(store, compact_committed=True)
+
+    monkeypatch.setattr(fs, "_validate_prepared_entry", prepared_validator)
+    pending_intent, _ = _copy_pending_stage_intent(
+        tmp_path / f"{authority_state}-unrelated-pending",
+        root,
+        valid_for_target=True,
+    )
+    pending = fs._load_json(pending_intent)
+    pending_candidate = root / next(
+        write["path"] for write in pending["writes"] if isinstance(write["after"].get("case"), dict)
+    )
+    before = _persistent_identity_snapshot(root)
+
+    with pytest.raises(fs.StateError, match="object-ID width") as raised:
+        if authority_state == "fresh":
+            fs.approve_repair(
+                root,
+                candidate_path,
+                approval_path,
+                "2026-07-11T08:39:00Z",
+                interactive_confirmed=True,
+            )
+        else:
+            with fs._state_lock(root, create=False) as store:
+                if authority_state == "retired":
+                    fs._require_committed_transaction(
+                        store,
+                        "approve-repair",
+                        approval["approval_id"],
+                        recover_publication=False,
+                    )
+                else:
+                    fs._recover_pending_wal(store)
+
+    assert raised.value.code == "prepared-commit-format"
+    assert _persistent_identity_snapshot(root) == before
+    assert not pending_candidate.exists()
+
+
+def test_pending_approve_repair_rejects_extra_write_without_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proposed, approved = _repair_lifecycle_candidates()[:2]
+    root, proposed_stage = _stage(tmp_path, proposed)
+    approval, _ = _publish_and_approve_repair(
+        tmp_path,
+        root,
+        proposed,
+        approved,
+        proposed_stage,
+        approval_id="approve-extra-write",
+        persist=False,
+    )
+    approval_relative = Path("repairs") / "approvals" / f"{approval['approval_id']}.json"
+    original_write = fs.StateStore.write_json
+
+    def interrupt_approval(
+        store: Any,
+        relative: Path | str,
+        value: dict[str, Any],
+        *,
+        immutable: bool = False,
+        max_bytes: int | None = None,
+    ) -> str:
+        if Path(relative) == approval_relative:
+            raise OSError("injected approve extra-write intent")
+        return original_write(
+            store,
+            relative,
+            value,
+            immutable=immutable,
+            max_bytes=max_bytes,
+        )
+
+    monkeypatch.setattr(fs.StateStore, "write_json", interrupt_approval)
+    with pytest.raises(OSError, match="approve extra-write intent"):
+        fs.approve_repair(
+            root,
+            _write(tmp_path / "approve-extra-candidate.json", approved),
+            _write(tmp_path / "approve-extra-approval.json", approval),
+            "2026-07-11T08:38:00Z",
+            interactive_confirmed=True,
+        )
+    monkeypatch.setattr(fs.StateStore, "write_json", original_write)
+
+    intent_relative, commit_relative = fs._wal_paths(
+        "approve-repair",
+        approval["approval_id"],
+    )
+    intent_path = root / intent_relative
+    intent = fs._load_json(intent_path)
+    extra_after = {"version": fs.VERSION, "kind": "unexpected-approval-side-effect"}
+    intent["writes"].append(
+        {
+            "scope": "state",
+            "path": "repairs/unexpected.json",
+            "before_sha256": None,
+            "after_sha256": hashlib.sha256(fs._canonical_bytes(extra_after)).hexdigest(),
+            "after": extra_after,
+            "immutable": False,
+        }
+    )
+    intent_body = {key: value for key, value in intent.items() if key != "intent_digest"}
+    intent["intent_digest"] = fs._digest(intent_body)
+    intent_path.write_bytes(fs._canonical_bytes(intent))
+    before = _persistent_identity_snapshot(root)
+
+    with fs._state_lock(root, create=False) as store:
+        with pytest.raises(fs.StateError, match="exactly two authority writes") as raised:
+            fs._recover_pending_wal(store)
+
+    assert raised.value.code == "invalid-wal"
+    assert _persistent_identity_snapshot(root) == before
+    assert not (root / commit_relative).exists()
+    assert not (root / "repairs" / "unexpected.json").exists()
+
+
+def test_retired_approve_repair_rejects_extra_projection_without_mutation(
+    tmp_path: Path,
+) -> None:
+    proposed, approved = _repair_lifecycle_candidates()[:2]
+    root, proposed_stage = _stage(tmp_path, proposed)
+    approval, _ = _publish_and_approve_repair(
+        tmp_path,
+        root,
+        proposed,
+        approved,
+        proposed_stage,
+        approval_id="retired-extra-approval-write",
+    )
+    with fs._state_lock(root, create=False) as store:
+        fs._recover_pending_wal(store, compact_committed=True)
+
+    checkpoint_path = root / fs._wal_history_path(
+        "approve-repair",
+        approval["approval_id"],
+    )
+    checkpoint = fs._load_json(checkpoint_path)
+    checkpoint["after_images"].append(
+        {
+            "scope": "state",
+            "path": "repairs/unexpected-retired.json",
+            "before_sha256": None,
+            "after_sha256": "e" * 64,
+            "immutable": False,
+        }
+    )
+    _rewrite_wal_checkpoint_chain(root, checkpoint_path, checkpoint)
+    candidate_path = _write(tmp_path / "retired-extra-approved.json", approved)
+    approval_path = _write(tmp_path / "retired-extra-approval.json", approval)
+
+    before_retry = _persistent_identity_snapshot(root)
+    with pytest.raises(fs.StateError, match="state after-images differ") as retry:
+        fs.approve_repair(
+            root,
+            candidate_path,
+            approval_path,
+            "2026-07-11T08:39:00Z",
+            interactive_confirmed=True,
+        )
+    assert retry.value.code == "invalid-wal-history"
+    assert _persistent_identity_snapshot(root) == before_retry
+
+    before_audit = _persistent_identity_snapshot(root)
+    with pytest.raises(fs.StateError, match="state after-images differ") as audit:
+        fs.audit_wal_history(root)
+    assert audit.value.code == "invalid-wal-history"
+    assert _persistent_identity_snapshot(root) == before_audit
+
+
 def test_repair_approval_requires_strict_post_closure_time_and_next_revision(
     tmp_path: Path,
 ) -> None:
@@ -6567,10 +7964,16 @@ def test_repair_approval_requires_strict_post_closure_time_and_next_revision(
     not_later = json.loads(json.dumps(approval))
     not_later["approval_id"] = "not-strictly-after-closure"
     not_later["interaction"]["approved_at"] = "2026-07-11T08:36:00Z"
+    not_later_candidate = json.loads(json.dumps(approved))
+    not_later_candidate["case"]["lifecycle_changed_at"] = "2026-07-11T08:36:00Z"
+    not_later_candidate["control"]["semantic_digest"] = fs.semantic_digest(
+        not_later_candidate["case"]
+    )
+    not_later["target"] = fs._case_tuple(not_later_candidate)
     with pytest.raises(fs.StateError, match="follow merge/closure") as clock:
         fs.approve_repair(
             root,
-            _write(tmp_path / "not-later-candidate.json", approved),
+            _write(tmp_path / "not-later-candidate.json", not_later_candidate),
             _write(tmp_path / "not-later-approval.json", not_later),
             "2026-07-11T08:38:00Z",
             interactive_confirmed=True,
@@ -6592,6 +7995,289 @@ def test_repair_approval_requires_strict_post_closure_time_and_next_revision(
             interactive_confirmed=True,
         )
     assert revision.value.code == "invalid-repair-approval"
+
+
+def test_repair_approval_creation_binds_exact_lifecycle_decision_time_without_mutation(
+    tmp_path: Path,
+) -> None:
+    proposed, approved = _repair_lifecycle_candidates()[:2]
+    root, proposed_stage = _stage(tmp_path, proposed)
+    approval, _ = _publish_and_approve_repair(
+        tmp_path, root, proposed, approved, proposed_stage, persist=False
+    )
+    mismatched = json.loads(json.dumps(approved))
+    mismatched["case"]["lifecycle_changed_at"] = "2026-07-11T08:36:59Z"
+    mismatched["control"]["semantic_digest"] = fs.semantic_digest(mismatched["case"])
+    mismatched_approval = json.loads(json.dumps(approval))
+    mismatched_approval["approval_id"] = "mismatched-lifecycle-authority"
+    mismatched_approval["target"] = fs._case_tuple(mismatched)
+    before = _persistent_identity_snapshot(root)
+
+    with pytest.raises(fs.StateError, match="must equal repair approved_at") as raised:
+        fs.approve_repair(
+            root,
+            _write(tmp_path / "mismatched-lifecycle-candidate.json", mismatched),
+            _write(tmp_path / "mismatched-lifecycle-approval.json", mismatched_approval),
+            "2026-07-11T08:38:00Z",
+            interactive_confirmed=True,
+        )
+
+    assert raised.value.code == "repair-approval-lifecycle-mismatch"
+    assert _persistent_identity_snapshot(root) == before
+    approval_key = fs._repair_approval_index_key(
+        mismatched_approval["source"], mismatched_approval["target"]
+    )
+    assert not (
+        root / "repairs" / "approvals" / f"{mismatched_approval['approval_id']}.json"
+    ).exists()
+    assert not (root / "repairs" / "approval-index" / f"{approval_key}.json").exists()
+    intent_relative, commit_relative = fs._wal_paths(
+        "approve-repair", mismatched_approval["approval_id"]
+    )
+    assert not (root / intent_relative).exists()
+    assert not (root / commit_relative).exists()
+
+
+def test_legacy_repair_approval_result_replays_active_and_retired_without_new_field(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proposed, approved = _repair_lifecycle_candidates()[:2]
+    root, proposed_stage = _stage(tmp_path, proposed)
+    approval, _ = _publish_and_approve_repair(
+        tmp_path,
+        root,
+        proposed,
+        approved,
+        proposed_stage,
+        approval_id="legacy-result-shape",
+        persist=False,
+    )
+    candidate_path = _write(tmp_path / "legacy-result-candidate.json", approved)
+    approval_path = _write(tmp_path / "legacy-result-approval.json", approval)
+    first = _persist_legacy_repair_approval_result(
+        root,
+        candidate_path,
+        approval_path,
+        monkeypatch,
+    )
+    before_active_retry = _persistent_identity_snapshot(root)
+    active_retry = fs.approve_repair(
+        root,
+        candidate_path,
+        approval_path,
+        "2026-07-11T08:39:00Z",
+        interactive_confirmed=True,
+    )
+    assert active_retry == first
+    assert "target_lifecycle_changed_at" not in active_retry
+    assert _persistent_identity_snapshot(root) == before_active_retry
+
+    with fs._state_lock(root, create=False) as store:
+        fs._recover_pending_wal(store, compact_committed=True)
+    checkpoint_path = root / fs._wal_history_path("approve-repair", approval["approval_id"])
+    assert checkpoint_path.exists()
+    checkpoint = fs._load_json(checkpoint_path)
+    assert checkpoint["result_digest"] == fs._digest(first)
+    retired_retry = fs.approve_repair(
+        root,
+        candidate_path,
+        approval_path,
+        "2026-07-11T08:40:00Z",
+        interactive_confirmed=True,
+    )
+    assert retired_retry == first
+    assert "target_lifecycle_changed_at" not in retired_retry
+    assert fs.audit_wal_history(root)["status"] == "clean"
+
+
+def test_pending_approve_repair_wal_revalidates_lifecycle_time_before_replay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    proposed, approved = _repair_lifecycle_candidates()[:2]
+    mismatched = json.loads(json.dumps(approved))
+    mismatched["case"]["lifecycle_changed_at"] = "2026-07-11T08:36:59Z"
+    mismatched["control"]["semantic_digest"] = fs.semantic_digest(mismatched["case"])
+    root, proposed_stage = _stage(tmp_path, proposed)
+    approval, _ = _publish_and_approve_repair(
+        tmp_path,
+        root,
+        proposed,
+        mismatched,
+        proposed_stage,
+        approval_id="pending-mismatched-approval-authority",
+        persist=False,
+    )
+    candidate_path = _write(tmp_path / "pending-mismatched-approval-candidate.json", mismatched)
+    approval_path = _write(tmp_path / "pending-mismatched-approval.json", approval)
+    approval_relative = Path("repairs") / "approvals" / f"{approval['approval_id']}.json"
+    approval_key = fs._repair_approval_index_key(approval["source"], approval["target"])
+    index_relative = Path("repairs") / "approval-index" / f"{approval_key}.json"
+    lifecycle_validator = fs._validate_repair_approval_lifecycle_time
+    intent_validator = fs._validate_approve_repair_intent_lifecycle
+    original_write = fs.StateStore.write_json
+
+    def interrupt_approval(
+        store: Any,
+        relative: Path | str,
+        value: dict[str, Any],
+        *,
+        immutable: bool = False,
+    ) -> str:
+        if Path(relative) == approval_relative:
+            raise OSError("injected mismatched repair approval interruption")
+        return original_write(store, relative, value, immutable=immutable)
+
+    monkeypatch.setattr(
+        fs,
+        "_validate_repair_approval_lifecycle_time",
+        lambda approval_value, target: None,
+    )
+    monkeypatch.setattr(
+        fs,
+        "_validate_approve_repair_intent_lifecycle",
+        lambda store, intent, **kwargs: None,
+    )
+    monkeypatch.setattr(fs.StateStore, "write_json", interrupt_approval)
+    with pytest.raises(OSError, match="injected mismatched repair approval interruption"):
+        fs.approve_repair(
+            root,
+            candidate_path,
+            approval_path,
+            "2026-07-11T08:38:00Z",
+            interactive_confirmed=True,
+        )
+    monkeypatch.setattr(
+        fs,
+        "_validate_repair_approval_lifecycle_time",
+        lifecycle_validator,
+    )
+    monkeypatch.setattr(fs, "_validate_approve_repair_intent_lifecycle", intent_validator)
+    monkeypatch.setattr(fs.StateStore, "write_json", original_write)
+
+    intent_relative, commit_relative = fs._wal_paths("approve-repair", approval["approval_id"])
+    assert (root / intent_relative).exists()
+    assert not (root / commit_relative).exists()
+    assert not (root / approval_relative).exists()
+    assert not (root / index_relative).exists()
+    before = _persistent_identity_snapshot(root)
+
+    with pytest.raises(fs.StateError, match="must equal repair approved_at") as raised:
+        fs.approve_repair(
+            root,
+            candidate_path,
+            approval_path,
+            "2026-07-11T08:39:00Z",
+            interactive_confirmed=True,
+        )
+
+    assert raised.value.code == "repair-approval-lifecycle-mismatch"
+    assert _persistent_identity_snapshot(root) == before
+    assert not (root / approval_relative).exists()
+    assert not (root / index_relative).exists()
+
+
+def test_stage_revalidates_legacy_repair_approval_lifecycle_time_without_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    proposed, approved = _repair_lifecycle_candidates()[:2]
+    mismatched = json.loads(json.dumps(approved))
+    mismatched["case"]["lifecycle_changed_at"] = "2026-07-11T08:36:59Z"
+    mismatched["control"]["semantic_digest"] = fs.semantic_digest(mismatched["case"])
+    root, proposed_stage = _stage(tmp_path, proposed)
+    approval, _ = _persist_legacy_mismatched_repair_approval(
+        tmp_path,
+        root,
+        proposed,
+        mismatched,
+        proposed_stage,
+        monkeypatch,
+        approval_id="legacy-mismatched-lifecycle-authority",
+    )
+    before = _persistent_identity_snapshot(root)
+
+    with pytest.raises(fs.StateError, match="must equal repair approved_at") as raised:
+        fs.stage_candidate(
+            _write(tmp_path / "legacy-mismatched-lifecycle-target.json", mismatched),
+            root,
+            "2026-07-11T08:39:00Z",
+        )
+
+    assert raised.value.code == "repair-approval-lifecycle-mismatch"
+    assert _persistent_identity_snapshot(root) == before
+    assert not (root / "repairs" / "consumptions" / f"{approval['approval_id']}.json").exists()
+    assert fs._load_json(root / fs._case_relative_path(proposed))["case"]["status"] == "proposed"
+
+
+def test_pending_stage_wal_revalidates_repair_approval_lifecycle_before_replay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    proposed, approved = _repair_lifecycle_candidates()[:2]
+    mismatched = json.loads(json.dumps(approved))
+    mismatched["case"]["lifecycle_changed_at"] = "2026-07-11T08:36:59Z"
+    mismatched["control"]["semantic_digest"] = fs.semantic_digest(mismatched["case"])
+    root, proposed_stage = _stage(tmp_path, proposed)
+    approval, _ = _persist_legacy_mismatched_repair_approval(
+        tmp_path,
+        root,
+        proposed,
+        mismatched,
+        proposed_stage,
+        monkeypatch,
+        approval_id="pending-mismatched-lifecycle-authority",
+    )
+    lifecycle_validator = fs._validate_repair_approval_lifecycle_time
+    monkeypatch.setattr(
+        fs,
+        "_validate_repair_approval_lifecycle_time",
+        lambda approval_value, target: None,
+    )
+    consumption_relative = Path("repairs") / "consumptions" / f"{approval['approval_id']}.json"
+    binding_relative = fs._repair_binding_relative(proposed["case"]["id"])
+    original_write = fs.StateStore.write_json
+    receipts_before = set((root / "receipts" / "stage").glob("*.json"))
+
+    def interrupt_consumption(
+        store: Any,
+        relative: Path | str,
+        value: dict[str, Any],
+        *,
+        immutable: bool = False,
+    ) -> str:
+        if Path(relative) == consumption_relative:
+            raise OSError("injected mismatched approval consumption interruption")
+        return original_write(store, relative, value, immutable=immutable)
+
+    target_path = _write(tmp_path / "pending-mismatched-lifecycle-target.json", mismatched)
+    monkeypatch.setattr(fs.StateStore, "write_json", interrupt_consumption)
+    with pytest.raises(OSError, match="injected mismatched approval consumption interruption"):
+        fs.stage_candidate(target_path, root, "2026-07-11T08:39:00Z")
+    monkeypatch.setattr(
+        fs,
+        "_validate_repair_approval_lifecycle_time",
+        lifecycle_validator,
+    )
+    monkeypatch.setattr(fs.StateStore, "write_json", original_write)
+
+    pending_intents = [
+        path
+        for path in (root / "wal" / "stage").glob("*.intent.json")
+        if not path.with_name(path.name.replace(".intent.json", ".commit.json")).exists()
+    ]
+    assert len(pending_intents) == 1
+    assert not (root / consumption_relative).exists()
+    assert not (root / binding_relative).exists()
+    assert set((root / "receipts" / "stage").glob("*.json")) == receipts_before
+    before = _persistent_identity_snapshot(root)
+
+    with pytest.raises(fs.StateError, match="must equal repair approved_at") as raised:
+        fs.stage_candidate(target_path, root, "2026-07-11T08:40:00Z")
+
+    assert raised.value.code == "repair-approval-lifecycle-mismatch"
+    assert _persistent_identity_snapshot(root) == before
+    assert not (root / consumption_relative).exists()
+    assert not (root / binding_relative).exists()
+    assert fs._load_json(root / fs._case_relative_path(proposed))["case"]["status"] == "proposed"
 
 
 def test_repair_approval_consumption_recovers_atomically(
@@ -6706,6 +8392,7 @@ def test_repair_approval_authority_recovers_before_becoming_usable(
         interactive_confirmed=True,
     )
     assert recovered["approval_id"] == approval["approval_id"]
+    assert recovered["target_lifecycle_changed_at"] == approved["case"]["lifecycle_changed_at"]
     assert (root / index_relative).exists()
     _, commit_relative = fs._wal_paths("approve-repair", approval["approval_id"])
     assert (root / commit_relative).exists()

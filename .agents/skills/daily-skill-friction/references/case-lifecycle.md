@@ -109,7 +109,11 @@ exact committed `published` closure ID/digest, selection ID, plan and manifest
 digests, ledger pull-request URL, squash commit, and `merged_at`. The helper
 requires `approved_at` to be strictly later than both `merged_at` and the closure
 time, no later than the invocation time, and before `expires_at`; validity may not
-exceed seven days.
+exceed seven days. The approved target's canonical `lifecycle_changed_at` must
+also equal `approved_at` exactly. This protects the semantic lifecycle decision
+time bound into the target digest; a same-outcome update only to
+`currentness_checked_at` remains benign metadata and does not move that decision
+time.
 
 Only after Joey makes that exact decision, run:
 
@@ -119,15 +123,30 @@ Only after Joey makes that exact decision, run:
 
 The explicit confirmation flag attests the current interactive handoff; a caller
 must not set it from an unattended run. Success immutably writes the receipt and
-its exact source/target index in one committed `approve-repair` WAL transaction.
-The helper accepts neither a publication approval nor an uncommitted, cancelled,
-or stale closure as repair authority.
+its exact source/target index in one committed `approve-repair` WAL transaction;
+the result binds `target_lifecycle_changed_at` to the same exact decision time.
+A pending approval WAL missing or contradicting that binding is rejected before
+any authority after-image is replayed. An exact committed pre-upgrade result may
+retain its original legacy digest without that result field; the helper never
+synthesizes the new field into that result. Retry or consumption accepts that
+legacy form only after directly proving that the supplied target's canonical
+`lifecycle_changed_at` equals `approved_at`. The helper accepts neither a
+publication approval nor an uncommitted, cancelled, or stale closure as repair
+authority. It also revalidates the complete immutable publication chain from the
+registered plan through the prepared receipt, manifest, exact finalize
+transaction and external output, published closure, and active closure record.
+The closure's source tuple must be the unique exact case/revision/semantic entry
+in that finalized manifest. Fresh approval, active WAL recovery, and retired
+idempotent replay perform that proof before unrelated recovery can mutate state;
+an approval WAL contains exactly its immutable approval and index writes.
 
 Then call `stage` on only that bound target. The stage transaction revalidates the
 source and target semantic tuples, full closed repair delta, published closure
-provenance, authority WAL, time window, and unused state. It atomically writes one
-immutable consumption record together with the approved case and stage receipt.
-One authority permits one consumption; a different target, forged closure,
+provenance, authority WAL, time window, exact lifecycle decision time, and unused
+state. Pending stage WAL replay performs the same lifecycle-time check before any
+after-image. It atomically writes one immutable consumption record together with
+the approved case and stage receipt. One authority permits one consumption; a
+different target, forged closure,
 expired receipt, or already consumed authority fails closed. Recovery or exact
 replay completes or returns the same committed transaction rather than consuming
 the decision again.
