@@ -216,4 +216,6 @@ skip the later separate repair decision. This is the only closed-to-active
 transition. Schema validity alone does not authorize a direct
 closed-to-`superseded` repair replacement: the control helper rejects that change
 while the consumed binding remains active. A `superseded` case cannot reopen or
-mutate.
+change any canonical semantic history, repair provenance, evidence, lineage, or
+scope. It may record only a same-outcome `currentness_checked_at` refresh with the
+same semantic digest and revision.

@@ -769,9 +769,10 @@ def _closed_reopen_candidate(
     )
     wrapper["case"]["lifecycle_changed_at"] = "2026-06-21T12:01:00Z"
     wrapper["case"]["repairs"][0]["state"] = "superseded"
+    repair_id = f"R{len(wrapper['case']['repairs']) + 1}"
     wrapper["case"]["repairs"].append(
         {
-            "id": "R2",
+            "id": repair_id,
             "repository": "Joey-Tools/example",
             "action": "amend",
             "state": "planned",
@@ -5643,6 +5644,70 @@ def test_closed_case_reopens_only_for_a_later_same_cause_recurrence(tmp_path: Pa
         )
 
 
+def test_closed_reopen_freezes_every_prior_repair_provenance(tmp_path: Path) -> None:
+    lifecycle = _repair_lifecycle_candidates()
+    for candidate in lifecycle:
+        case = candidate["case"]
+        case["repairs"].append(
+            {
+                "id": "R2",
+                "repository": "Joey-Tools/example",
+                "action": "amend",
+                "state": "superseded",
+                "problem_statement": (
+                    "An earlier repair proposal was retired before implementation."
+                ),
+                "change_summary": "Retain the unimplemented repair as sealed history.",
+                "pull_request_url": None,
+                "commit": None,
+                "commit_trailer": f"Friction-Case: {case['id']}",
+                "installed_on": None,
+                "removed_on": None,
+                "replaces_repair_id": None,
+            }
+        )
+        candidate["control"]["semantic_digest"] = fs.semantic_digest(case)
+
+    root, closed = _stage_repair_lifecycle(tmp_path, lifecycle)
+    reopened = _closed_reopen_candidate(closed)
+
+    changed_prior = json.loads(json.dumps(reopened))
+    changed_prior["case"]["repairs"][1]["pull_request_url"] = (
+        "https://github.com/Joey-Tools/example/pull/99"
+    )
+    changed_prior["control"]["semantic_digest"] = fs.semantic_digest(changed_prior["case"])
+    with pytest.raises(fs.StateError, match="preserve every prior repair") as prior_error:
+        fs.stage_candidate(
+            _write(tmp_path / "changed-prior.json", changed_prior),
+            root,
+            "2026-07-10T13:00:00Z",
+        )
+    assert prior_error.value.code == "invalid-closed-reopen"
+
+    changed_active = json.loads(json.dumps(reopened))
+    changed_active["case"]["repairs"][0]["pull_request_url"] = (
+        "https://github.com/Joey-Tools/example/pull/98"
+    )
+    changed_active["control"]["semantic_digest"] = fs.semantic_digest(changed_active["case"])
+    with pytest.raises(fs.StateError, match="preserve every prior repair") as active_error:
+        fs.stage_candidate(
+            _write(tmp_path / "changed-active.json", changed_active),
+            root,
+            "2026-07-10T13:01:00Z",
+        )
+    assert active_error.value.code == "invalid-closed-reopen"
+
+    receipt = fs.stage_candidate(
+        _write(tmp_path / "legal-reopen.json", reopened),
+        root,
+        "2026-07-10T13:02:00Z",
+    )
+    assert receipt["action"] == "updated"
+    persisted = fs._load_json(root / receipt["case_path"])["case"]
+    assert persisted["repairs"][:-1] == reopened["case"]["repairs"][:-1]
+    assert persisted["repairs"][-1]["id"] == "R3"
+
+
 def test_stage_rejects_missing_or_cyclic_supersession_graph(tmp_path: Path) -> None:
     missing_first = _candidate()
     missing_root, _ = _stage(tmp_path / "missing", missing_first)
@@ -5690,6 +5755,124 @@ def test_stage_rejects_missing_or_cyclic_supersession_graph(tmp_path: Path) -> N
             root,
             "2026-07-10T14:00:00Z",
         )
+
+
+def test_superseded_case_allows_only_nonsemantic_currentness_refresh(tmp_path: Path) -> None:
+    successor = _candidate()
+    first = _candidate()
+    root, _ = _stage(tmp_path, successor)
+    fs.stage_candidate(
+        _write(tmp_path / "first.json", first),
+        root,
+        "2026-07-10T12:01:00Z",
+    )
+    terminal = json.loads(json.dumps(first))
+    terminal["case"]["revision"] = 2
+    terminal["case"]["status"] = "superseded"
+    terminal["case"]["lifecycle_changed_at"] = "2026-06-02T12:00:00Z"
+    terminal["case"]["lifecycle"]["superseded_by"] = successor["case"]["id"]
+    terminal["control"]["semantic_digest"] = fs.semantic_digest(terminal["case"])
+    fs.stage_candidate(
+        _write(tmp_path / "terminal.json", terminal),
+        root,
+        "2026-07-10T12:02:00Z",
+    )
+
+    changed_title = json.loads(json.dumps(terminal))
+    changed_title["case"]["revision"] += 1
+    changed_title["case"]["title"] = "Rewritten terminal history"
+    changed_title["control"]["semantic_digest"] = fs.semantic_digest(changed_title["case"])
+
+    appended_evidence = json.loads(json.dumps(terminal))
+    occurrence = _occurrence(
+        1,
+        root="root:terminal-history",
+        observed_at="2026-06-03T12:00:00Z",
+    )
+    appended_evidence["case"]["revision"] += 1
+    appended_evidence["case"]["support"] = "repeated"
+    appended_evidence["case"]["evidence"].append(occurrence)
+    appended_evidence["case"]["evidence_last_seen"] = occurrence["observed_at"]
+    appended_evidence["case"]["currentness_checked_at"] = occurrence["observed_at"]
+    appended_evidence["case"]["causal"].update(
+        {
+            "occurrence_count": 2,
+            "root_task_count": 2,
+            "workflow_count": 1,
+            "repository_count": 1,
+            "opportunity_count": 2,
+            "causal_signature_count": 1,
+        }
+    )
+    appended_evidence["control"]["source_lineage"].append(
+        {
+            "opportunity_id": occurrence["opportunity_id"],
+            "source_family": "human-root",
+            "is_automation_descendant": False,
+            "is_replay": False,
+            "chronology": "A later human root supplied terminal recurrence evidence.",
+        }
+    )
+    appended_evidence["control"]["semantic_digest"] = fs.semantic_digest(appended_evidence["case"])
+
+    appended_repair = json.loads(json.dumps(terminal))
+    appended_repair["case"]["revision"] += 1
+    appended_repair["case"]["repairs"] = [
+        {
+            "id": "R1",
+            "repository": "Joey-Tools/example",
+            "action": "amend",
+            "state": "superseded",
+            "problem_statement": "Terminal history must not gain a repair after supersession.",
+            "change_summary": "Attempt to append a repair to terminal history.",
+            "pull_request_url": None,
+            "commit": None,
+            "commit_trailer": f"Friction-Case: {terminal['case']['id']}",
+            "installed_on": None,
+            "removed_on": None,
+            "replaces_repair_id": None,
+        }
+    ]
+    appended_repair["case"]["effectiveness"]["method"] = "deterministic"
+    appended_repair["control"]["semantic_digest"] = fs.semantic_digest(appended_repair["case"])
+
+    for index, candidate in enumerate(
+        (changed_title, appended_evidence, appended_repair),
+        start=1,
+    ):
+        with pytest.raises(fs.StateError, match="semantic history is immutable") as semantic:
+            fs.stage_candidate(
+                _write(tmp_path / f"terminal-semantic-{index}.json", candidate),
+                root,
+                f"2026-07-10T12:1{index}:00Z",
+            )
+        assert semantic.value.code == "terminal-semantic-mutation"
+
+    changed_lineage = json.loads(json.dumps(terminal))
+    changed_lineage["control"]["source_lineage"][0]["chronology"] = (
+        "Rewritten lineage for terminal history."
+    )
+    with pytest.raises(fs.StateError, match="control provenance") as lineage:
+        fs.stage_candidate(
+            _write(tmp_path / "terminal-lineage.json", changed_lineage),
+            root,
+            "2026-07-10T12:20:00Z",
+        )
+    assert lineage.value.code == "control-mutation"
+
+    refreshed = json.loads(json.dumps(terminal))
+    refreshed["case"]["currentness_checked_at"] = "2026-07-10T12:30:00Z"
+    refreshed["control"]["semantic_digest"] = fs.semantic_digest(refreshed["case"])
+    assert refreshed["case"]["revision"] == terminal["case"]["revision"]
+    assert refreshed["control"]["semantic_digest"] == terminal["control"]["semantic_digest"]
+    receipt = fs.stage_candidate(
+        _write(tmp_path / "terminal-currentness.json", refreshed),
+        root,
+        "2026-07-10T12:31:00Z",
+    )
+    assert receipt["action"] == "updated"
+    persisted = fs._load_json(root / receipt["case_path"])
+    assert persisted["case"] == refreshed["case"]
 
 
 def test_terminal_evaluation_and_forward_removal_bind_latest_history() -> None:

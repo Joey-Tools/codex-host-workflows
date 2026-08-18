@@ -6455,10 +6455,16 @@ def _validate_closed_reopen(old_case: Mapping[str, Any], new_case: Mapping[str, 
     ]
     if len(old_active) != 1:
         _fail("invalid-closed-reopen", "reopen requires exactly one prior current repair")
-    index, old_repair = old_active[0]
-    changed_old = new_repairs[index]
-    if changed_old["id"] != old_repair["id"] or changed_old["state"] != "superseded":
-        _fail("invalid-closed-reopen", "reopen must supersede prior current repair")
+    index, _ = old_active[0]
+    for repair_index, prior_repair in enumerate(old_repairs):
+        expected_repair = dict(prior_repair)
+        if repair_index == index:
+            expected_repair["state"] = "superseded"
+        if new_repairs[repair_index] != expected_repair:
+            _fail(
+                "invalid-closed-reopen",
+                "reopen must preserve every prior repair and only supersede the current state",
+            )
     appended_repair = new_repairs[-1]
     if appended_repair["state"] != "planned" or appended_repair["action"] not in {
         "install",
@@ -6584,6 +6590,11 @@ def _validate_case_delta(existing: Mapping[str, Any], candidate: Mapping[str, An
     old_digest = existing["control"]["semantic_digest"]
     new_digest = candidate["control"]["semantic_digest"]
     semantic_changed = old_digest != new_digest
+    if old_case["status"] == "superseded" and semantic_changed:
+        _fail(
+            "terminal-semantic-mutation",
+            "superseded case semantic history is immutable; only currentness may refresh",
+        )
     if semantic_changed and new_revision != old_revision + 1:
         _fail("revision-order", "a semantic change must increment revision by exactly one")
     if not semantic_changed and new_revision != old_revision:
