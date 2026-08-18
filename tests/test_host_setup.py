@@ -834,6 +834,65 @@ def test_empty_host_apply_is_idempotent_and_preserves_shared_prefetch(tmp_path: 
         ]
 
 
+def test_launch_agent_mode_drift_is_planned_repaired_and_doctor_ready(
+    tmp_path: Path,
+) -> None:
+    fixture = _build_host(tmp_path)
+    runner = FakeRunner()
+    _apply_ready(fixture, runner)
+    active = _active(fixture)
+    spec = hs._launch_agent_specs(active, fixture.home)[0]
+    assert stat.S_IMODE(spec.destination.stat().st_mode) == hs.LAUNCH_AGENT_MODE
+
+    original = spec.destination.stat()
+    os.utime(
+        spec.destination,
+        ns=(original.st_atime_ns, original.st_mtime_ns + 10_000_000_000),
+    )
+    timestamp_only = hs.plan_setup(active, fixture.home, runner, no_launchctl=True)
+    assert _check(timestamp_only, "launch-agent-file-control")["status"] == "ready"
+    assert "launch-agent-file-control" not in timestamp_only["actions"]
+
+    spec.destination.chmod(0o600)
+    planned = hs.plan_setup(active, fixture.home, runner, no_launchctl=True)
+    planned_check = _check(planned, "launch-agent-file-control")
+    assert planned["status"] == "changes-required"
+    assert planned_check["status"] == "needs-apply"
+    assert "access policy" in planned_check["detail"]
+    assert "launch-agent-file-control" in planned["actions"]
+
+    now = dt.datetime(2026, 8, 17, 7, 0, tzinfo=dt.UTC)
+    _write_both_stamps(active, runner, now)
+    before_repair = hs.doctor_setup(
+        active,
+        fixture.home,
+        runner,
+        no_launchctl=True,
+        max_age_minutes=60,
+        now=now,
+    )
+    assert before_repair["status"] == "changes-required"
+    assert _check(before_repair, "launch-agent-file-control")["status"] == "needs-apply"
+
+    old_inode = spec.destination.stat().st_ino
+    repaired = _apply_ready(fixture, runner)
+    assert repaired["status"] == "ready"
+    assert "launch-agent-control" in cast(list[str], repaired["changes"])
+    assert spec.destination.stat().st_ino != old_inode
+    assert stat.S_IMODE(spec.destination.stat().st_mode) == hs.LAUNCH_AGENT_MODE
+
+    ready = hs.doctor_setup(
+        active,
+        fixture.home,
+        runner,
+        no_launchctl=True,
+        max_age_minutes=60,
+        now=now,
+    )
+    assert ready["status"] == "ready"
+    assert _check(ready, "launch-agent-file-control")["status"] == "ready"
+
+
 def test_launch_agent_clean_launcher_drops_inherited_tool_control_environment(
     tmp_path: Path,
 ) -> None:
@@ -2603,6 +2662,46 @@ def test_status_rejects_symlinked_git_admin_before_helper(tmp_path: Path) -> Non
     assert not any("status" in args for args, _cwd in runner.calls)
 
 
+def test_index_symlink_blocks_flag_validation_before_git_child(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _build_host(tmp_path)
+    active = _active(fixture)
+    manifest = hs._load_main_manifest(active)
+    mirror = manifest.repo_path(manifest.repos[0])
+    index = mirror / ".git" / "index"
+    displaced = mirror / ".git" / "index.displaced"
+    external = tmp_path / "external-index"
+    external.write_bytes(index.read_bytes())
+    index.rename(displaced)
+    index.symlink_to(external)
+    git_started = False
+
+    def forbidden_git(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        nonlocal git_started
+        git_started = True
+        raise AssertionError("Git must not start after the index leaf precheck blocks")
+
+    monkeypatch.setattr(hs, "_run_git", forbidden_git)
+    checks = hs._git_admin_path_checks(
+        mirror,
+        prefix="symlink-index",
+        allow_managed_hooks_path=True,
+    )
+
+    assert (
+        next(check for check in checks if check.name == "symlink-index-index").status == "blocked"
+    )
+    flag_check = next(check for check in checks if check.name == "symlink-index-index-flags")
+    assert flag_check.status == "blocked"
+    assert "prerequisite" in flag_check.detail
+    with pytest.raises(hs.SetupError, match="index prerequisite is blocked"):
+        hs._default_mirror_index_snapshot(mirror)
+    assert git_started is False
+    assert external.read_bytes() == displaced.read_bytes()
+
+
 def test_git_and_helper_environments_disable_executable_fsmonitor(tmp_path: Path) -> None:
     fixture = _build_host(tmp_path)
     active = _active(fixture)
@@ -4153,6 +4252,151 @@ def test_ensure_semantic_precheck_allows_clean_behind_mirror(tmp_path: Path) -> 
 
     assert check.status == "ready"
     assert "ahead=0 behind=1" in check.detail
+
+
+@pytest.mark.parametrize(
+    ("index_flag", "expected_tag"),
+    [
+        ("--assume-unchanged", "h=1"),
+        ("--skip-worktree", "S=1"),
+    ],
+)
+@pytest.mark.parametrize("manifest_kind", ["control", "main"])
+def test_hidden_tracked_mirror_drift_blocks_all_control_entrypoints(
+    tmp_path: Path,
+    index_flag: str,
+    expected_tag: str,
+    manifest_kind: str,
+) -> None:
+    fixture = _build_host(tmp_path)
+    active = _active(fixture)
+    if manifest_kind == "control":
+        manifest = hs.load_workspace_manifest(
+            active.control_mirror_manifest,
+            label="control index flag test manifest",
+            expected_cache_root=active.cache_root,
+        )
+        repo = manifest.repos[0]
+        relative = "scripts/host_setup.py"
+    else:
+        manifest = hs._load_main_manifest(active)
+        repo = manifest.repos[0]
+        relative = "README.md"
+    mirror = manifest.repo_path(repo)
+    _git(mirror, "update-index", index_flag, "--", relative)
+    target = mirror / relative
+    target.write_bytes(target.read_bytes() + b"hidden drift\n")
+
+    assert _git(mirror, "status", "--porcelain=v1", "--untracked-files=all") == ""
+    semantic = hs._ensure_mirror_precheck(manifest, repo)
+    assert semantic.status == "blocked"
+    assert expected_tag in semantic.detail
+
+    status_runner = FakeRunner()
+    status = hs.status_setup(active, fixture.home, status_runner, no_launchctl=True)
+    assert status["status"] == "blocked"
+    index_check = _check(status, f"prefetch-{repo.name}-index-flags")
+    assert index_check["status"] == "blocked"
+    assert expected_tag in index_check["detail"]
+    assert not any("status" in args for args, _cwd in status_runner.calls)
+
+    prefetch_runner = FakeRunner()
+    prefetch, _refreshed = hs.prefetch_weekly(active, prefetch_runner)
+    assert prefetch["status"] == "blocked"
+    assert not any(
+        "prefetch" in args
+        and "--config" in args
+        and Path(args[args.index("--config") + 1]) == manifest.path
+        for args, _cwd in prefetch_runner.calls
+    )
+
+    ensure_runner = FakeRunner()
+    with pytest.raises(hs.SetupError, match="initial preflight blocked"):
+        hs.apply_setup(
+            active,
+            fixture.home,
+            ensure_runner,
+            ensure=True,
+            no_launchctl=True,
+        )
+    assert not any("ensure" in args for args, _cwd in ensure_runner.calls)
+
+
+def test_default_mirror_index_flags_and_timestamp_churn_remain_ready(tmp_path: Path) -> None:
+    fixture = _build_host(tmp_path)
+    active = _active(fixture)
+    control_manifest = hs.load_workspace_manifest(
+        active.control_mirror_manifest,
+        label="control default index test manifest",
+        expected_cache_root=active.cache_root,
+    )
+    main_manifest = hs._load_main_manifest(active)
+    manifests = (control_manifest, main_manifest)
+    for manifest in manifests:
+        for repo in manifest.repos:
+            mirror = manifest.repo_path(repo)
+            relative = (
+                "scripts/host_setup.py" if repo.name == active.control_repo.name else "README.md"
+            )
+            target = mirror / relative
+            metadata = target.stat()
+            os.utime(target, ns=(metadata.st_atime_ns, metadata.st_mtime_ns + 10_000_000_000))
+            assert hs._default_mirror_index_snapshot(mirror)
+            assert hs._ensure_mirror_precheck(manifest, repo).status == "ready"
+
+    report = hs.plan_setup(active, fixture.home, FakeRunner(), no_launchctl=True)
+    assert report["status"] == "changes-required"
+    for manifest in manifests:
+        for repo in manifest.repos:
+            assert _check(report, f"prefetch-{repo.name}-index-flags")["status"] == "ready"
+
+
+def test_helper_final_revalidation_rejects_new_index_flag(tmp_path: Path) -> None:
+    fixture = _build_host(tmp_path)
+    active = _active(fixture)
+    manifest = hs._load_main_manifest(active)
+    repo = manifest.repos[0]
+    mirror = manifest.repo_path(repo)
+
+    def hide_tracked_path(_args: list[str]) -> None:
+        _git(mirror, "update-index", "--assume-unchanged", "--", "README.md")
+
+    runner = FakeRunner(on_helper=hide_tracked_path)
+    with pytest.raises(hs.SetupError, match="status-suppressing flags.*h=1"):
+        hs._run_workspace_status(active, manifest, runner)
+
+    assert any("status" in args for args, _cwd in runner.calls)
+
+
+def test_mirror_final_decision_rechecks_worktree_status(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _build_host(tmp_path)
+    active = _active(fixture)
+    manifest = hs._load_main_manifest(active)
+    repo = manifest.repos[0]
+    mirror = manifest.repo_path(repo)
+    real_git_output = hs._managed_mirror_git_output
+    status_calls = 0
+
+    def mutate_after_first_status(repository: Path, *arguments: str) -> str:
+        nonlocal status_calls
+        output = real_git_output(repository, *arguments)
+        if repository == mirror and arguments and arguments[0] == "status":
+            status_calls += 1
+            if status_calls == 1:
+                mirror.joinpath("README.md").write_text(
+                    "# changed after initial status\n",
+                    encoding="utf-8",
+                )
+        return output
+
+    monkeypatch.setattr(hs, "_managed_mirror_git_output", mutate_after_first_status)
+    with pytest.raises(hs.SetupError, match="mirror is dirty"):
+        hs.mirror_snapshot(active, manifest, repo, FakeRunner())
+
+    assert status_calls == 2
 
 
 @pytest.mark.parametrize("mechanism", ["loose-replace", "packed-replace", "graft"])

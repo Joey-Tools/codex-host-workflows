@@ -88,6 +88,7 @@ GIT_TIMEOUT_SECONDS = 20
 COMMAND_TIMEOUT_SECONDS = 120
 COMMAND_TERM_GRACE_SECONDS = 2
 COMMAND_KILL_GRACE_SECONDS = 2
+LAUNCH_AGENT_MODE = 0o644
 ACL_TYPE_EXTENDED = 0x00000100
 ACL_FIRST_ENTRY = 0
 ACL_NEXT_ENTRY = -1
@@ -3764,7 +3765,7 @@ def _git_admin_path_checks(
     allow_managed_hooks_path: bool = False,
     allow_worktree_config: bool = False,
 ) -> list[Check]:
-    """Validate the Git worktree/admin boundary without invoking Git."""
+    """Validate Git admin paths before any optional managed-mirror Git probe."""
 
     git_dir = repository / ".git"
     checks = [
@@ -3809,6 +3810,18 @@ def _git_admin_path_checks(
             allow_worktree_config=allow_worktree_config,
         )
     )
+    if allow_managed_hooks_path:
+        if any(check.status == "blocked" for check in checks):
+            checks.append(
+                Check(
+                    f"{prefix}-index-flags",
+                    "blocked",
+                    "index flag validation was not started because a Git admin "
+                    "prerequisite is blocked",
+                )
+            )
+        else:
+            checks.append(_mirror_index_flags_check(repository, prefix=prefix))
     return checks
 
 
@@ -3836,9 +3849,13 @@ def _git_environment(*, disable_hooks: bool = True) -> dict[str, str]:
     )
     overrides = [
         ("core.attributesFile", "/dev/null"),
+        ("core.checkStat", "default"),
+        ("core.fileMode", "true"),
         ("core.fsmonitor", "false"),
         ("core.hooksPath", "/dev/null"),
+        ("core.ignoreStat", "false"),
         ("core.sshCommand", SSH_EXECUTABLE),
+        ("core.trustCtime", "true"),
         ("credential.helper", ""),
         ("protocol.ext.allow", "never"),
     ]
@@ -3954,6 +3971,96 @@ def _managed_mirror_git_output(repository: Path, *arguments: str) -> str:
     )
 
 
+def _default_mirror_index_snapshot(repository: Path) -> str:
+    """Require the index shape that makes worktree cleanliness observable.
+
+    The protected property is that status can observe tracked worktree drift at
+    each validation checkpoint. A lowercase ``h`` (assume-unchanged), ``S``
+    (skip-worktree), or any other non-``H`` ``git ls-files -v`` tag can suppress
+    or invalidate an ordinary status signal, so managed mirrors accept only
+    cached ``H`` entries. This intentionally does not claim to expose the
+    separate fsmonitor-valid bit. The command runs under the repository-safe Git
+    boundary, with hooks, filters, attributes, and executable extensions
+    disabled, and its aggregate output is byte-bounded by ``CommandRunner``.
+    Object identity and access policy are separate topology and filesystem
+    properties.
+    """
+
+    index_check = _regular_file_check(
+        repository / ".git" / "index",
+        name="managed mirror index",
+    )
+    if index_check.status != "ready":
+        raise SetupError(f"managed mirror index prerequisite is blocked: {index_check.detail}")
+    output = _run_git(
+        repository,
+        "ls-files",
+        "--cached",
+        "-v",
+        "-z",
+        "--",
+        allow_managed_hooks_path=True,
+    ).stdout
+    if output and not output.endswith("\0"):
+        raise SetupError("managed mirror index flag output is malformed")
+    records = output.split("\0")
+    if records and records[-1] == "":
+        records.pop()
+    unexpected_tags: dict[str, int] = {}
+    for record in records:
+        if len(record) < 3 or record[1] != " ":
+            raise SetupError("managed mirror index flag output is malformed")
+        tag = record[0]
+        if tag != "H":
+            unexpected_tags[tag] = unexpected_tags.get(tag, 0) + 1
+    if unexpected_tags:
+        summary = ",".join(f"{tag}={count}" for tag, count in sorted(unexpected_tags.items()))
+        raise SetupError(
+            "managed mirror index has status-suppressing flags or non-default "
+            f"stages that can hide tracked worktree drift: {summary}"
+        )
+    return output
+
+
+def _mirror_index_flags_check(repository: Path, *, prefix: str) -> Check:
+    try:
+        _default_mirror_index_snapshot(repository)
+    except SetupError as error:
+        return Check(f"{prefix}-index-flags", "blocked", str(error))
+    return Check(
+        f"{prefix}-index-flags",
+        "ready",
+        f"no status-suppressing index tags or non-default stages: {repository}",
+    )
+
+
+def _mirror_cleanliness_snapshot(repository: Path, *, repo_name: str) -> str:
+    baseline = _default_mirror_index_snapshot(repository)
+    dirty = _managed_mirror_git_output(
+        repository,
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=all",
+    )
+    rebound = _default_mirror_index_snapshot(repository)
+    if rebound != baseline:
+        raise SetupError(f"{repo_name} mirror index changed during cleanliness validation")
+    if dirty:
+        raise SetupError(f"{repo_name} mirror is dirty")
+    return baseline
+
+
+def _revalidate_mirror_cleanliness_snapshot(
+    repository: Path,
+    *,
+    repo_name: str,
+    expected: str,
+) -> None:
+    rebound = _mirror_cleanliness_snapshot(repository, repo_name=repo_name)
+    if rebound != expected:
+        raise SetupError(f"{repo_name} mirror index changed during semantic validation")
+
+
 def mirror_snapshot(
     config: HostConfig,
     manifest: WorkspaceManifest,
@@ -3991,9 +4098,7 @@ def mirror_snapshot(
         raise SetupError(
             f"{repo.name} branch is {branch or 'detached'}, expected {repo.default_branch}"
         )
-    dirty = _managed_mirror_git_output(mirror, "status", "--porcelain=v1", "--untracked-files=all")
-    if dirty:
-        raise SetupError(f"{repo.name} mirror is dirty")
+    clean_index = _mirror_cleanliness_snapshot(mirror, repo_name=repo.name)
     upstream = _managed_mirror_git_output(
         mirror, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"
     )
@@ -4010,6 +4115,11 @@ def mirror_snapshot(
         raise SetupError(f"{repo.name} ahead/behind output is malformed")
     if pieces != ["0", "0"] or head != upstream_head:
         raise SetupError(f"{repo.name} mirror is not exactly synchronized with upstream")
+    _revalidate_mirror_cleanliness_snapshot(
+        mirror,
+        repo_name=repo.name,
+        expected=clean_index,
+    )
     return {
         "name": repo.name,
         "remote": "origin",
@@ -4065,8 +4175,7 @@ def _ensure_mirror_precheck(manifest: WorkspaceManifest, repo: RepoSpec) -> Chec
             raise SetupError(
                 f"{repo.name} branch is {branch or 'detached'}, expected {repo.default_branch}"
             )
-        if _managed_mirror_git_output(mirror, "status", "--porcelain=v1", "--untracked-files=all"):
-            raise SetupError(f"{repo.name} mirror is dirty")
+        clean_index = _mirror_cleanliness_snapshot(mirror, repo_name=repo.name)
         upstream = _managed_mirror_git_output(
             mirror, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"
         )
@@ -4097,6 +4206,11 @@ def _ensure_mirror_precheck(manifest: WorkspaceManifest, repo: RepoSpec) -> Chec
             raise SetupError(
                 f"{repo.name} mirror is ahead or diverged: ahead={pieces[0]} behind={pieces[1]}"
             )
+        _revalidate_mirror_cleanliness_snapshot(
+            mirror,
+            repo_name=repo.name,
+            expected=clean_index,
+        )
     except SetupError as error:
         return Check(f"ensure-mirror-{repo.name}", "blocked", str(error))
     return Check(
@@ -4359,6 +4473,14 @@ def _check_launch_agent_file(spec: LaunchAgentSpec) -> Check:
             f"launch-agent-file-{spec.key}",
             "needs-apply",
             f"missing file: {spec.destination}",
+        )
+    installed_mode = stat.S_IMODE(installed.binding.mode)
+    if installed.data == source.data and installed_mode != LAUNCH_AGENT_MODE:
+        return Check(
+            f"launch-agent-file-{spec.key}",
+            "needs-apply",
+            f"managed LaunchAgent access policy needs mode {LAUNCH_AGENT_MODE:#06o}, "
+            f"found {installed_mode:#06o}: {spec.destination}",
         )
     if installed.data == source.data:
         return Check(f"launch-agent-file-{spec.key}", "ready", str(spec.destination))
@@ -5523,7 +5645,11 @@ def _plan_launch_agent(spec: LaunchAgentSpec) -> PlannedLaunchAgent:
         spec=spec,
         source=source,
         installed=installed,
-        changed=installed is None or installed.data != source.data,
+        changed=(
+            installed is None
+            or installed.data != source.data
+            or stat.S_IMODE(installed.binding.mode) != LAUNCH_AGENT_MODE
+        ),
     )
 
 
@@ -5550,6 +5676,10 @@ def _revalidate_launch_agent_plans(
             raise SetupError(
                 f"installed {plan.spec.key} LaunchAgent no longer matches the frozen source"
             )
+        if stat.S_IMODE(installed.binding.mode) != LAUNCH_AGENT_MODE:
+            raise SetupError(
+                f"installed {plan.spec.key} LaunchAgent no longer has mode {LAUNCH_AGENT_MODE:#06o}"
+            )
 
 
 def _install_plist(
@@ -5560,11 +5690,15 @@ def _install_plist(
     spec = plan.spec
     if not plan.changed:
         assert plan.installed is not None
+        if stat.S_IMODE(plan.installed.binding.mode) != LAUNCH_AGENT_MODE:
+            raise SetupError(
+                f"unchanged {spec.key} LaunchAgent lacks mode {LAUNCH_AGENT_MODE:#06o}"
+            )
         return plan.installed
     transaction = file_ops.begin_replace(
         spec.destination,
         plan.source.data,
-        mode=0o644,
+        mode=LAUNCH_AGENT_MODE,
         expected=plan.installed,
         max_bytes=MAX_CONFIG_BYTES,
     )
@@ -5574,7 +5708,11 @@ def _install_plist(
         max_bytes=MAX_CONFIG_BYTES,
         label=f"installed {spec.key} LaunchAgent",
     )
-    if installed != transaction.new_snapshot or installed.data != plan.source.data:
+    if (
+        installed != transaction.new_snapshot
+        or installed.data != plan.source.data
+        or stat.S_IMODE(installed.binding.mode) != LAUNCH_AGENT_MODE
+    ):
         raise SetupError(f"installed {spec.key} LaunchAgent did not match the frozen source")
     return transaction.new_snapshot
 
@@ -5622,12 +5760,12 @@ def _bind_helper_git_topology(
             missing_status="missing",
         )
         if occupancy.status == "ready":
-            guards.append(
-                _inspect_git_topology_replacements(
-                    repository,
-                    allow_managed_hooks_path=True,
-                )
+            guard = _inspect_git_topology_replacements(
+                repository,
+                allow_managed_hooks_path=True,
             )
+            _default_mirror_index_snapshot(repository)
+            guards.append(guard)
             continue
         if occupancy.status == "missing" and allow_missing:
             guards.append(
@@ -5667,6 +5805,7 @@ def _revalidate_helper_git_topology(guards: Sequence[GitTopologyGuard]) -> None:
                 guard.repository,
                 allow_managed_hooks_path=True,
             )
+            _default_mirror_index_snapshot(guard.repository)
             continue
         if occupancy.status != "ready":
             raise SetupError(
@@ -5678,6 +5817,7 @@ def _revalidate_helper_git_topology(guards: Sequence[GitTopologyGuard]) -> None:
             expected=guard,
             allow_managed_hooks_path=True,
         )
+        _default_mirror_index_snapshot(guard.repository)
 
 
 def _revalidate_workspace_manifest(manifest: WorkspaceManifest, *, phase: str) -> None:
