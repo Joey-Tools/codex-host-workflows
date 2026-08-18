@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import contextvars
+import ctypes
 import datetime as dt
 import errno
 import fcntl
@@ -26,6 +27,13 @@ from pathlib import Path
 from typing import Any, Literal, NoReturn, overload
 
 VERSION = 1
+ACL_POLICY_VERSION = 1
+DARWIN_ACL_TYPE_EXTENDED = 0x00000100
+DARWIN_ACL_FIRST_ENTRY = 0
+DARWIN_ACL_NEXT_ENTRY = -1
+DARWIN_ACL_EXTENDED_ALLOW = 1
+DARWIN_ACL_EXTENDED_DENY = 2
+DARWIN_ACL_FLAG_BITS = 32
 MAX_JSON_BYTES = 4 * 1024 * 1024
 MAX_CASE_JSON_BYTES = 256 * 1024
 MAX_PUBLICATION_JSON_BYTES = 32 * 1024 * 1024
@@ -46,6 +54,7 @@ PUBLICATION_PER_CASE_OVERHEAD_BYTES = 32 * 1024
 WEEKLY_WAL_FIXED_BUDGET_BYTES = 2 * 1024 * 1024
 WEEKLY_WAL_PER_CASE_OVERHEAD_BYTES = 8 * 1024
 FINALIZE_WAL_FIXED_BUDGET_BYTES = 4 * 1024 * 1024
+REPAIR_APPROVAL_MAX_AGE = dt.timedelta(days=7)
 STATE_MARKER = ".state-root.json"
 LOCK_FILE = ".state.lock"
 LIVE_POINTER = "last-completed-daily.json"
@@ -59,6 +68,7 @@ TRANSACTION_OPERATIONS = {
     "weekly-plan",
     "finalize-publication",
     "close-publication",
+    "approve-repair",
 }
 AUDIT_SUMMARY_COUNT_FIELDS = {
     "candidates_considered",
@@ -251,6 +261,158 @@ def _canonical_bytes(value: Any) -> bytes:
     ).encode("utf-8")
 
 
+_DARWIN_ACL_LIBC: ctypes.CDLL | None = None
+
+
+def _darwin_acl_libc() -> ctypes.CDLL:
+    """Return the process libc with the FD-native extended ACL API bound."""
+
+    global _DARWIN_ACL_LIBC
+    if _DARWIN_ACL_LIBC is None:
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.acl_get_fd_np.argtypes = [ctypes.c_int, ctypes.c_int]
+        libc.acl_get_fd_np.restype = ctypes.c_void_p
+        libc.acl_get_entry.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_void_p),
+        ]
+        libc.acl_get_entry.restype = ctypes.c_int
+        libc.acl_get_tag_type.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)]
+        libc.acl_get_tag_type.restype = ctypes.c_int
+        libc.acl_get_qualifier.argtypes = [ctypes.c_void_p]
+        libc.acl_get_qualifier.restype = ctypes.c_void_p
+        libc.acl_get_permset_mask_np.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_uint64),
+        ]
+        libc.acl_get_permset_mask_np.restype = ctypes.c_int
+        libc.acl_get_flagset_np.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
+        libc.acl_get_flagset_np.restype = ctypes.c_int
+        libc.acl_get_flag_np.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        libc.acl_get_flag_np.restype = ctypes.c_int
+        libc.acl_free.argtypes = [ctypes.c_void_p]
+        libc.acl_free.restype = ctypes.c_int
+        _DARWIN_ACL_LIBC = libc
+    return _DARWIN_ACL_LIBC
+
+
+def _darwin_acl_entries(libc: ctypes.CDLL, acl: int, source: str) -> list[dict[str, Any]]:
+    """Enumerate stable ACL authority fields, preserving kernel entry order."""
+
+    entries: list[dict[str, Any]] = []
+    selector = DARWIN_ACL_FIRST_ENTRY
+    while True:
+        entry = ctypes.c_void_p()
+        ctypes.set_errno(0)
+        status = libc.acl_get_entry(acl, selector, ctypes.byref(entry))
+        if status == -1 and not entry.value and ctypes.get_errno() == errno.EINVAL:
+            break
+        if status != 0 or not entry.value:
+            _fail(
+                "acl-revalidation-failed",
+                f"could not enumerate extended ACL for {source}: errno {ctypes.get_errno()}",
+            )
+        selector = DARWIN_ACL_NEXT_ENTRY
+        tag_value = ctypes.c_int()
+        if libc.acl_get_tag_type(entry, ctypes.byref(tag_value)) != 0:
+            _fail("acl-revalidation-failed", f"could not read ACL tag for {source}")
+        tag = {
+            DARWIN_ACL_EXTENDED_ALLOW: "allow",
+            DARWIN_ACL_EXTENDED_DENY: "deny",
+        }.get(tag_value.value)
+        if tag is None:
+            _fail("acl-revalidation-failed", f"ACL tag is unsupported for {source}")
+        qualifier_pointer = libc.acl_get_qualifier(entry)
+        if not qualifier_pointer:
+            _fail("acl-revalidation-failed", f"could not read ACL qualifier for {source}")
+        try:
+            qualifier = ctypes.string_at(qualifier_pointer, 16).hex()
+        finally:
+            libc.acl_free(qualifier_pointer)
+        permissions = ctypes.c_uint64()
+        if libc.acl_get_permset_mask_np(entry, ctypes.byref(permissions)) != 0:
+            _fail("acl-revalidation-failed", f"could not read ACL permissions for {source}")
+        flagset = ctypes.c_void_p()
+        if libc.acl_get_flagset_np(entry, ctypes.byref(flagset)) != 0 or not flagset.value:
+            _fail("acl-revalidation-failed", f"could not read ACL flags for {source}")
+        flags = 0
+        for bit in range(DARWIN_ACL_FLAG_BITS):
+            ctypes.set_errno(0)
+            present = libc.acl_get_flag_np(flagset, 1 << bit)
+            if present == 1:
+                flags |= 1 << bit
+            elif present == 0:
+                continue
+            elif ctypes.get_errno() != errno.EINVAL:
+                _fail("acl-revalidation-failed", f"could not inspect ACL flags for {source}")
+        entries.append(
+            {
+                "index": len(entries),
+                "tag": tag,
+                "qualifier": qualifier,
+                "permissions": permissions.value,
+                "flags": flags,
+            }
+        )
+    return entries
+
+
+def _acl_snapshot(fd: int, source: str) -> dict[str, Any]:
+    """Read an access-policy snapshot through the retained object descriptor."""
+
+    if sys.platform != "darwin":
+        body: dict[str, Any] = {
+            "version": ACL_POLICY_VERSION,
+            "model": "posix-mode-only-v1",
+            "entries": [],
+        }
+        return {**body, "digest": _digest(body)}
+
+    libc = _darwin_acl_libc()
+    ctypes.set_errno(0)
+    acl = libc.acl_get_fd_np(fd, DARWIN_ACL_TYPE_EXTENDED)
+    if not acl:
+        error = ctypes.get_errno()
+        if error == errno.ENOENT:
+            entries: list[dict[str, Any]] = []
+        else:
+            _fail(
+                "acl-revalidation-failed",
+                f"could not read extended ACL for {source}: errno {error}",
+            )
+    else:
+        try:
+            entries = _darwin_acl_entries(libc, acl, source)
+        finally:
+            libc.acl_free(acl)
+    body = {
+        "version": ACL_POLICY_VERSION,
+        "model": "darwin-extended-v1",
+        "entries": entries,
+    }
+    return {**body, "digest": _digest(body)}
+
+
+def _enforce_acl_policy(snapshot: Mapping[str, Any], source: str, *, sensitive: bool) -> None:
+    entries = _require_list(snapshot.get("entries"), "acl.entries")
+    if sensitive and entries:
+        _fail("state-acl-present", f"sensitive state object has an extended ACL: {source}")
+    if not sensitive and any(
+        _require_object(entry, "acl.entry").get("tag") == "allow" for entry in entries
+    ):
+        _fail(
+            "custody-acl-allows-access",
+            f"state custody ancestor has an allow ACL entry: {source}",
+        )
+
+
+def _acl_digest(fd: int, source: str, *, sensitive: bool) -> str:
+    snapshot = _acl_snapshot(fd, source)
+    _enforce_acl_policy(snapshot, source, sensitive=sensitive)
+    return _require_string(snapshot.get("digest"), "acl.digest")
+
+
 def _json_from_bytes(raw: bytes, source: str) -> dict[str, Any]:
     try:
         value = json.loads(raw.decode("utf-8"), object_pairs_hook=_reject_duplicate_keys)
@@ -274,8 +436,9 @@ def _read_fd_stable(
 
     Identity is the open object's device/inode plus the parent entry that names it.
     Content stability is an equal second read, not mtime/ctime equality.  Access
-    policy is regular, current-user-owned, private, single-link state when
-    ``private`` is true.
+    policy is regular, current-user-owned, private, single-link state with no
+    Darwin extended ACL when ``private`` is true.  Timestamps are not mutation
+    evidence and are deliberately excluded.
     """
 
     before = os.fstat(fd)
@@ -290,6 +453,9 @@ def _read_fd_stable(
             _fail("unsafe-permissions", f"state file permits group or other access: {source}")
         if before.st_nlink != 1:
             _fail("unsafe-link-count", f"state file must have exactly one link: {source}")
+        before_acl_digest = _acl_digest(fd, source, sensitive=True)
+    else:
+        before_acl_digest = None
 
     def read_once() -> bytes:
         os.lseek(fd, 0, os.SEEK_SET)
@@ -321,6 +487,10 @@ def _read_fd_stable(
         or not stat.S_ISREG(after.st_mode)
     ):
         _fail("access-policy-changed", f"state file access policy changed: {source}")
+    if private:
+        after_acl_digest = _acl_digest(fd, source, sensitive=True)
+        if after_acl_digest != before_acl_digest:
+            _fail("access-policy-changed", f"state file ACL changed while reading: {source}")
     if expected_parent_fd is not None and expected_name is not None:
         try:
             named = os.stat(expected_name, dir_fd=expected_parent_fd, follow_symlinks=False)
@@ -1455,16 +1625,23 @@ class StateStore:
     directory entry.
     """
 
-    def __init__(self, root: Path, *, create: bool = True) -> None:
+    def __init__(
+        self,
+        root: Path,
+        *,
+        create: bool = True,
+        sensitive_root: bool = True,
+    ) -> None:
         self.root = Path(os.path.abspath(os.fspath(root)))
         if self.root == Path(self.root.anchor):
             _fail("unsafe-state-root", "state root cannot be a filesystem root")
         self._ancestor_fds: list[int] = []
         self._chain_names: list[str | None] = []
-        self._chain_signals: list[tuple[int, int, int, int, int, int]] = []
+        self._chain_signals: list[tuple[int, int, int, int, int, int, str]] = []
         self.root_fd = -1
         self.lock_fd = -1
         self.lock_identity: tuple[int, int, int] | None = None
+        self._sensitive_root = sensitive_root
         self._immutable_publication_capture: _ImmutablePublicationCapture | None = None
         try:
             self._open_root(create=create)
@@ -1477,7 +1654,9 @@ class StateStore:
         current = os.open(self.root.anchor, flags)
         self._ancestor_fds.append(current)
         self._chain_names.append(None)
-        self._chain_signals.append(self._directory_signal(os.fstat(current), self.root.anchor))
+        self._chain_signals.append(
+            self._directory_signal(current, os.fstat(current), self.root.anchor, sensitive=False)
+        )
         parts = self.root.parts[1:]
         for index, component in enumerate(parts):
             final = index == len(parts) - 1
@@ -1493,7 +1672,10 @@ class StateStore:
                     pass
                 child = os.open(component, flags, dir_fd=current)
             child_signal = self._directory_signal(
-                os.fstat(child), Path(self.root.anchor, *parts[: index + 1])
+                child,
+                os.fstat(child),
+                Path(self.root.anchor, *parts[: index + 1]),
+                sensitive=final and self._sensitive_root,
             )
             self._chain_names.append(component)
             self._chain_signals.append(child_signal)
@@ -1526,8 +1708,12 @@ class StateStore:
 
     @staticmethod
     def _directory_signal(
-        info: os.stat_result, path: Path | str
-    ) -> tuple[int, int, int, int, int, int]:
+        fd: int,
+        info: os.stat_result,
+        path: Path | str,
+        *,
+        sensitive: bool,
+    ) -> tuple[int, int, int, int, int, int, str]:
         """Return only object-identity, type, and access-policy signals."""
 
         if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
@@ -1545,6 +1731,7 @@ class StateStore:
             info.st_uid,
             policy_group,
             permissions,
+            _acl_digest(fd, str(path), sensitive=sensitive),
         )
 
     def _bind_state_chain(self, phase: str) -> None:
@@ -1568,7 +1755,12 @@ class StateStore:
                     f"could not inspect retained state path component during {phase}: "
                     f"{component_path}: {exc}",
                 )
-            opened_signal = self._directory_signal(opened, component_path)
+            opened_signal = self._directory_signal(
+                fd,
+                opened,
+                component_path,
+                sensitive=(index == len(chain_fds) - 1 and self._sensitive_root),
+            )
             if opened_signal[:3] != expected[:3]:
                 _fail(
                     "state-chain-replaced",
@@ -1601,7 +1793,18 @@ class StateStore:
                     f"could not revalidate state path component during {phase}: "
                     f"{component_path}: {exc}",
                 )
-            named_signal = self._directory_signal(named, component_path)
+            permissions = stat.S_IMODE(named.st_mode)
+            group_bits = (permissions & stat.S_IRWXG) >> 3
+            other_bits = permissions & stat.S_IRWXO
+            named_signal = (
+                named.st_dev,
+                named.st_ino,
+                stat.S_IFMT(named.st_mode),
+                named.st_uid,
+                named.st_gid if group_bits != other_bits else -1,
+                permissions,
+                opened_signal[6],
+            )
             if named_signal[:3] != expected[:3]:
                 _fail(
                     "state-chain-replaced",
@@ -1620,6 +1823,7 @@ class StateStore:
                 f"could not inspect state root during {phase}: {self.root}: {exc}",
             )
         _validate_private_stat(final_root, self.root, directory=True)
+        _acl_digest(self.root_fd, str(self.root), sensitive=self._sensitive_root)
 
     def acquire_lock(self, *, create: bool = True) -> None:
         flags = os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC
@@ -1634,6 +1838,7 @@ class StateStore:
             _fail("unsafe-lock", f"cannot open state lock: {exc}")
         before = os.fstat(self.lock_fd)
         _validate_private_stat(before, self.root / LOCK_FILE, directory=False)
+        _acl_digest(self.lock_fd, str(self.root / LOCK_FILE), sensitive=True)
         self.lock_identity = (before.st_dev, before.st_ino, before.st_nlink)
         self._bind_lock("before acquisition")
         fcntl.flock(self.lock_fd, fcntl.LOCK_EX)
@@ -1649,6 +1854,7 @@ class StateStore:
             _fail("lock-replaced", f"state lock disappeared {phase}")
         for info in (opened, named):
             _validate_private_stat(info, self.root / LOCK_FILE, directory=False)
+        _acl_digest(self.lock_fd, str(self.root / LOCK_FILE), sensitive=True)
         expected = self.lock_identity
         if (opened.st_dev, opened.st_ino, opened.st_nlink) != expected or (
             named.st_dev,
@@ -1688,6 +1894,7 @@ class StateStore:
                     child = os.open(component, flags, dir_fd=current)
                 info = os.fstat(child)
                 _validate_private_stat(info, self.root / Path(*parts), directory=True)
+                _acl_digest(child, str(self.root / Path(*parts)), sensitive=True)
                 os.close(current)
                 current = child
             yield current
@@ -1933,6 +2140,22 @@ class StateStore:
                     self.root / relative_path / name,
                     expected_links=1,
                 )
+                temp_fd = os.open(
+                    name,
+                    os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    dir_fd=directory_fd,
+                )
+                try:
+                    opened = os.fstat(temp_fd)
+                    if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
+                        _fail("unsafe-helper-temp", f"helper temporary was rebound: {name}")
+                    _acl_digest(
+                        temp_fd,
+                        str(self.root / relative_path / name),
+                        sensitive=True,
+                    )
+                finally:
+                    os.close(temp_fd)
                 temporaries[leaf] = name
 
             for leaf, temporary in sorted(temporaries.items()):
@@ -2004,6 +2227,7 @@ class StateStore:
                 )
             fd = os.open(temporary, flags, 0o600, dir_fd=parent_fd)
             try:
+                _acl_digest(fd, str(self.root / Path(*parts)), sensitive=True)
                 offset = 0
                 while offset < len(payload):
                     offset += os.write(fd, payload[offset:])
@@ -2116,7 +2340,7 @@ def _atomic_write(path: Path, value: Mapping[str, Any], *, immutable: bool = Fal
     # External immutable outputs use the same no-replace primitive in a private
     # parent.  Mutable state writes are always routed through ``StateStore``.
     _ensure_private_dir(path.parent)
-    temporary_root = StateStore(path.parent)
+    temporary_root = StateStore(path.parent, sensitive_root=False)
     try:
         return temporary_root.write_json(Path(path.name), value, immutable=immutable)
     finally:
@@ -2131,6 +2355,10 @@ def _state_lock(state_root: Path, *, create: bool = True) -> Iterator[StateStore
         store = StateStore(state_root, create=create)
         store.acquire_lock(create=create)
         token = _ACTIVE_STORE.set(store)
+        if store.exists(Path(STATE_MARKER)):
+            # Validate the persisted ACL chain before any caller can recover or
+            # apply a WAL after-image.
+            _read_marker(state_root)
         yield store
     finally:
         try:
@@ -2188,7 +2416,7 @@ def _planned_write(
 
 
 def _external_parent_binding(store: StateStore) -> list[dict[str, Any]]:
-    """Serialize the protected name, identity, and POSIX policy chain.
+    """Serialize the protected name, identity, POSIX policy, and ACL chain.
 
     Device, inode, and file type identify each directory object.  Owner and
     permission bits define its coarse POSIX access policy.  Group identity is
@@ -2201,7 +2429,7 @@ def _external_parent_binding(store: StateStore) -> list[dict[str, Any]]:
     names = [store.root.anchor if name is None else name for name in store._chain_names]
     result: list[dict[str, Any]] = []
     for name, signal in zip(names, store._chain_signals, strict=True):
-        device, inode, file_type, owner, group, permissions = signal
+        device, inode, file_type, owner, group, permissions, acl_digest = signal
         group_bits = (permissions & stat.S_IRWXG) >> 3
         other_bits = permissions & stat.S_IRWXO
         result.append(
@@ -2213,6 +2441,7 @@ def _external_parent_binding(store: StateStore) -> list[dict[str, Any]]:
                 "owner": owner,
                 "group": group if group_bits != other_bits else None,
                 "permissions": permissions,
+                "acl_digest": acl_digest,
             }
         )
     return result
@@ -2233,6 +2462,7 @@ def _validate_external_parent_binding(value: Any, path: Path) -> list[dict[str, 
         "owner",
         "group",
         "permissions",
+        "acl_digest",
     }
     for index, (raw, expected_name) in enumerate(zip(entries, expected_names, strict=True)):
         entry = _require_object(raw, f"wal.external_parent_binding[{index}]")
@@ -2244,6 +2474,9 @@ def _validate_external_parent_binding(value: Any, path: Path) -> list[dict[str, 
         file_type = _require_int(entry["file_type"], "wal.parent.file_type")
         owner = _require_int(entry["owner"], "wal.parent.owner")
         permissions = _require_int(entry["permissions"], "wal.parent.permissions")
+        acl_digest = _require_string(entry["acl_digest"], "wal.parent.acl_digest")
+        if HEX64_RE.fullmatch(acl_digest) is None:
+            _fail("invalid-wal", "external parent ACL digest must be raw SHA-256")
         if file_type != stat.S_IFDIR or permissions > 0o7777:
             _fail("invalid-wal", "external parent binding has an invalid directory policy")
         group = entry["group"]
@@ -2263,6 +2496,7 @@ def _validate_external_parent_binding(value: Any, path: Path) -> list[dict[str, 
                 "owner": owner,
                 "group": group,
                 "permissions": permissions,
+                "acl_digest": acl_digest,
             }
         )
     final = normalized[-1]
@@ -2300,7 +2534,7 @@ def _bound_external_parent(
 
     absolute = Path(os.path.abspath(os.fspath(path)))
     try:
-        store = StateStore(absolute.parent, create=False)
+        store = StateStore(absolute.parent, create=False, sensitive_root=False)
     except StateError as exc:
         if exc.code in {"missing-state-root", "missing-state-chain"}:
             _fail(
@@ -2353,7 +2587,7 @@ def _bound_external_parent(
                     )
                 if any(
                     expected_entry[field] != actual_entry[field]
-                    for field in ("owner", "group", "permissions")
+                    for field in ("owner", "group", "permissions", "acl_digest")
                 ):
                     _fail(
                         "external-parent-policy-changed",
@@ -3079,13 +3313,63 @@ def _state_list_names(path: Path) -> list[str]:
     return store.list_names(relative)
 
 
+def _state_access_policy_binding(store: StateStore) -> dict[str, Any]:
+    names = [store.root.anchor if name is None else name for name in store._chain_names]
+    return {
+        "version": ACL_POLICY_VERSION,
+        "model": "darwin-extended-v1" if sys.platform == "darwin" else "posix-mode-only-v1",
+        "chain": [
+            {"name": name, "acl_digest": signal[6]}
+            for name, signal in zip(names, store._chain_signals, strict=True)
+        ],
+    }
+
+
+def _validate_state_access_policy_binding(value: Any, store: StateStore) -> None:
+    binding = _require_object(value, "state_marker.access_policy")
+    _exact_fields(binding, "state_marker.access_policy", {"version", "model", "chain"})
+    if binding["version"] != ACL_POLICY_VERSION:
+        _fail("unsupported-state-access-policy", "state ACL policy version is unsupported")
+    expected = _state_access_policy_binding(store)
+    if binding["model"] != expected["model"]:
+        _fail("unsupported-state-access-policy", "state ACL policy model is unsupported")
+    raw_chain = _require_list(binding["chain"], "state_marker.access_policy.chain")
+    normalized: list[dict[str, str]] = []
+    for index, raw in enumerate(raw_chain):
+        entry = _require_object(raw, f"state_marker.access_policy.chain[{index}]")
+        _exact_fields(entry, "state_marker.access_policy.chain[]", {"name", "acl_digest"})
+        name = _require_string(entry["name"], "state_marker.access_policy.name")
+        digest = _require_string(entry["acl_digest"], "state_marker.access_policy.acl_digest")
+        if HEX64_RE.fullmatch(digest) is None:
+            _fail("invalid-state-marker", "state ACL digest must be raw SHA-256")
+        normalized.append({"name": name, "acl_digest": digest})
+    if normalized != expected["chain"]:
+        _fail("state-chain-policy-changed", "persisted state ACL chain no longer matches")
+
+
+def _new_state_marker(store: StateStore, now: str) -> dict[str, Any]:
+    return {
+        "version": VERSION,
+        "kind": "daily-skill-friction-state",
+        "mode": "unbound",
+        "state_id": str(uuid.uuid4()),
+        "created_at": _timestamp(now, "now"),
+        "access_policy": _state_access_policy_binding(store),
+    }
+
+
 def _read_marker(root: Path) -> dict[str, Any] | None:
     path = _marker_path(root)
     if not _state_exists(path):
         return None
     marker = _load_json(path)
     mode = marker.get("mode")
-    fields = {"version", "kind", "mode", "state_id", "created_at"}
+    if "access_policy" not in marker:
+        _fail(
+            "unsupported-state-access-policy",
+            "legacy state marker has no persisted ACL policy binding",
+        )
+    fields = {"version", "kind", "mode", "state_id", "created_at", "access_policy"}
     if mode in {"live", "historical-replay"}:
         fields.add("bound_at")
     _exact_fields(marker, "state_marker", fields)
@@ -3097,6 +3381,10 @@ def _read_marker(root: Path) -> dict[str, Any] | None:
         _fail("invalid-state-marker", f"invalid state marker: {path}")
     if mode not in {"unbound", "live", "historical-replay"}:
         _fail("invalid-state-marker", f"unsupported state marker mode: {marker.get('mode')}")
+    store = _active_store_for_path(path)
+    if store is None:
+        _fail("unbound-state-marker-read", "state marker requires descriptor-bound validation")
+    _validate_state_access_policy_binding(marker["access_policy"], store)
     try:
         uuid.UUID(_require_string(marker["state_id"], "state_marker.state_id"))
     except ValueError:
@@ -3113,13 +3401,10 @@ def _ensure_marker(root: Path, now: str) -> dict[str, Any]:
     marker = _read_marker(root)
     if marker is not None:
         return marker
-    marker = {
-        "version": VERSION,
-        "kind": "daily-skill-friction-state",
-        "mode": "unbound",
-        "state_id": str(uuid.uuid4()),
-        "created_at": _timestamp(now, "now"),
-    }
+    store = _active_store_for_path(root)
+    if store is None:
+        _fail("unbound-state-marker-write", "state marker requires active custody")
+    marker = _new_state_marker(store, now)
     _atomic_write(_marker_path(root), marker, immutable=True)
     return marker
 
@@ -3576,6 +3861,427 @@ def _validate_automation_origin(state_root: Path, candidate: Mapping[str, Any]) 
         _fail("self-reinforcing-automation", "automation-derived evidence must be independent")
 
 
+def _case_tuple(wrapper: Mapping[str, Any]) -> dict[str, Any]:
+    case = _require_object(wrapper.get("case"), "case")
+    control = _require_object(wrapper.get("control"), "control")
+    return {
+        "case_id": _validate_case_id(case.get("id")),
+        "revision": _require_int(case.get("revision"), "case.revision", minimum=1),
+        "semantic_digest": _sha_digest(control.get("semantic_digest"), "control.semantic_digest"),
+    }
+
+
+def _validate_repair_approval_delta(source: Mapping[str, Any], target: Mapping[str, Any]) -> None:
+    """Allow approval to authorize only the exact repair/lifecycle transition."""
+
+    source_case = _require_object(source.get("case"), "source.case")
+    target_case = _require_object(target.get("case"), "target.case")
+    if source_case["status"] != "proposed" or target_case["status"] != "approved":
+        _fail("repair-approval-scope", "repair approval requires proposed -> approved")
+    if target_case["revision"] != source_case["revision"] + 1:
+        _fail("repair-approval-scope", "approved revision must be exactly source revision + 1")
+    source_repairs = _require_list(source_case["repairs"], "source.repairs")
+    target_repairs = _require_list(target_case["repairs"], "target.repairs")
+    if len(source_repairs) != len(target_repairs):
+        _fail("repair-approval-scope", "repair approval cannot add or remove repair history")
+    active_indexes = [
+        index
+        for index, repair in enumerate(source_repairs)
+        if _require_object(repair, "source.repair").get("state") != "superseded"
+    ]
+    if len(active_indexes) != 1:
+        _fail("repair-approval-scope", "source must have exactly one active planned repair")
+    active_index = active_indexes[0]
+    for index, (source_repair_raw, target_repair_raw) in enumerate(
+        zip(source_repairs, target_repairs, strict=True)
+    ):
+        source_repair = _require_object(source_repair_raw, "source.repair")
+        target_repair = _require_object(target_repair_raw, "target.repair")
+        if index != active_index:
+            if target_repair != source_repair:
+                _fail("repair-approval-scope", "prior repair history cannot change at approval")
+            continue
+        normalized = dict(target_repair)
+        target_state = normalized.get("state")
+        if target_state not in {"planned", "open"}:
+            _fail("repair-approval-scope", "approved repair must remain planned or become open")
+        normalized["state"] = source_repair["state"]
+        normalized["pull_request_url"] = source_repair["pull_request_url"]
+        if normalized != source_repair:
+            _fail(
+                "repair-approval-scope",
+                "approval may change only active repair state and pull request URL",
+            )
+
+    normalized_target = json.loads(json.dumps(target, ensure_ascii=False))
+    normalized_case = normalized_target["case"]
+    normalized_case["revision"] = source_case["revision"]
+    normalized_case["status"] = source_case["status"]
+    normalized_case["lifecycle_changed_at"] = source_case["lifecycle_changed_at"]
+    normalized_case["currentness_checked_at"] = source_case["currentness_checked_at"]
+    normalized_case["repairs"] = json.loads(json.dumps(source_repairs, ensure_ascii=False))
+    normalized_target["control"]["semantic_digest"] = source["control"]["semantic_digest"]
+    if normalized_target != source:
+        _fail(
+            "repair-approval-scope",
+            "repair approval cannot change evidence, scope, lineage, or unrelated case fields",
+        )
+
+
+def _normalize_repair_approval(value: Mapping[str, Any]) -> dict[str, Any]:
+    _scan_prohibited_content(value, "repair_approval")
+    if value.get("version") != VERSION or value.get("kind") != "repair-approval":
+        _fail("invalid-repair-approval", "repair approval version or kind is invalid")
+    _exact_fields(
+        value,
+        "repair_approval",
+        {
+            "version",
+            "kind",
+            "approval_id",
+            "interaction",
+            "expires_at",
+            "source",
+            "target",
+            "publication",
+        },
+    )
+    approval_id = _safe_object_id(value.get("approval_id"), "repair_approval.approval_id")
+    interaction = _require_object(value.get("interaction"), "repair_approval.interaction")
+    _exact_fields(
+        interaction,
+        "repair_approval.interaction",
+        {"interactive", "actor", "approved_at"},
+    )
+    if interaction.get("interactive") is not True or interaction.get("actor") != "Joey":
+        _fail("untrusted-repair-approval", "repair approval must be interactive Joey input")
+    approved_at = _timestamp(interaction.get("approved_at"), "repair_approval.approved_at")
+    expires_at = _timestamp(value.get("expires_at"), "repair_approval.expires_at")
+
+    def normalize_tuple(raw: Any, field: str) -> dict[str, Any]:
+        item = _require_object(raw, field)
+        _exact_fields(item, field, {"case_id", "revision", "semantic_digest"})
+        return {
+            "case_id": _validate_case_id(item.get("case_id"), f"{field}.case_id"),
+            "revision": _require_int(item.get("revision"), f"{field}.revision", minimum=1),
+            "semantic_digest": _sha_digest(item.get("semantic_digest"), f"{field}.semantic_digest"),
+        }
+
+    source = normalize_tuple(value.get("source"), "repair_approval.source")
+    target = normalize_tuple(value.get("target"), "repair_approval.target")
+    if source["case_id"] != target["case_id"] or target["revision"] != source["revision"] + 1:
+        _fail("invalid-repair-approval", "repair approval source/target tuple is inconsistent")
+    publication = _require_object(value.get("publication"), "repair_approval.publication")
+    publication_fields = {
+        "closure_id",
+        "closure_digest",
+        "selection_id",
+        "plan_digest",
+        "manifest_digest",
+        "pull_request_url",
+        "ledger_commit",
+        "merged_at",
+    }
+    _exact_fields(publication, "repair_approval.publication", publication_fields)
+    normalized_publication = {
+        "closure_id": _safe_object_id(
+            publication.get("closure_id"), "repair_approval.publication.closure_id"
+        ),
+        "closure_digest": _require_string(
+            publication.get("closure_digest"), "repair_approval.publication.closure_digest"
+        ),
+        "selection_id": _safe_object_id(
+            publication.get("selection_id"), "repair_approval.publication.selection_id"
+        ),
+        "plan_digest": _require_string(
+            publication.get("plan_digest"), "repair_approval.publication.plan_digest"
+        ),
+        "manifest_digest": _require_string(
+            publication.get("manifest_digest"), "repair_approval.publication.manifest_digest"
+        ),
+        "pull_request_url": _require_string(
+            publication.get("pull_request_url"), "repair_approval.publication.pull_request_url"
+        ),
+        "ledger_commit": _require_string(
+            publication.get("ledger_commit"), "repair_approval.publication.ledger_commit"
+        ),
+        "merged_at": _timestamp(
+            publication.get("merged_at"), "repair_approval.publication.merged_at"
+        ),
+    }
+    for field in ("closure_digest", "plan_digest", "manifest_digest"):
+        if HEX64_RE.fullmatch(normalized_publication[field]) is None:
+            _fail("invalid-repair-approval", f"publication.{field} must be raw SHA-256")
+    if (
+        PR_URL_RE.fullmatch(normalized_publication["pull_request_url"]) is None
+        or not normalized_publication["pull_request_url"].startswith(
+            f"https://github.com/{LEDGER_REPOSITORY}/pull/"
+        )
+        or COMMIT_RE.fullmatch(normalized_publication["ledger_commit"]) is None
+    ):
+        _fail("invalid-repair-approval", "repair approval publication provenance is invalid")
+    return {
+        "version": VERSION,
+        "kind": "repair-approval",
+        "approval_id": approval_id,
+        "interaction": {
+            "interactive": True,
+            "actor": "Joey",
+            "approved_at": approved_at,
+        },
+        "expires_at": expires_at,
+        "source": source,
+        "target": target,
+        "publication": normalized_publication,
+    }
+
+
+def _repair_approval_index_key(
+    source_tuple: Mapping[str, Any], target_tuple: Mapping[str, Any]
+) -> str:
+    return _digest({"source": dict(source_tuple), "target": dict(target_tuple)})
+
+
+def _validate_published_closure_authority(
+    store: StateStore,
+    publication: Mapping[str, Any],
+    source_tuple: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    closure_id = publication["closure_id"]
+    closure_relative = Path("publication") / "closures" / f"{closure_id}.json"
+    closure = store.read_json(closure_relative)[0]
+    body = {key: value for key, value in closure.items() if key != "closure_digest"}
+    if (
+        closure.get("kind") != "publication-closure"
+        or closure.get("reason") != "published"
+        or closure.get("closure_digest") != _digest(body)
+        or closure.get("closure_digest") != publication["closure_digest"]
+    ):
+        _fail("invalid-repair-publication", "repair approval does not bind a published closure")
+    entries = _require_list(closure.get("entries"), "closure.entries")
+    matches = [
+        _require_object(entry, "closure.entry")
+        for entry in entries
+        if isinstance(entry, dict) and entry.get("case_id") == source_tuple["case_id"]
+    ]
+    if len(matches) != 1:
+        _fail("invalid-repair-publication", "published closure has no unique matching case")
+    entry = matches[0]
+    expected = {
+        **dict(source_tuple),
+        "selection_id": publication["selection_id"],
+        "plan_digest": publication["plan_digest"],
+        "manifest_digest": publication["manifest_digest"],
+        "pull_request_url": publication["pull_request_url"],
+        "ledger_commit": publication["ledger_commit"],
+        "merged_at": publication["merged_at"],
+    }
+    if any(entry.get(field) != expected_value for field, expected_value in expected.items()):
+        _fail("invalid-repair-publication", "published closure provenance does not match")
+    intent = _require_committed_transaction(store, "close-publication", closure_id)
+    if intent["result"].get("closure_digest") != publication["closure_digest"]:
+        _fail("missing-authority-transaction", "closure WAL does not bind repair publication")
+    active_relative = Path("publication") / "active" / f"{source_tuple['case_id']}.json"
+    active = store.read_json(active_relative)[0]
+    if any(
+        active.get(field) != expected_value
+        for field, expected_value in {
+            **dict(source_tuple),
+            "status": "closed",
+            "closure_id": closure_id,
+            "closure_digest": publication["closure_digest"],
+            "closure_reason": "published",
+        }.items()
+    ):
+        _fail("invalid-repair-publication", "published active record does not match approval")
+    return closure, entry
+
+
+def _validate_repair_approval_times(
+    approval: Mapping[str, Any], closure: Mapping[str, Any], now_value: str
+) -> None:
+    approved = _parse_time(approval["interaction"]["approved_at"], "approved_at")
+    expires = _parse_time(approval["expires_at"], "expires_at")
+    merged = _parse_time(approval["publication"]["merged_at"], "merged_at")
+    closed = _parse_time(closure["interaction"]["closed_at"], "closed_at")
+    now_instant = _parse_time(now_value, "now")
+    if not (merged < approved and closed < approved <= now_instant < expires):
+        _fail(
+            "repair-approval-clock-order",
+            "repair approval must follow merge/closure and remain unexpired at --now",
+        )
+    if expires - approved > REPAIR_APPROVAL_MAX_AGE:
+        _fail("repair-approval-too-long", "repair approval validity cannot exceed seven days")
+
+
+def approve_repair(
+    state_root: Path,
+    candidate_path: Path,
+    approval_path: Path,
+    now: str,
+    *,
+    interactive_confirmed: bool,
+) -> dict[str, Any]:
+    """Persist one independent, interactive, single-use repair authority."""
+
+    if not interactive_confirmed:
+        _fail(
+            "interactive-confirmation-required",
+            "approve-repair requires explicit interactive Joey confirmation",
+        )
+    now_value = _timestamp(now, "now")
+    candidate = _load_json(candidate_path)
+    validate_candidate(candidate)
+    _validate_candidate_at_now(candidate, now_value)
+    approval = _normalize_repair_approval(_load_json(approval_path))
+    target_tuple = _case_tuple(candidate)
+    if approval["target"] != target_tuple:
+        _fail("repair-approval-mismatch", "approval does not bind the exact target tuple")
+    request = {"approval": approval, "target": target_tuple}
+    approval_id = approval["approval_id"]
+    with _state_lock(state_root, create=False) as store:
+        _recover_pending_wal(store)
+        intent_path, _ = _wal_paths("approve-repair", approval_id)
+        if store.exists(intent_path):
+            return _run_transaction(
+                store,
+                operation="approve-repair",
+                natural_key=approval_id,
+                request=request,
+                captured_at=now_value,
+                writes=[],
+                result={},
+            )
+        marker = _read_marker(state_root)
+        if marker is None or marker.get("mode") != "live":
+            _fail("not-live-state", "repair approval requires live state")
+        source_path = _find_case(state_root, approval["source"]["case_id"])
+        if source_path is None:
+            _fail("missing-repair-source", "repair approval source case does not exist")
+        source = _load_json(source_path)
+        validate_candidate(source)
+        if _case_tuple(source) != approval["source"]:
+            _fail("repair-approval-stale", "current proposed case does not match approval source")
+        _validate_case_delta(source, candidate)
+        _validate_repair_approval_delta(source, candidate)
+        closure, _ = _validate_published_closure_authority(
+            store, approval["publication"], approval["source"]
+        )
+        _validate_repair_approval_times(approval, closure, now_value)
+        approval_digest = _digest(approval)
+        record = {**approval, "approval_digest": approval_digest}
+        approval_key = _repair_approval_index_key(approval["source"], approval["target"])
+        index_body = {
+            "version": VERSION,
+            "kind": "repair-approval-index",
+            "approval_key": approval_key,
+            "approval_id": approval_id,
+            "approval_digest": approval_digest,
+            "source": approval["source"],
+            "target": approval["target"],
+        }
+        index = {**index_body, "index_digest": _digest(index_body)}
+        approval_relative = Path("repairs") / "approvals" / f"{approval_id}.json"
+        index_relative = Path("repairs") / "approval-index" / f"{approval_key}.json"
+        if store.exists(approval_relative):
+            _fail(
+                "orphan-repair-approval",
+                "repair approval exists without its committed approve-repair transaction",
+            )
+        if store.exists(index_relative):
+            _fail(
+                "repair-approval-conflict",
+                "the exact repair tuple already has a different approval authority",
+            )
+        result = {
+            "version": VERSION,
+            "status": "approved",
+            "approval_id": approval_id,
+            "approval_digest": approval_digest,
+            "approval_key": approval_key,
+            "expires_at": approval["expires_at"],
+        }
+        return _run_transaction(
+            store,
+            operation="approve-repair",
+            natural_key=approval_id,
+            request=request,
+            captured_at=now_value,
+            writes=[
+                _planned_write(store, approval_relative, record, immutable=True),
+                _planned_write(store, index_relative, index, immutable=True),
+            ],
+            result=result,
+        )
+
+
+def _load_unconsumed_repair_approval(
+    store: StateStore,
+    source: Mapping[str, Any],
+    target: Mapping[str, Any],
+    now_value: str,
+) -> tuple[dict[str, Any], Path]:
+    source_tuple = _case_tuple(source)
+    target_tuple = _case_tuple(target)
+    approval_key = _repair_approval_index_key(source_tuple, target_tuple)
+    index_relative = Path("repairs") / "approval-index" / f"{approval_key}.json"
+    if not store.exists(index_relative):
+        _fail("missing-repair-approval", "proposed -> approved needs exact repair approval")
+    index = store.read_json(index_relative)[0]
+    _exact_fields(
+        index,
+        "repair_approval_index",
+        {
+            "version",
+            "kind",
+            "approval_key",
+            "approval_id",
+            "approval_digest",
+            "source",
+            "target",
+            "index_digest",
+        },
+    )
+    index_body = {key: value for key, value in index.items() if key != "index_digest"}
+    if (
+        index.get("version") != VERSION
+        or index.get("kind") != "repair-approval-index"
+        or index.get("approval_key") != approval_key
+        or index.get("source") != source_tuple
+        or index.get("target") != target_tuple
+        or index.get("index_digest") != _digest(index_body)
+    ):
+        _fail("invalid-repair-approval-index", "repair approval index is invalid")
+    approval_id = _safe_object_id(index.get("approval_id"), "approval_index.approval_id")
+    approval_relative = Path("repairs") / "approvals" / f"{approval_id}.json"
+    record = store.read_json(approval_relative)[0]
+    approval_digest = _require_string(
+        record.get("approval_digest"), "repair_approval.approval_digest"
+    )
+    approval_body = {key: value for key, value in record.items() if key != "approval_digest"}
+    approval = _normalize_repair_approval(approval_body)
+    if (
+        approval_digest != _digest(approval)
+        or approval_digest != index.get("approval_digest")
+        or approval["approval_id"] != approval_id
+        or approval["source"] != source_tuple
+        or approval["target"] != target_tuple
+    ):
+        _fail("invalid-repair-approval", "persisted repair approval binding is invalid")
+    authority_intent = _require_committed_transaction(store, "approve-repair", approval_id)
+    if (
+        authority_intent["result"].get("approval_digest") != approval_digest
+        or authority_intent["result"].get("approval_key") != approval_key
+    ):
+        _fail("missing-authority-transaction", "approve-repair WAL does not bind authority")
+    closure, _ = _validate_published_closure_authority(store, approval["publication"], source_tuple)
+    _validate_repair_approval_times(approval, closure, now_value)
+    consumption_relative = Path("repairs") / "consumptions" / f"{approval_id}.json"
+    if store.exists(consumption_relative):
+        _fail("repair-approval-used", "repair approval was already consumed")
+    return {**approval, "approval_digest": approval_digest}, consumption_relative
+
+
 def stage_candidate(candidate_path: Path, state_root: Path, now: str) -> dict[str, Any]:
     now_value = _timestamp(now, "now")
     candidate, candidate_file_sha = _load_json_with_digest(candidate_path)
@@ -3590,18 +4296,14 @@ def stage_candidate(candidate_path: Path, state_root: Path, now: str) -> dict[st
         marker = _read_marker(state_root)
         marker_write: dict[str, Any] | None = None
         if marker is None:
-            marker = {
-                "version": VERSION,
-                "kind": "daily-skill-friction-state",
-                "mode": "unbound",
-                "state_id": str(uuid.uuid4()),
-                "created_at": now_value,
-            }
+            marker = _new_state_marker(store, now_value)
             marker_write = _planned_write(store, Path(STATE_MARKER), marker, immutable=True)
         if marker["mode"] == "historical-replay" and state_root.name == "control-state":
             _fail("historical-live-root", "historical state cannot use the canonical live root")
         _validate_automation_origin(state_root, candidate)
         existing_path = _find_case(state_root, summary["case_id"])
+        repair_approval: dict[str, Any] | None = None
+        consumption_relative: Path | None = None
         if existing_path is None:
             if summary["status"] not in INITIAL_CASE_STATUSES:
                 _fail(
@@ -3617,6 +4319,14 @@ def stage_candidate(candidate_path: Path, state_root: Path, now: str) -> dict[st
             existing = _load_json(existing_path)
             validate_candidate(existing)
             action = _validate_case_delta(existing, candidate)
+            if (
+                existing["case"]["status"] == "proposed"
+                and candidate["case"]["status"] == "approved"
+            ):
+                _validate_repair_approval_delta(existing, candidate)
+                repair_approval, consumption_relative = _load_unconsumed_repair_approval(
+                    store, existing, candidate, now_value
+                )
             if existing["case"]["status"] != candidate["case"]["status"] and not (
                 _parse_time(existing["case"]["lifecycle_changed_at"], "old.lifecycle")
                 < _parse_time(candidate["case"]["lifecycle_changed_at"], "new.lifecycle")
@@ -3638,6 +4348,21 @@ def stage_candidate(candidate_path: Path, state_root: Path, now: str) -> dict[st
         anchor = _last_pointer_digest(state_root)
         natural_key = f"{anchor or 'none'}:{summary['case_id']}:{candidate_file_sha}"
         receipt_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"dsf-stage:{natural_key}"))
+        receipt_path = Path("receipts") / "stage" / f"{receipt_id}.json"
+        approval_ref: dict[str, str] | None = (
+            None
+            if repair_approval is None
+            else {
+                "approval_id": repair_approval["approval_id"],
+                "approval_digest": repair_approval["approval_digest"],
+            }
+        )
+        if approval_ref is None and store.exists(receipt_path):
+            persisted_receipt = store.read_json(receipt_path)[0]
+            _validate_persisted_receipt(persisted_receipt, "stage", receipt_id)
+            persisted_ref = persisted_receipt.get("repair_approval")
+            if isinstance(persisted_ref, dict):
+                approval_ref = dict(persisted_ref)
         receipt_body = {
             "version": VERSION,
             "kind": "stage",
@@ -3652,12 +4377,27 @@ def stage_candidate(candidate_path: Path, state_root: Path, now: str) -> dict[st
             "wrapper_file_sha256": hashlib.sha256(_canonical_bytes(candidate)).hexdigest(),
             "case_sha256": hashlib.sha256(_canonical_bytes(candidate["case"])).hexdigest(),
             "action": action,
+            "repair_approval": approval_ref,
         }
         receipt = {**receipt_body, "digest": _digest(receipt_body)}
-        receipt_path = Path("receipts") / "stage" / f"{receipt_id}.json"
         writes = []
         if marker_write is not None:
             writes.append(marker_write)
+        if repair_approval is not None:
+            assert consumption_relative is not None
+            consumption_body = {
+                "version": VERSION,
+                "kind": "repair-approval-consumption",
+                "approval_id": repair_approval["approval_id"],
+                "approval_digest": repair_approval["approval_digest"],
+                "case_id": summary["case_id"],
+                "revision": summary["revision"],
+                "semantic_digest": summary["semantic_digest"],
+                "consumed_at": now_value,
+                "stage_receipt_id": receipt_id,
+            }
+            consumption = {**consumption_body, "consumption_digest": _digest(consumption_body)}
+            writes.append(_planned_write(store, consumption_relative, consumption, immutable=True))
         writes.extend(
             [
                 _planned_write(
@@ -3671,7 +4411,11 @@ def stage_candidate(candidate_path: Path, state_root: Path, now: str) -> dict[st
             store,
             operation="stage",
             natural_key=natural_key,
-            request={"candidate_file_sha256": candidate_file_sha, "anchor": anchor},
+            request={
+                "candidate_file_sha256": candidate_file_sha,
+                "anchor": anchor,
+                "repair_approval": receipt_body["repair_approval"],
+            },
             captured_at=now_value,
             writes=writes,
             result=result,
@@ -3802,13 +4546,7 @@ def transition_dormant(state_root: Path, now: str) -> dict[str, Any]:
         marker = _read_marker(state_root)
         marker_write: dict[str, Any] | None = None
         if marker is None:
-            marker = {
-                "version": VERSION,
-                "kind": "daily-skill-friction-state",
-                "mode": "unbound",
-                "state_id": str(uuid.uuid4()),
-                "created_at": now_value,
-            }
+            marker = _new_state_marker(store, now_value)
             marker_write = _planned_write(store, Path(STATE_MARKER), marker, immutable=True)
         anchor = _last_pointer_digest(state_root)
         pending = _pending_case_ids(state_root)
@@ -3991,6 +4729,7 @@ def _validate_persisted_receipt(
             "wrapper_file_sha256",
             "case_sha256",
             "action",
+            "repair_approval",
         }
     elif category == "dormancy":
         expected = common | {"changed"}
@@ -4023,6 +4762,25 @@ def _validate_persisted_receipt(
             _validate_raw_sha_or_none(receipt[field], f"receipt.{field}")
         if receipt["action"] not in {"created", "updated", "unchanged"}:
             _fail("invalid-receipt", "stage receipt action is invalid")
+        repair_approval = receipt["repair_approval"]
+        if repair_approval is not None:
+            approval_ref = _require_object(repair_approval, "receipt.repair_approval")
+            _exact_fields(
+                approval_ref,
+                "receipt.repair_approval",
+                {"approval_id", "approval_digest"},
+            )
+            _safe_object_id(approval_ref["approval_id"], "receipt.repair_approval.approval_id")
+            if (
+                HEX64_RE.fullmatch(
+                    _require_string(
+                        approval_ref["approval_digest"],
+                        "receipt.repair_approval.approval_digest",
+                    )
+                )
+                is None
+            ):
+                _fail("invalid-receipt", "repair approval digest must be raw SHA-256")
     else:
         seen: set[str] = set()
         for index, value in enumerate(_require_list(receipt["changed"], "receipt.changed")):
@@ -4359,13 +5117,7 @@ def complete_audit(
         marker_created = False
         if marker is None:
             marker_created = True
-            marker = {
-                "version": VERSION,
-                "kind": "daily-skill-friction-state",
-                "mode": "unbound",
-                "state_id": str(uuid.uuid4()),
-                "created_at": now_value,
-            }
+            marker = _new_state_marker(store, now_value)
         current_anchor = _last_pointer_digest(state_root)
         if anchor != current_anchor:
             _fail(
@@ -6091,6 +6843,21 @@ def _parser() -> argparse.ArgumentParser:
     stage.add_argument("--state-root", type=Path, required=True)
     stage.add_argument("--now", required=True)
 
+    approve = subparsers.add_parser(
+        "approve-repair",
+        help="persist one exact interactive Joey repair authority",
+    )
+    approve.add_argument("--state-root", type=Path, required=True)
+    approve.add_argument("--candidate", type=Path, required=True)
+    approve.add_argument("--approval", type=Path, required=True)
+    approve.add_argument("--now", required=True)
+    approve.add_argument(
+        "--confirm-interactive-joey-decision",
+        action="store_true",
+        required=True,
+        help="attest that this invocation consumes Joey's current interactive decision",
+    )
+
     dormant = subparsers.add_parser("transition-dormant", help="apply eligible dormancy")
     dormant.add_argument("--state-root", type=Path, required=True)
     dormant.add_argument("--now", required=True)
@@ -6152,6 +6919,14 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         return {"version": VERSION, "status": "valid", "semantic_digest": expected}
     if args.command == "stage":
         return stage_candidate(args.candidate, Path(os.path.abspath(args.state_root)), args.now)
+    if args.command == "approve-repair":
+        return approve_repair(
+            Path(os.path.abspath(args.state_root)),
+            args.candidate,
+            args.approval,
+            args.now,
+            interactive_confirmed=args.confirm_interactive_joey_decision,
+        )
     if args.command == "transition-dormant":
         return transition_dormant(Path(os.path.abspath(args.state_root)), args.now)
     if args.command == "complete-audit":

@@ -72,7 +72,10 @@ the shown subcommand and arguments, and never execute the script directly:
 6. Run the narrow currentness check. Record unavailable validation separately
    from an absent or reproduced problem.
 7. Call `stage --candidate <FILE> --state-root <DIR> --now <ISO>` for every
-   validated case delta. Then call
+   validated evidence-only case delta. Keep every repair lifecycle at `proposed`
+   or earlier: the scheduled audit must never submit a `proposed`-to-`approved`
+   delta or initiate, impersonate, or consume Joey's separate interactive repair
+   decision. Then call
    `transition-dormant --state-root <DIR> --now <ISO>` with that same absolute
    state root and run timestamp. Verify every JSON receipt emitted on stdout.
 8. Write a version 1 `daily-audit` receipt with an `audit_id`, start/end times,

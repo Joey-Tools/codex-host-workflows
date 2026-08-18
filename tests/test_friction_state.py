@@ -219,6 +219,8 @@ def _candidate(
 def _stage(
     tmp_path: Path, case: dict[str, Any], now: str = "2026-07-10T12:00:00Z"
 ) -> tuple[Path, dict[str, Any]]:
+    tmp_path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    tmp_path.chmod(0o700)
     root = tmp_path / "state"
     receipt = fs.stage_candidate(_write(tmp_path / f"{case['case']['id']}.json", case), root, now)
     return root, receipt
@@ -594,15 +596,153 @@ def _closed_candidate() -> dict[str, Any]:
 def _stage_repair_lifecycle(
     tmp_path: Path, candidates: list[dict[str, Any]] | None = None
 ) -> tuple[Path, dict[str, Any]]:
+    tmp_path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    tmp_path.chmod(0o700)
     root = tmp_path / "state"
     candidates = candidates or _repair_lifecycle_candidates()
-    for index, candidate in enumerate(candidates):
+    proposed = candidates[0]
+    proposed_stage = fs.stage_candidate(
+        _write(tmp_path / "proposed.json", proposed),
+        root,
+        "2026-07-10T12:00:00Z",
+    )
+    _publish_and_approve_repair(tmp_path, root, proposed, candidates[1], proposed_stage)
+    fs.stage_candidate(
+        _write(tmp_path / "approved.json", candidates[1]),
+        root,
+        "2026-07-11T08:39:00Z",
+    )
+    for index, candidate in enumerate(candidates[2:], start=2):
         fs.stage_candidate(
             _write(tmp_path / f"{candidate['case']['status']}.json", candidate),
             root,
-            f"2026-07-10T12:0{index}:00Z",
+            f"2026-07-11T09:0{index}:00Z",
         )
     return root, candidates[-1]
+
+
+def _publish_and_approve_repair(
+    tmp_path: Path,
+    root: Path,
+    proposed: dict[str, Any],
+    approved: dict[str, Any],
+    proposed_stage: dict[str, Any],
+    *,
+    approval_id: str = "repair-approval-one",
+    approved_at: str = "2026-07-11T08:37:00Z",
+    expires_at: str = "2026-07-18T08:37:00Z",
+    persist: bool = True,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    completed = _complete_live(tmp_path, root, [proposed_stage])
+    plan_path = tmp_path / "repair-plan.json"
+    fs.weekly_plan(
+        root,
+        _write(
+            tmp_path / "repair-selection.json",
+            _approved_selection(tmp_path, root, completed["snapshot_digest"], [proposed]),
+        ),
+        plan_path,
+        "2026-07-11T08:01:00Z",
+    )
+    plan = fs._load_json(plan_path)
+    manifest_path = tmp_path / "repair-manifest.json"
+    fs.finalize_publication(
+        root,
+        plan_path,
+        _write(tmp_path / "repair-prepared.json", _prepared_receipt(plan)),
+        manifest_path,
+        "2026-07-11T08:32:00Z",
+    )
+    manifest = fs._load_json(manifest_path)
+    entry = plan["entries"][0]
+    closure = {
+        "version": 1,
+        "kind": "publication-closure",
+        "closure_id": "repair-published-one",
+        "interaction": {
+            "interactive": True,
+            "actor": "Joey",
+            "closed_at": "2026-07-11T08:36:00Z",
+        },
+        "reason": "published",
+        "summary": "Joey confirmed the exact ledger case publication was merged.",
+        "entries": [
+            {
+                "case_id": entry["case_id"],
+                "revision": entry["revision"],
+                "semantic_digest": entry["semantic_digest"],
+                "selection_id": plan["selection_id"],
+                "plan_digest": plan["plan_digest"],
+                "manifest_digest": manifest["manifest_digest"],
+                "pull_request_url": (
+                    "https://github.com/Joey-Tools/codex-skill-friction-ledger/pull/1"
+                ),
+                "ledger_commit": "c" * 40,
+                "merged_at": "2026-07-11T08:35:00Z",
+            }
+        ],
+    }
+    publication_approval = {
+        "version": 1,
+        "kind": "publication-approval",
+        "approval_id": "repair-publication-approval",
+        "interaction": {
+            "interactive": True,
+            "actor": "Joey",
+            "approved_at": "2026-07-11T08:34:00Z",
+        },
+        "selection_id": plan["selection_id"],
+        "plan_digest": plan["plan_digest"],
+        "manifest_digest": manifest["manifest_digest"],
+        "entries": [
+            {
+                "case_id": entry["case_id"],
+                "revision": entry["revision"],
+                "semantic_digest": entry["semantic_digest"],
+            }
+        ],
+    }
+    closed = fs.close_publication(
+        root,
+        _write(tmp_path / "repair-closure.json", closure),
+        "2026-07-11T08:36:30Z",
+        _write(tmp_path / "repair-publication-approval.json", publication_approval),
+    )
+    repair_approval = {
+        "version": 1,
+        "kind": "repair-approval",
+        "approval_id": approval_id,
+        "interaction": {
+            "interactive": True,
+            "actor": "Joey",
+            "approved_at": approved_at,
+        },
+        "expires_at": expires_at,
+        "source": fs._case_tuple(proposed),
+        "target": fs._case_tuple(approved),
+        "publication": {
+            "closure_id": closure["closure_id"],
+            "closure_digest": closed["closure_digest"],
+            "selection_id": plan["selection_id"],
+            "plan_digest": plan["plan_digest"],
+            "manifest_digest": manifest["manifest_digest"],
+            "pull_request_url": closure["entries"][0]["pull_request_url"],
+            "ledger_commit": closure["entries"][0]["ledger_commit"],
+            "merged_at": closure["entries"][0]["merged_at"],
+        },
+    }
+    authority = (
+        fs.approve_repair(
+            root,
+            _write(tmp_path / "repair-approved-candidate.json", approved),
+            _write(tmp_path / "repair-approval.json", repair_approval),
+            "2026-07-11T08:38:00Z",
+            interactive_confirmed=True,
+        )
+        if persist
+        else {}
+    )
+    return repair_approval, authority
 
 
 def _closed_reopen_candidate(
@@ -2315,6 +2455,52 @@ def test_weekly_wal_recovery_rejects_external_parent_access_policy_drift(
         output_parent.chmod(0o700)
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="Darwin extended ACL contract")
+def test_weekly_wal_recovery_rejects_external_parent_acl_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    output_parent = tmp_path / "external"
+    root, selection_path, output, _ = _leave_pending_weekly_external_write(
+        tmp_path, monkeypatch, output_parent=output_parent
+    )
+    subprocess.run(
+        ["chmod", "+a", "everyone deny delete", str(output_parent)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    try:
+        with pytest.raises(fs.StateError, match="parent access policy changed") as raised:
+            fs.weekly_plan(root, selection_path, output, "2026-07-11T09:01:00Z")
+        assert raised.value.code == "external-parent-policy-changed"
+        assert not output.exists()
+    finally:
+        subprocess.run(["chmod", "-N", str(output_parent)], check=True, capture_output=True)
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="Darwin extended ACL contract")
+def test_weekly_wal_accepts_and_revalidates_preexisting_deny_only_parent_acl(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    output_parent = tmp_path / "external"
+    output_parent.mkdir(mode=0o700)
+    subprocess.run(
+        ["chmod", "+a", "everyone deny delete", str(output_parent)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    try:
+        root, selection_path, output, _ = _leave_pending_weekly_external_write(
+            tmp_path, monkeypatch, output_parent=output_parent
+        )
+        recovered = fs.weekly_plan(root, selection_path, output, "2026-07-11T09:01:00Z")
+        assert recovered["status"] == "planned"
+        assert output.exists()
+    finally:
+        subprocess.run(["chmod", "-N", str(output_parent)], check=True, capture_output=True)
+
+
 def test_weekly_wal_recovery_ignores_external_parent_child_churn(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -3344,6 +3530,24 @@ def test_private_root_access_policy_and_symlink_entries_fail_closed(tmp_path: Pa
     assert target.read_text(encoding="utf-8") == '{"version": 1}'
 
 
+def test_legacy_state_marker_without_acl_binding_fails_closed(tmp_path: Path) -> None:
+    root = tmp_path / "state"
+    root.mkdir(mode=0o700)
+    (root / fs.LOCK_FILE).write_bytes(b"")
+    (root / fs.LOCK_FILE).chmod(0o600)
+    legacy = {
+        "version": 1,
+        "kind": "daily-skill-friction-state",
+        "mode": "unbound",
+        "state_id": str(uuid.uuid4()),
+        "created_at": "2026-07-10T12:00:00Z",
+    }
+    _write(root / fs.STATE_MARKER, legacy).chmod(0o600)
+    with pytest.raises(fs.StateError, match="no persisted ACL policy") as unsupported:
+        fs.transition_dormant(root, "2026-07-10T12:01:00Z")
+    assert unsupported.value.code == "unsupported-state-access-policy"
+
+
 def test_store_distinguishes_benign_metadata_churn_identity_and_content_change(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -3453,6 +3657,138 @@ def test_state_chain_binds_ancestor_access_policy_but_ignores_metadata_churn(
     finally:
         ancestor.chmod(0o700)
         store.close()
+
+
+def test_acl_policy_normalization_preserves_entry_order_and_separates_leaf_policy() -> None:
+    first = {
+        "index": 0,
+        "tag": "deny",
+        "qualifier": "00" * 16,
+        "permissions": 16,
+        "flags": 0,
+    }
+    second = {
+        "index": 1,
+        "tag": "deny",
+        "qualifier": "11" * 16,
+        "permissions": 2,
+        "flags": 32,
+    }
+    ordered = {
+        "version": 1,
+        "model": "darwin-extended-v1",
+        "entries": [first, second],
+    }
+    reversed_entries = {
+        **ordered,
+        "entries": [{**second, "index": 0}, {**first, "index": 1}],
+    }
+    assert fs._digest(ordered) != fs._digest(reversed_entries)
+    fs._enforce_acl_policy({**ordered, "digest": fs._digest(ordered)}, "ancestor", sensitive=False)
+    with pytest.raises(fs.StateError, match="extended ACL") as leaf:
+        fs._enforce_acl_policy({**ordered, "digest": fs._digest(ordered)}, "leaf", sensitive=True)
+    assert leaf.value.code == "state-acl-present"
+    allowing = json.loads(json.dumps(ordered))
+    allowing["entries"][0]["tag"] = "allow"
+    with pytest.raises(fs.StateError, match="allow ACL") as ancestor:
+        fs._enforce_acl_policy(allowing, "ancestor", sensitive=False)
+    assert ancestor.value.code == "custody-acl-allows-access"
+
+
+def test_non_darwin_acl_policy_is_explicit_posix_only_sentinel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    monkeypatch.setattr(fs.sys, "platform", "linux")
+    monkeypatch.setattr(
+        fs,
+        "_darwin_acl_libc",
+        lambda: pytest.fail("non-Darwin ACL path must not load Darwin libc"),
+    )
+    try:
+        snapshot = fs._acl_snapshot(fd, str(tmp_path))
+    finally:
+        os.close(fd)
+    assert snapshot == {
+        "version": 1,
+        "model": "posix-mode-only-v1",
+        "entries": [],
+        "digest": fs._digest({"version": 1, "model": "posix-mode-only-v1", "entries": []}),
+    }
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="Darwin extended ACL contract")
+def test_darwin_acl_fd_policy_accepts_deny_custody_rejects_allow_and_binds_marker(
+    tmp_path: Path,
+) -> None:
+    deny_ancestor = tmp_path / "deny-ancestor"
+    deny_ancestor.mkdir(mode=0o700)
+    subprocess.run(
+        ["chmod", "+a", "everyone deny delete", str(deny_ancestor)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    root = deny_ancestor / "state"
+    case = _candidate()
+    staged = fs.stage_candidate(
+        _write(deny_ancestor / "candidate.json", case),
+        root,
+        "2026-07-10T12:00:00Z",
+    )
+    marker = fs._load_json(root / fs.STATE_MARKER)
+    assert marker["access_policy"]["model"] == "darwin-extended-v1"
+    assert any(item["name"] == deny_ancestor.name for item in marker["access_policy"]["chain"])
+
+    case_path = root / staged["case_path"]
+    subprocess.run(
+        ["chmod", "+a", "everyone deny delete", str(case_path)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    try:
+        with pytest.raises(fs.StateError, match="extended ACL") as leaf:
+            fs.stage_candidate(
+                _write(deny_ancestor / "candidate-again.json", case),
+                root,
+                "2026-07-10T12:01:00Z",
+            )
+        assert leaf.value.code == "state-acl-present"
+    finally:
+        subprocess.run(["chmod", "-N", str(case_path)], check=True, capture_output=True)
+
+    subprocess.run(["chmod", "-N", str(deny_ancestor)], check=True, capture_output=True)
+    try:
+        with pytest.raises(fs.StateError, match="ACL chain no longer matches") as changed:
+            fs.stage_candidate(
+                _write(deny_ancestor / "candidate-after-drift.json", case),
+                root,
+                "2026-07-10T12:02:00Z",
+            )
+        assert changed.value.code == "state-chain-policy-changed"
+    finally:
+        subprocess.run(
+            ["chmod", "+a", "everyone deny delete", str(deny_ancestor)],
+            check=True,
+            capture_output=True,
+        )
+
+    allow_ancestor = tmp_path / "allow-ancestor"
+    allow_ancestor.mkdir(mode=0o700)
+    subprocess.run(
+        ["chmod", "+a", "everyone allow read", str(allow_ancestor)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    try:
+        with pytest.raises(fs.StateError, match="allow ACL") as allowing:
+            fs.StateStore(allow_ancestor / "state")
+        assert allowing.value.code == "custody-acl-allows-access"
+    finally:
+        subprocess.run(["chmod", "-N", str(allow_ancestor)], check=True, capture_output=True)
+        subprocess.run(["chmod", "-N", str(deny_ancestor)], check=True, capture_output=True)
 
 
 def test_immutable_output_is_first_writer_wins(
@@ -3836,6 +4172,298 @@ def test_closure_recovers_history_active_gap_across_now(
     assert active["status"] == "closed"
 
 
+def test_proposed_to_approved_requires_independent_published_repair_authority(
+    tmp_path: Path,
+) -> None:
+    proposed, approved = _repair_lifecycle_candidates()[:2]
+    root, proposed_stage = _stage(tmp_path, proposed)
+    with pytest.raises(fs.StateError, match="exact repair approval") as missing:
+        fs.stage_candidate(
+            _write(tmp_path / "unapproved.json", approved),
+            root,
+            "2026-07-11T08:39:00Z",
+        )
+    assert missing.value.code == "missing-repair-approval"
+
+    approval, _ = _publish_and_approve_repair(
+        tmp_path, root, proposed, approved, proposed_stage, persist=False
+    )
+    publication_approval = {
+        "version": 1,
+        "kind": "publication-approval",
+        "approval_id": "not-a-repair-approval",
+        "interaction": {
+            "interactive": True,
+            "actor": "Joey",
+            "approved_at": "2026-07-11T08:37:00Z",
+        },
+        "selection_id": approval["publication"]["selection_id"],
+        "plan_digest": approval["publication"]["plan_digest"],
+        "manifest_digest": approval["publication"]["manifest_digest"],
+        "entries": [approval["source"]],
+    }
+    with pytest.raises(fs.StateError, match="version or kind"):
+        fs.approve_repair(
+            root,
+            _write(tmp_path / "approved-candidate.json", approved),
+            _write(tmp_path / "wrong-authority.json", publication_approval),
+            "2026-07-11T08:38:00Z",
+            interactive_confirmed=True,
+        )
+    with pytest.raises(fs.StateError, match="interactive Joey confirmation"):
+        fs.approve_repair(
+            root,
+            _write(tmp_path / "approved-candidate.json", approved),
+            _write(tmp_path / "repair-authority.json", approval),
+            "2026-07-11T08:38:00Z",
+            interactive_confirmed=False,
+        )
+
+
+def test_repair_approval_binds_exact_scope_survives_currentness_and_is_consumed_once(
+    tmp_path: Path,
+) -> None:
+    proposed, approved = _repair_lifecycle_candidates()[:2]
+    root, proposed_stage = _stage(tmp_path, proposed)
+    approval, authority = _publish_and_approve_repair(
+        tmp_path, root, proposed, approved, proposed_stage
+    )
+    assert authority["status"] == "approved"
+    duplicate = json.loads(json.dumps(approval))
+    duplicate["approval_id"] = "duplicate-exact-repair-authority"
+    with pytest.raises(fs.StateError, match="already has a different approval") as conflict:
+        fs.approve_repair(
+            root,
+            _write(tmp_path / "duplicate-approved.json", approved),
+            _write(tmp_path / "duplicate-approval.json", duplicate),
+            "2026-07-11T08:38:30Z",
+            interactive_confirmed=True,
+        )
+    assert conflict.value.code == "repair-approval-conflict"
+    current = json.loads(json.dumps(approved))
+    current["case"]["currentness_checked_at"] = "2026-07-11T08:38:30Z"
+    current["control"]["semantic_digest"] = fs.semantic_digest(current["case"])
+    staged = fs.stage_candidate(
+        _write(tmp_path / "current-approved.json", current),
+        root,
+        "2026-07-11T08:39:00Z",
+    )
+    assert staged["repair_approval"] == {
+        "approval_id": approval["approval_id"],
+        "approval_digest": authority["approval_digest"],
+    }
+    consumption = fs._load_json(
+        root / "repairs" / "consumptions" / f"{approval['approval_id']}.json"
+    )
+    assert consumption["stage_receipt_id"] == staged["receipt_id"]
+    assert consumption["semantic_digest"] == fs._case_tuple(current)["semantic_digest"]
+    assert (
+        fs.stage_candidate(
+            _write(tmp_path / "current-approved.json", current),
+            root,
+            "2026-07-11T09:39:00Z",
+        )
+        == staged
+    )
+    with fs._state_lock(root, create=False) as store:
+        with pytest.raises(fs.StateError, match="already consumed") as used:
+            fs._load_unconsumed_repair_approval(store, proposed, current, "2026-07-11T09:00:00Z")
+    assert used.value.code == "repair-approval-used"
+
+
+def test_repair_approval_rejects_forged_stale_and_unrelated_semantic_changes(
+    tmp_path: Path,
+) -> None:
+    proposed, approved = _repair_lifecycle_candidates()[:2]
+    root, proposed_stage = _stage(tmp_path, proposed)
+    approval, _ = _publish_and_approve_repair(
+        tmp_path, root, proposed, approved, proposed_stage, persist=False
+    )
+    forged = json.loads(json.dumps(approval))
+    forged["publication"]["closure_digest"] = "f" * 64
+    with pytest.raises(fs.StateError, match="published closure"):
+        fs.approve_repair(
+            root,
+            _write(tmp_path / "forged-candidate.json", approved),
+            _write(tmp_path / "forged-approval.json", forged),
+            "2026-07-11T08:38:00Z",
+            interactive_confirmed=True,
+        )
+
+    unrelated = json.loads(json.dumps(approved))
+    unrelated["case"]["title"] = "Unrelated semantic change hidden in repair approval"
+    unrelated["control"]["semantic_digest"] = fs.semantic_digest(unrelated["case"])
+    scoped = json.loads(json.dumps(approval))
+    scoped["approval_id"] = "unrelated-scope"
+    scoped["target"] = fs._case_tuple(unrelated)
+    with pytest.raises(fs.StateError, match="cannot change evidence, scope") as scope_error:
+        fs.approve_repair(
+            root,
+            _write(tmp_path / "unrelated.json", unrelated),
+            _write(tmp_path / "unrelated-approval.json", scoped),
+            "2026-07-11T08:38:00Z",
+            interactive_confirmed=True,
+        )
+    assert scope_error.value.code == "repair-approval-scope"
+
+    stale = json.loads(json.dumps(approval))
+    stale["approval_id"] = "stale-repair-approval"
+    stale["expires_at"] = "2026-07-11T08:38:30Z"
+    fs.approve_repair(
+        root,
+        _write(tmp_path / "stale-candidate.json", approved),
+        _write(tmp_path / "stale-approval.json", stale),
+        "2026-07-11T08:38:00Z",
+        interactive_confirmed=True,
+    )
+    with pytest.raises(fs.StateError, match="remain unexpired") as expired:
+        fs.stage_candidate(
+            _write(tmp_path / "stale-target.json", approved),
+            root,
+            "2026-07-11T08:39:00Z",
+        )
+    assert expired.value.code == "repair-approval-clock-order"
+
+
+def test_repair_approval_requires_strict_post_closure_time_and_next_revision(
+    tmp_path: Path,
+) -> None:
+    proposed, approved = _repair_lifecycle_candidates()[:2]
+    root, proposed_stage = _stage(tmp_path, proposed)
+    approval, _ = _publish_and_approve_repair(
+        tmp_path, root, proposed, approved, proposed_stage, persist=False
+    )
+
+    not_later = json.loads(json.dumps(approval))
+    not_later["approval_id"] = "not-strictly-after-closure"
+    not_later["interaction"]["approved_at"] = "2026-07-11T08:36:00Z"
+    with pytest.raises(fs.StateError, match="follow merge/closure") as clock:
+        fs.approve_repair(
+            root,
+            _write(tmp_path / "not-later-candidate.json", approved),
+            _write(tmp_path / "not-later-approval.json", not_later),
+            "2026-07-11T08:38:00Z",
+            interactive_confirmed=True,
+        )
+    assert clock.value.code == "repair-approval-clock-order"
+
+    skipped_revision = json.loads(json.dumps(approved))
+    skipped_revision["case"]["revision"] += 1
+    skipped_revision["control"]["semantic_digest"] = fs.semantic_digest(skipped_revision["case"])
+    wrong_revision = json.loads(json.dumps(approval))
+    wrong_revision["approval_id"] = "skipped-repair-revision"
+    wrong_revision["target"] = fs._case_tuple(skipped_revision)
+    with pytest.raises(fs.StateError, match="source/target tuple is inconsistent") as revision:
+        fs.approve_repair(
+            root,
+            _write(tmp_path / "skipped-revision-candidate.json", skipped_revision),
+            _write(tmp_path / "skipped-revision-approval.json", wrong_revision),
+            "2026-07-11T08:38:00Z",
+            interactive_confirmed=True,
+        )
+    assert revision.value.code == "invalid-repair-approval"
+
+
+def test_repair_approval_consumption_recovers_atomically(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    proposed, approved = _repair_lifecycle_candidates()[:2]
+    root, proposed_stage = _stage(tmp_path, proposed)
+    approval, _ = _publish_and_approve_repair(tmp_path, root, proposed, approved, proposed_stage)
+    case_relative = fs._case_relative_path(approved)
+    original = fs.StateStore.write_json
+    interrupted = False
+
+    def interrupt_case(
+        store: Any,
+        relative: Path | str,
+        value: dict[str, Any],
+        *,
+        immutable: bool = False,
+        max_bytes: int | None = None,
+    ) -> str:
+        nonlocal interrupted
+        if not interrupted and Path(relative) == case_relative:
+            interrupted = True
+            raise OSError("injected repair stage interruption")
+        return original(
+            store,
+            relative,
+            value,
+            immutable=immutable,
+            max_bytes=max_bytes,
+        )
+
+    monkeypatch.setattr(fs.StateStore, "write_json", interrupt_case)
+    target_path = _write(tmp_path / "recover-approved.json", approved)
+    with pytest.raises(OSError, match="injected repair stage interruption"):
+        fs.stage_candidate(target_path, root, "2026-07-11T08:39:00Z")
+    monkeypatch.setattr(fs.StateStore, "write_json", original)
+    recovered = fs.stage_candidate(target_path, root, "2026-07-11T08:40:00Z")
+    assert recovered["repair_approval"]["approval_id"] == approval["approval_id"]
+    assert fs._load_json(root / case_relative)["case"]["status"] == "approved"
+    assert (root / "repairs" / "consumptions" / f"{approval['approval_id']}.json").exists()
+
+
+def test_repair_approval_authority_recovers_before_becoming_usable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    proposed, approved = _repair_lifecycle_candidates()[:2]
+    root, proposed_stage = _stage(tmp_path, proposed)
+    approval, _ = _publish_and_approve_repair(
+        tmp_path, root, proposed, approved, proposed_stage, persist=False
+    )
+    approval_key = fs._repair_approval_index_key(approval["source"], approval["target"])
+    index_relative = Path("repairs") / "approval-index" / f"{approval_key}.json"
+    original = fs.StateStore.write_json
+    interrupted = False
+
+    def interrupt_index(
+        store: Any,
+        relative: Path | str,
+        value: dict[str, Any],
+        *,
+        immutable: bool = False,
+        max_bytes: int | None = None,
+    ) -> str:
+        nonlocal interrupted
+        if not interrupted and Path(relative) == index_relative:
+            interrupted = True
+            raise OSError("injected repair authority interruption")
+        return original(
+            store,
+            relative,
+            value,
+            immutable=immutable,
+            max_bytes=max_bytes,
+        )
+
+    candidate_path = _write(tmp_path / "authority-approved.json", approved)
+    approval_path = _write(tmp_path / "authority-receipt.json", approval)
+    monkeypatch.setattr(fs.StateStore, "write_json", interrupt_index)
+    with pytest.raises(OSError, match="injected repair authority interruption"):
+        fs.approve_repair(
+            root,
+            candidate_path,
+            approval_path,
+            "2026-07-11T08:38:00Z",
+            interactive_confirmed=True,
+        )
+    monkeypatch.setattr(fs.StateStore, "write_json", original)
+
+    recovered = fs.approve_repair(
+        root,
+        candidate_path,
+        approval_path,
+        "2026-07-11T08:39:00Z",
+        interactive_confirmed=True,
+    )
+    assert recovered["approval_id"] == approval["approval_id"]
+    assert (root / index_relative).exists()
+    _, commit_relative = fs._wal_paths("approve-repair", approval["approval_id"])
+    assert (root / commit_relative).exists()
+
+
 def test_helper_has_no_git_network_or_subprocess_execution_surface() -> None:
     source = HELPER.read_text(encoding="utf-8")
     assert "import subprocess" not in source
@@ -3872,6 +4500,32 @@ def test_cli_failures_emit_one_machine_json_object(
     assert not (tmp_path / "missing-state").exists()
 
 
+def test_approve_repair_cli_requires_explicit_interactive_confirmation(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code = fs.main(
+        [
+            "approve-repair",
+            "--state-root",
+            str(tmp_path / "state"),
+            "--candidate",
+            str(tmp_path / "candidate.json"),
+            "--approval",
+            str(tmp_path / "approval.json"),
+            "--now",
+            "2026-07-11T08:38:00Z",
+        ]
+    )
+    lines = capsys.readouterr().out.splitlines()
+    assert code == 2
+    assert len(lines) == 1
+    error = json.loads(lines[0])
+    assert error["status"] == "error"
+    assert error["code"] == "invalid-command-line"
+    assert "--confirm-interactive-joey-decision" in error["message"]
+    assert not (tmp_path / "state").exists()
+
+
 def test_cli_advertises_every_control_transition() -> None:
     choices = fs._parser()._subparsers._group_actions[0].choices
     assert set(choices) == {
@@ -3879,6 +4533,7 @@ def test_cli_advertises_every_control_transition() -> None:
         "digest",
         "validate",
         "stage",
+        "approve-repair",
         "transition-dormant",
         "complete-audit",
         "selection-preflight",

@@ -28,6 +28,7 @@ import ctypes
 import dataclasses
 import datetime as dt
 import errno
+import functools
 import hashlib
 import json
 import locale
@@ -48,7 +49,7 @@ import traceback
 import types
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
-from typing import Any, BinaryIO, Protocol
+from typing import Any, BinaryIO, Protocol, cast
 
 
 class SetupError(RuntimeError):
@@ -65,6 +66,11 @@ LAUNCH_AGENT_LABEL_PATTERN = re.compile(
     r"(?=.{3,128}\Z)(?:[A-Za-z0-9][A-Za-z0-9-]*\.){2,}"
     r"[A-Za-z0-9][A-Za-z0-9-]*\Z"
 )
+GIT_CONFIG_SECTION_PATTERN = re.compile(
+    r"^\[\s*([A-Za-z0-9][A-Za-z0-9.-]*)"
+    r'(?:\s+"((?:[^"\\]|\\["\\])*)")?\s*\](?:\s*[#;].*)?$'
+)
+GIT_CONFIG_VARIABLE_PATTERN = re.compile(r"^([A-Za-z][A-Za-z0-9-]*)(?:\s*=.*)?$")
 MAX_CONFIG_BYTES = 1024 * 1024
 MAX_STAMP_BYTES = 1024 * 1024
 MAX_COMMAND_DETAIL = 2000
@@ -74,6 +80,12 @@ GIT_TIMEOUT_SECONDS = 20
 COMMAND_TIMEOUT_SECONDS = 120
 COMMAND_TERM_GRACE_SECONDS = 2
 COMMAND_KILL_GRACE_SECONDS = 2
+ACL_TYPE_EXTENDED = 0x00000100
+ACL_FIRST_ENTRY = 0
+ACL_NEXT_ENTRY = -1
+ACL_EXTENDED_ALLOW = 1
+ACL_EXTENDED_DENY = 2
+ACL_FLAG_SCAN_BITS = 32
 GIT_EXECUTABLE = "/usr/bin/git"
 LAUNCHCTL_EXECUTABLE = "/bin/launchctl"
 SSH_EXECUTABLE = "/usr/bin/ssh"
@@ -189,6 +201,7 @@ class Binding:
     gid: int
     mode: int
     size: int
+    acl_digest: str | None = None
 
     @classmethod
     def from_stat(cls, metadata: os.stat_result) -> Binding:
@@ -200,6 +213,16 @@ class Binding:
             mode=metadata.st_mode,
             size=metadata.st_size,
         )
+
+
+@dataclasses.dataclass(frozen=True)
+class AclEntry:
+    """One Darwin extended ACL entry in stable kernel order."""
+
+    tag: int
+    qualifier: bytes
+    permissions: int
+    flags: int
 
 
 @dataclasses.dataclass(frozen=True)
@@ -262,6 +285,7 @@ class GitTopologyGuard:
     git_dir_binding: Binding | None
     refs_binding: Binding | None
     info_binding: Binding | None
+    local_config_snapshot: FileSnapshot | None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -554,6 +578,7 @@ class CommandRunner:
         source_path: Path,
         cwd: Path,
         env: Mapping[str, str],
+        workspace_manifest: WorkspaceManifest | None = None,
     ) -> subprocess.CompletedProcess[str]:
         """Fork this interpreter and execute exact validated source bytes.
 
@@ -569,6 +594,7 @@ class CommandRunner:
                 source_path=source_path,
                 cwd=cwd,
                 env=env,
+                workspace_manifest=workspace_manifest,
             )
         except OSError as error:
             raise SetupError(
@@ -632,6 +658,7 @@ class CommandRunner:
         source_path: Path,
         cwd: Path,
         env: Mapping[str, str],
+        workspace_manifest: WorkspaceManifest | None,
     ) -> _ForkedPythonProcess:
         if len(argv) < 5 or tuple(argv[1:4]) != PYTHON_ISOLATION_FLAGS:
             raise SetupError("delegated helper argv lost the required Python isolation flags")
@@ -662,6 +689,7 @@ class CommandRunner:
                 source_path=source_path,
                 cwd=cwd,
                 environment=environment,
+                workspace_manifest=workspace_manifest,
                 stdout_read=stdout_read,
                 stdout_write=stdout_write,
                 stderr_read=stderr_read,
@@ -704,6 +732,7 @@ class CommandRunner:
         source_path: Path,
         cwd: Path,
         environment: dict[str, str],
+        workspace_manifest: WorkspaceManifest | None,
         stdout_read: int,
         stdout_write: int,
         stderr_read: int,
@@ -727,10 +756,14 @@ class CommandRunner:
             signal.signal(signal.SIGPIPE, signal.SIG_IGN)
             sys.argv = child_argv
             sys.orig_argv = list(display_argv)
-            main_module = types.ModuleType("__main__")
+            module_name = (
+                "__main__" if workspace_manifest is None else "_codex_workspace_bound_helper"
+            )
+            main_module = types.ModuleType(module_name)
             namespace = main_module.__dict__
             namespace.update(
                 {
+                    "__name__": module_name,
                     "__file__": str(source_path),
                     "__package__": None,
                     "__cached__": None,
@@ -738,9 +771,15 @@ class CommandRunner:
                     "__spec__": None,
                 }
             )
-            sys.modules["__main__"] = main_module
+            sys.modules[module_name] = main_module
             code = compile(source.data, str(source_path), "exec", dont_inherit=True)
             exec(code, namespace)
+            if workspace_manifest is not None:
+                CommandRunner._run_bound_workspace_helper(
+                    namespace,
+                    child_argv=child_argv,
+                    manifest=workspace_manifest,
+                )
         except SystemExit as error:
             if error.code is None:
                 exit_code = 0
@@ -759,6 +798,118 @@ class CommandRunner:
             sys.stderr.flush()
         finally:
             os._exit(exit_code)
+
+    @staticmethod
+    def _run_bound_workspace_helper(
+        namespace: dict[str, Any],
+        *,
+        child_argv: Sequence[str],
+        manifest: WorkspaceManifest,
+    ) -> None:
+        """Call the trusted helper with an exact inherited manifest object."""
+
+        main = namespace.get("main")
+        original_load_config = namespace.get("load_config")
+        repo_type = namespace.get("RepoSpec")
+        config_type = namespace.get("WorkspaceConfig")
+        workspace_error = namespace.get("WorkspaceError")
+        expected_callables = {
+            "main": main,
+            "load_config": original_load_config,
+            "git_common_dir": namespace.get("git_common_dir"),
+            "mirror_guard_hook": namespace.get("mirror_guard_hook"),
+            "mirror_guard_path": namespace.get("mirror_guard_path"),
+            "install_mirror_guard": namespace.get("install_mirror_guard"),
+        }
+        missing = [name for name, value in expected_callables.items() if not callable(value)]
+        if missing:
+            raise SetupError(
+                "workspace helper API drifted; missing callables: " + ", ".join(missing)
+            )
+        if not isinstance(repo_type, type) or not dataclasses.is_dataclass(repo_type):
+            raise SetupError("workspace helper RepoSpec API drifted")
+        if not isinstance(config_type, type) or not dataclasses.is_dataclass(config_type):
+            raise SetupError("workspace helper WorkspaceConfig API drifted")
+        if not isinstance(workspace_error, type) or not issubclass(workspace_error, Exception):
+            raise SetupError("workspace helper WorkspaceError API drifted")
+        repo_fields = tuple(field.name for field in dataclasses.fields(repo_type))
+        config_fields = tuple(field.name for field in dataclasses.fields(config_type))
+        if repo_fields != ("name", "url", "default_branch", "visibility"):
+            raise SetupError("workspace helper RepoSpec constructor fields drifted")
+        if config_fields != ("root", "cache_root", "repos"):
+            raise SetupError("workspace helper WorkspaceConfig constructor fields drifted")
+
+        repo_factory = cast(Any, repo_type)
+        config_factory = cast(Any, config_type)
+        error_factory = cast(Any, workspace_error)
+        main_callable = cast(Callable[[list[str]], int], main)
+        git_common_dir_callable = cast(Callable[[Path], Path], expected_callables["git_common_dir"])
+        mirror_guard_hook_callable = cast(
+            Callable[[Path], str], expected_callables["mirror_guard_hook"]
+        )
+        repos = tuple(
+            repo_factory(
+                name=repo.name,
+                url=repo.url,
+                default_branch=repo.default_branch,
+                visibility=repo.visibility,
+            )
+            for repo in manifest.repos
+        )
+        bound_config = config_factory(
+            root=manifest.root,
+            cache_root=manifest.cache_root,
+            repos=repos,
+        )
+
+        def bound_load_config(requested: object) -> object:
+            try:
+                requested_path = Path(requested)  # type: ignore[arg-type]
+            except TypeError as error:
+                raise error_factory("bound manifest path has an invalid type") from error
+            if requested_path != manifest.path:
+                raise error_factory(
+                    "bound manifest path does not match the inherited logical origin: "
+                    f"{requested_path} != {manifest.path}"
+                )
+            return bound_config
+
+        guard_hooks = namespace.get("MIRROR_GUARD_HOOKS")
+        if (
+            not isinstance(guard_hooks, tuple)
+            or not guard_hooks
+            or not all(isinstance(hook, str) and hook for hook in guard_hooks)
+        ):
+            raise SetupError("workspace helper MIRROR_GUARD_HOOKS API drifted")
+
+        def bound_mirror_guard_path(mirror: Path, hook_name: str) -> Path:
+            if hook_name not in guard_hooks:
+                raise error_factory(f"unsupported mirror guard hook: {hook_name}")
+            common_dir = git_common_dir_callable(mirror)
+            return common_dir / "hooks" / hook_name
+
+        def bound_install_mirror_guard(config: Any, repo: Any) -> None:
+            mirror = config.repo_path(repo)
+            expected = mirror_guard_hook_callable(mirror)
+            common_dir = git_common_dir_callable(mirror)
+            hooks_dir = common_dir / "hooks"
+            hooks_dir.mkdir(parents=True, exist_ok=True)
+            for hook_name in guard_hooks:
+                hook = bound_mirror_guard_path(mirror, hook_name)
+                if not hook.is_relative_to(common_dir):
+                    raise error_factory(
+                        f"effective {hook_name} hook path is outside git common dir: {hook}"
+                    )
+                hook.write_text(expected, encoding="utf-8")
+                hook.chmod(0o755)
+
+        namespace["load_config"] = bound_load_config
+        namespace["mirror_guard_path"] = bound_mirror_guard_path
+        namespace["install_mirror_guard"] = bound_install_mirror_guard
+        result = main_callable(list(child_argv[1:]))
+        if not isinstance(result, int) or isinstance(result, bool):
+            raise SetupError("workspace helper main returned a non-integer status")
+        raise SystemExit(result)
 
     def _capture_output(self, process: _SupervisedProcess) -> tuple[str, str]:
         """Stream both pipes through one retained-byte budget until exit."""
@@ -931,6 +1082,207 @@ class CommandRunner:
             return group_error
 
 
+@functools.cache
+def _darwin_acl_api() -> tuple[Any, ...]:
+    """Resolve and type the Darwin ACL ABI once per process."""
+
+    library = ctypes.CDLL(None, use_errno=True)
+    acl_get_fd_np = library.acl_get_fd_np
+    acl_get_fd_np.argtypes = [ctypes.c_int, ctypes.c_int]
+    acl_get_fd_np.restype = ctypes.c_void_p
+    acl_get_entry = library.acl_get_entry
+    acl_get_entry.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.POINTER(ctypes.c_void_p)]
+    acl_get_entry.restype = ctypes.c_int
+    acl_get_tag_type = library.acl_get_tag_type
+    acl_get_tag_type.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)]
+    acl_get_tag_type.restype = ctypes.c_int
+    acl_get_qualifier = library.acl_get_qualifier
+    acl_get_qualifier.argtypes = [ctypes.c_void_p]
+    acl_get_qualifier.restype = ctypes.c_void_p
+    acl_get_permset_mask_np = library.acl_get_permset_mask_np
+    acl_get_permset_mask_np.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint64)]
+    acl_get_permset_mask_np.restype = ctypes.c_int
+    acl_get_flagset_np = library.acl_get_flagset_np
+    acl_get_flagset_np.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
+    acl_get_flagset_np.restype = ctypes.c_int
+    acl_get_flag_np = library.acl_get_flag_np
+    acl_get_flag_np.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    acl_get_flag_np.restype = ctypes.c_int
+    acl_free = library.acl_free
+    acl_free.argtypes = [ctypes.c_void_p]
+    acl_free.restype = ctypes.c_int
+    return (
+        acl_get_fd_np,
+        acl_get_entry,
+        acl_get_tag_type,
+        acl_get_qualifier,
+        acl_get_permset_mask_np,
+        acl_get_flagset_np,
+        acl_get_flag_np,
+        acl_free,
+    )
+
+
+def _read_darwin_acl_entries(descriptor: int) -> tuple[AclEntry, ...]:
+    """Read one extended ACL from an already-retained descriptor."""
+
+    (
+        acl_get_fd_np,
+        acl_get_entry,
+        acl_get_tag_type,
+        acl_get_qualifier,
+        acl_get_permset_mask_np,
+        acl_get_flagset_np,
+        acl_get_flag_np,
+        acl_free,
+    ) = _darwin_acl_api()
+
+    ctypes.set_errno(0)
+    acl = acl_get_fd_np(descriptor, ACL_TYPE_EXTENDED)
+    if not acl:
+        error_number = ctypes.get_errno()
+        if error_number == errno.ENOENT:
+            return ()
+        raise SetupError(
+            "extended ACL could not be read from retained descriptor: "
+            f"{os.strerror(error_number) if error_number else 'unknown error'}"
+        )
+    entries: list[AclEntry] = []
+    try:
+        entry = ctypes.c_void_p()
+        selector = ACL_FIRST_ENTRY
+        while True:
+            ctypes.set_errno(0)
+            status = acl_get_entry(acl, selector, ctypes.byref(entry))
+            if status == -1 and ctypes.get_errno() == errno.EINVAL and entries:
+                break
+            if status != 0 or not entry.value:
+                error_number = ctypes.get_errno()
+                raise SetupError(
+                    "extended ACL entry enumeration failed: "
+                    f"{os.strerror(error_number) if error_number else 'invalid entry'}"
+                )
+            selector = ACL_NEXT_ENTRY
+            tag = ctypes.c_int()
+            if acl_get_tag_type(entry, ctypes.byref(tag)) != 0:
+                error_number = ctypes.get_errno()
+                raise SetupError(
+                    "extended ACL tag could not be read: "
+                    f"{os.strerror(error_number) if error_number else 'unknown error'}"
+                )
+            qualifier_pointer = acl_get_qualifier(entry)
+            if not qualifier_pointer:
+                error_number = ctypes.get_errno()
+                raise SetupError(
+                    "extended ACL qualifier could not be read: "
+                    f"{os.strerror(error_number) if error_number else 'unknown error'}"
+                )
+            try:
+                qualifier = ctypes.string_at(qualifier_pointer, 16)
+            finally:
+                if acl_free(qualifier_pointer) != 0:
+                    raise SetupError("extended ACL qualifier could not be released")
+            permissions = ctypes.c_uint64()
+            if acl_get_permset_mask_np(entry, ctypes.byref(permissions)) != 0:
+                error_number = ctypes.get_errno()
+                raise SetupError(
+                    "extended ACL permissions could not be read: "
+                    f"{os.strerror(error_number) if error_number else 'unknown error'}"
+                )
+            flagset = ctypes.c_void_p()
+            if acl_get_flagset_np(entry, ctypes.byref(flagset)) != 0 or not flagset.value:
+                error_number = ctypes.get_errno()
+                raise SetupError(
+                    "extended ACL flags could not be read: "
+                    f"{os.strerror(error_number) if error_number else 'unknown error'}"
+                )
+            flags = 0
+            for bit_index in range(ACL_FLAG_SCAN_BITS):
+                flag = 1 << bit_index
+                ctypes.set_errno(0)
+                present = acl_get_flag_np(flagset, flag)
+                if present == 1:
+                    flags |= flag
+                elif present == -1 and ctypes.get_errno() not in {0, errno.EINVAL}:
+                    error_number = ctypes.get_errno()
+                    raise SetupError(
+                        f"extended ACL flag could not be read: {os.strerror(error_number)}"
+                    )
+            entries.append(
+                AclEntry(
+                    tag=tag.value,
+                    qualifier=qualifier,
+                    permissions=permissions.value,
+                    flags=flags,
+                )
+            )
+    finally:
+        if acl_free(acl) != 0:
+            raise SetupError("extended ACL could not be released")
+    return tuple(entries)
+
+
+def _canonical_acl_payload(entries: Sequence[AclEntry], *, platform_name: str) -> bytes:
+    payload = {
+        "entries": [
+            {
+                "flags": entry.flags,
+                "permissions": entry.permissions,
+                "qualifier": entry.qualifier.hex(),
+                "tag": entry.tag,
+            }
+            for entry in entries
+        ],
+        "platform": platform_name,
+        "version": 1,
+    }
+    return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("ascii")
+
+
+def _acl_digest_from_fd(
+    descriptor: int,
+    *,
+    label: str,
+    sensitive_leaf: bool,
+) -> str:
+    """Bind ACL access policy without a pathname re-open.
+
+    Darwin extended ACLs are enforced. Other platforms record an explicit
+    sentinel so equality remains meaningful without claiming ACL enforcement.
+    """
+
+    if sys.platform == "darwin":
+        entries = _read_darwin_acl_entries(descriptor)
+        if sensitive_leaf and entries:
+            raise SetupError(f"{label} has an extended ACL")
+        if not sensitive_leaf:
+            unsupported = [entry.tag for entry in entries if entry.tag != ACL_EXTENDED_DENY]
+            if unsupported:
+                raise SetupError(f"{label} has a non-deny extended ACL entry")
+        platform_name = "darwin-extended-acl"
+    else:
+        entries = ()
+        platform_name = "non-darwin-acl-unavailable"
+    return hashlib.sha256(_canonical_acl_payload(entries, platform_name=platform_name)).hexdigest()
+
+
+def _binding_from_fd(
+    descriptor: int,
+    *,
+    label: str,
+    sensitive_leaf: bool,
+) -> Binding:
+    metadata = os.fstat(descriptor)
+    return dataclasses.replace(
+        Binding.from_stat(metadata),
+        acl_digest=_acl_digest_from_fd(
+            descriptor,
+            label=label,
+            sensitive_leaf=sensitive_leaf,
+        ),
+    )
+
+
 def _binding_tuple(metadata: os.stat_result) -> tuple[int, int, int, int, int, int]:
     binding = Binding.from_stat(metadata)
     return (
@@ -943,8 +1295,21 @@ def _binding_tuple(metadata: os.stat_result) -> tuple[int, int, int, int, int, i
     )
 
 
-def _directory_binding_tuple(binding: Binding) -> tuple[int, int, int, int, int]:
+def _directory_binding_tuple(binding: Binding) -> tuple[int, int, int, int, int, str | None]:
     """Bind directory identity/access policy without child-entry-derived size."""
+
+    return (
+        binding.dev,
+        binding.ino,
+        binding.uid,
+        binding.gid,
+        binding.mode,
+        binding.acl_digest,
+    )
+
+
+def _directory_stat_tuple(binding: Binding) -> tuple[int, int, int, int, int]:
+    """Compare path metadata to a retained FD without pretending it carries ACL state."""
 
     return (binding.dev, binding.ino, binding.uid, binding.gid, binding.mode)
 
@@ -982,6 +1347,7 @@ def _open_real_directory(
     *,
     label: str,
     require_current_owner: bool = False,
+    sensitive_leaf: bool = True,
 ) -> tuple[int, Binding]:
     path = _normalized_absolute(path, field=label)
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
@@ -993,6 +1359,11 @@ def _open_real_directory(
             root_metadata, label=f"{label} root", require_current_owner=False
         )
         current = Path("/")
+        current_binding = _binding_from_fd(
+            descriptor,
+            label=f"{label} root",
+            sensitive_leaf=sensitive_leaf and path == current,
+        )
         for component in path.parts[1:]:
             try:
                 child = os.open(component, flags, dir_fd=descriptor)
@@ -1015,14 +1386,19 @@ def _open_real_directory(
                 label=f"{label} component {current}",
                 require_current_owner=require_current_owner and current == path,
             )
-        return descriptor, Binding.from_stat(os.fstat(descriptor))
+            current_binding = _binding_from_fd(
+                descriptor,
+                label=f"{label} component {current}",
+                sensitive_leaf=sensitive_leaf and current == path,
+            )
+        return descriptor, current_binding
     except BaseException:
         os.close(descriptor)
         raise
 
 
 def _directory_path_matches(path: Path, expected: Binding, *, label: str) -> None:
-    descriptor, current = _open_real_directory(path, label=label)
+    descriptor, current = _open_real_directory(path, label=label, sensitive_leaf=False)
     try:
         if _directory_binding_tuple(current) != _directory_binding_tuple(expected):
             raise SetupError(f"{label} directory identity or access policy changed: {path}")
@@ -1075,25 +1451,38 @@ def _snapshot_at(
             raise SetupError(f"{label} is group- or world-writable")
         if metadata.st_size > max_bytes:
             raise SetupError(f"{label} exceeds the {max_bytes}-byte limit")
+        binding = _binding_from_fd(
+            descriptor,
+            label=label,
+            sensitive_leaf=True,
+        )
         first = _read_bounded_descriptor(descriptor, max_bytes)
         if len(first) != metadata.st_size:
             raise SetupError(f"{label} changed while it was being read")
         os.lseek(descriptor, 0, os.SEEK_SET)
         second = _read_bounded_descriptor(descriptor, max_bytes)
-        rebound = os.fstat(descriptor)
-        if first != second or _binding_tuple(rebound) != _binding_tuple(metadata):
+        rebound_binding = _binding_from_fd(
+            descriptor,
+            label=label,
+            sensitive_leaf=True,
+        )
+        if first != second or rebound_binding != binding:
             raise SetupError(f"{label} content or access policy changed while reading")
         path_metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
         if _binding_tuple(path_metadata) != _binding_tuple(metadata):
             raise SetupError(f"{label} object was replaced while reading")
-        return FileSnapshot(binding=Binding.from_stat(metadata), data=first)
+        return FileSnapshot(binding=binding, data=first)
     finally:
         os.close(descriptor)
 
 
 def _read_owned_regular_file(path: Path, *, max_bytes: int, label: str) -> FileSnapshot:
     path = _normalized_absolute(path, field=label)
-    parent_fd, parent_binding = _open_real_directory(path.parent, label=f"{label} parent")
+    parent_fd, parent_binding = _open_real_directory(
+        path.parent,
+        label=f"{label} parent",
+        sensitive_leaf=False,
+    )
     try:
         snapshot = _snapshot_at(parent_fd, path.name, max_bytes=max_bytes, label=label)
         assert snapshot is not None
@@ -1105,7 +1494,11 @@ def _read_owned_regular_file(path: Path, *, max_bytes: int, label: str) -> FileS
 
 def _optional_owned_file(path: Path, *, max_bytes: int, label: str) -> FileSnapshot | None:
     path = _normalized_absolute(path, field=label)
-    parent_fd, parent_binding = _open_real_directory(path.parent, label=f"{label} parent")
+    parent_fd, parent_binding = _open_real_directory(
+        path.parent,
+        label=f"{label} parent",
+        sensitive_leaf=False,
+    )
     try:
         snapshot = _snapshot_at(
             parent_fd,
@@ -1565,8 +1958,21 @@ def _retire_directory_leaf(
     )
     try:
         metadata = os.stat(quarantine, dir_fd=parent_fd, follow_symlinks=False)
+        quarantine_fd = os.open(
+            quarantine,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=parent_fd,
+        )
+        try:
+            current_binding = _binding_from_fd(
+                quarantine_fd,
+                label=f"{label} quarantined directory",
+                sensitive_leaf=True,
+            )
+        finally:
+            os.close(quarantine_fd)
         if not stat.S_ISDIR(metadata.st_mode) or _directory_binding_tuple(
-            Binding.from_stat(metadata)
+            current_binding
         ) != _directory_binding_tuple(expected_binding):
             raise SetupError(f"{label} quarantined directory does not match the expected object")
         os.rmdir(quarantine, dir_fd=parent_fd)
@@ -2037,9 +2443,14 @@ def _ensure_directory_children(
     label: str,
 ) -> Path:
     current_path = base
-    descriptor, _ = _open_real_directory(base, label=f"{label} base", require_current_owner=True)
+    descriptor, _ = _open_real_directory(
+        base,
+        label=f"{label} base",
+        require_current_owner=True,
+        sensitive_leaf=False,
+    )
     try:
-        for child_name in children:
+        for index, child_name in enumerate(children):
             if "/" in child_name or child_name in {"", ".", ".."}:
                 raise SetupError(f"{label} has an invalid directory component")
             created = False
@@ -2071,7 +2482,11 @@ def _ensure_directory_children(
                 journal.directories.append(
                     CreatedDirectory(
                         current_path / child_name,
-                        Binding.from_stat(metadata),
+                        _binding_from_fd(
+                            child_fd,
+                            label=f"{label} {current_path / child_name}",
+                            sensitive_leaf=index == len(children) - 1,
+                        ),
                     )
                 )
                 created = True
@@ -2082,9 +2497,14 @@ def _ensure_directory_children(
                     label=f"{label} {current_path / child_name}",
                     require_current_owner=True,
                 )
+                child_binding = _binding_from_fd(
+                    child_fd,
+                    label=f"{label} {current_path / child_name}",
+                    sensitive_leaf=index == len(children) - 1,
+                )
                 rebound = os.stat(child_name, dir_fd=descriptor, follow_symlinks=False)
-                if _directory_binding_tuple(Binding.from_stat(rebound)) != _directory_binding_tuple(
-                    Binding.from_stat(metadata)
+                if _directory_stat_tuple(Binding.from_stat(rebound)) != _directory_stat_tuple(
+                    child_binding
                 ):
                     raise SetupError(
                         f"directory was replaced while opening: {current_path / child_name}"
@@ -2163,8 +2583,12 @@ def _open_optional_child_directory(
             require_current_owner=True,
         )
         path_metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-        binding = Binding.from_stat(metadata)
-        if _directory_binding_tuple(Binding.from_stat(path_metadata)) != _directory_binding_tuple(
+        binding = _binding_from_fd(
+            descriptor,
+            label=label,
+            sensitive_leaf=True,
+        )
+        if _directory_stat_tuple(Binding.from_stat(path_metadata)) != _directory_stat_tuple(
             binding
         ):
             raise SetupError(f"{label} was replaced while opening: {parent_path / name}")
@@ -2194,6 +2618,108 @@ def _packed_refs_contains_replace_ref(data: bytes) -> bool:
         if len(fields) == 2 and fields[1].startswith(b"refs/replace/"):
             return True
     return False
+
+
+def _git_local_config_keys(data: bytes, *, label: str) -> tuple[str, ...]:
+    """Parse the closed key grammar needed to reject executable Git config.
+
+    The parser intentionally accepts less than Git. Unsupported syntax fails
+    closed before any repository-aware Git command is started.
+    """
+
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise SetupError(f"{label} is not UTF-8") from error
+    if "\0" in text:
+        raise SetupError(f"{label} contains a NUL byte")
+    section: str | None = None
+    keys: list[str] = []
+    for line_number, raw_line in enumerate(text.splitlines(), start=1):
+        stripped = raw_line.strip()
+        if not stripped or stripped.startswith(("#", ";")):
+            continue
+        if raw_line.rstrip().endswith("\\"):
+            raise SetupError(f"{label} uses an unsupported continuation at line {line_number}")
+        if stripped.startswith("["):
+            match = GIT_CONFIG_SECTION_PATTERN.fullmatch(stripped)
+            if match is None:
+                raise SetupError(f"{label} has unsupported section syntax at line {line_number}")
+            section_name = match.group(1).lower()
+            subsection = match.group(2)
+            if subsection is not None:
+                subsection = subsection.replace(r"\"", '"').replace(r"\\", "\\")
+                section = f"{section_name}.{subsection.lower()}"
+            else:
+                section = section_name
+            continue
+        if section is None:
+            raise SetupError(f"{label} has a variable outside a section at line {line_number}")
+        match = GIT_CONFIG_VARIABLE_PATTERN.fullmatch(stripped)
+        if match is None:
+            raise SetupError(f"{label} has unsupported variable syntax at line {line_number}")
+        keys.append(f"{section}.{match.group(1).lower()}")
+    return tuple(keys)
+
+
+def _git_config_key_is_unsafe(key: str) -> bool:
+    parts = key.split(".")
+    section = parts[0]
+    leaf = parts[-1]
+    if section in {"include", "includeif", "alias", "pager"}:
+        return True
+    if section == "filter" and leaf in {"clean", "smudge", "process"}:
+        return True
+    if section == "core" and leaf in {
+        "askpass",
+        "attributesfile",
+        "editor",
+        "fsmonitor",
+        "gitproxy",
+        "hookspath",
+        "pager",
+        "sshcommand",
+    }:
+        return True
+    if section == "diff" and leaf in {"command", "external", "textconv"}:
+        return True
+    if section == "merge" and leaf in {"driver", "tool"}:
+        return True
+    if section in {"difftool", "mergetool"} and leaf in {"cmd", "path"}:
+        return True
+    if section == "interactive" and leaf == "difffilter":
+        return True
+    if section == "url" and leaf in {"insteadof", "pushinsteadof"}:
+        return True
+    if section == "credential" and leaf in {"askpass", "helper"}:
+        return True
+    if section == "remote" and leaf in {
+        "proxy",
+        "pushurl",
+        "receivepack",
+        "uploadpack",
+        "vcs",
+    }:
+        return True
+    if section in {"http", "https"} and leaf == "proxy":
+        return True
+    if section == "protocol" and leaf == "allow":
+        return True
+    return False
+
+
+def _validate_git_local_config(snapshot: FileSnapshot, *, label: str) -> None:
+    unsafe = sorted(
+        {
+            key
+            for key in _git_local_config_keys(snapshot.data, label=label)
+            if _git_config_key_is_unsafe(key)
+        }
+    )
+    if unsafe:
+        raise SetupError(
+            f"{label} selects executable or redirected Git behavior: {', '.join(unsafe)}"
+        )
 
 
 def _inspect_git_topology_replacements(
@@ -2239,6 +2765,23 @@ def _inspect_git_topology_replacements(
             ):
                 raise SetupError(
                     f"Git topology .git identity or access policy changed: {repository / '.git'}"
+                )
+        local_config = _snapshot_at(
+            git_fd,
+            "config",
+            max_bytes=MAX_CONFIG_BYTES,
+            label=f"Git local config {repository / '.git' / 'config'}",
+        )
+        assert local_config is not None
+        _validate_git_local_config(
+            local_config,
+            label=f"Git local config {repository / '.git' / 'config'}",
+        )
+        if expected is not None and expected.local_config_snapshot is not None:
+            if local_config != expected.local_config_snapshot:
+                raise SetupError(
+                    f"Git local config changed during delegated operation: "
+                    f"{repository / '.git' / 'config'}"
                 )
 
         refs_opened = _open_optional_child_directory(
@@ -2341,12 +2884,24 @@ def _inspect_git_topology_replacements(
             raise SetupError(
                 f"Git packed replacement ref is present: {repository / '.git' / 'packed-refs'}"
             )
+        local_config_rebound = _snapshot_at(
+            git_fd,
+            "config",
+            max_bytes=MAX_CONFIG_BYTES,
+            label=f"Git local config {repository / '.git' / 'config'}",
+        )
+        if local_config_rebound != local_config:
+            raise SetupError(
+                f"Git local config changed while it was being inspected: "
+                f"{repository / '.git' / 'config'}"
+            )
         return GitTopologyGuard(
             repository=repository,
             repository_binding=repository_binding,
             git_dir_binding=git_dir_binding,
             refs_binding=refs_binding,
             info_binding=info_binding,
+            local_config_snapshot=local_config,
         )
     finally:
         if info_opened is not None:
@@ -2417,22 +2972,32 @@ def _git_environment(*, disable_hooks: bool = True) -> dict[str, str]:
     environment.update(
         {
             "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_SYSTEM": "/dev/null",
             "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_ATTR_NOSYSTEM": "1",
             "GIT_GRAFT_FILE": "/dev/null",
             "GIT_NO_REPLACE_OBJECTS": "1",
             "GIT_TERMINAL_PROMPT": "0",
             "GIT_OPTIONAL_LOCKS": "0",
             "GIT_NO_LAZY_FETCH": "1",
+            "GIT_PROTOCOL_FROM_USER": "0",
+            "GIT_ASKPASS": "/usr/bin/false",
+            "SSH_ASKPASS": "/usr/bin/false",
             "GIT_SSH": SSH_EXECUTABLE,
             "GIT_SSH_VARIANT": "ssh",
+            "GIT_PAGER": "cat",
+            "PAGER": "cat",
         }
     )
     overrides = [
+        ("core.attributesFile", "/dev/null"),
         ("core.fsmonitor", "false"),
+        ("core.hooksPath", "/dev/null"),
         ("core.sshCommand", SSH_EXECUTABLE),
+        ("credential.helper", ""),
+        ("protocol.ext.allow", "never"),
     ]
-    if disable_hooks:
-        overrides.append(("core.hooksPath", "/dev/null"))
+    del disable_hooks  # Hooks are disabled at every Git boundary, including delegated helpers.
     environment["GIT_CONFIG_COUNT"] = str(len(overrides))
     for index, (key, value) in enumerate(overrides):
         environment[f"GIT_CONFIG_KEY_{index}"] = key
@@ -2445,10 +3010,7 @@ def _run_git(
     *arguments: str,
     check: bool = True,
 ) -> subprocess.CompletedProcess[str]:
-    descriptor, binding = _open_real_directory(
-        repository, label="Git repository", require_current_owner=True
-    )
-    os.close(descriptor)
+    topology = _inspect_git_topology_replacements(repository)
     try:
         result = CommandRunner(
             timeout_seconds=GIT_TIMEOUT_SECONDS,
@@ -2460,9 +3022,9 @@ def _run_git(
             env=_git_environment(disable_hooks=True),
         )
     except SetupError:
-        _directory_path_matches(repository, binding, label="Git repository")
+        _inspect_git_topology_replacements(repository, expected=topology)
         raise
-    _directory_path_matches(repository, binding, label="Git repository")
+    _inspect_git_topology_replacements(repository, expected=topology)
     if check and result.returncode != 0:
         detail = (result.stderr or result.stdout).strip()[:MAX_COMMAND_DETAIL]
         raise SetupError(f"git {' '.join(arguments)} failed in {repository}: {detail}")
@@ -2976,7 +3538,7 @@ def _check_locator(config: HostConfig) -> Check:
         )
         os.close(source_fd)
         followed = os.stat(config.skill_locator.name, dir_fd=parent_fd, follow_symlinks=True)
-        if _directory_binding_tuple(Binding.from_stat(followed)) != _directory_binding_tuple(
+        if _directory_stat_tuple(Binding.from_stat(followed)) != _directory_stat_tuple(
             source_binding
         ):
             return Check(
@@ -3874,12 +4436,15 @@ def collect_core_checks(
 def _preflight_creation_path(base: Path, children: Sequence[str], *, label: str) -> Check:
     try:
         descriptor, _ = _open_real_directory(
-            base, label=f"{label} base", require_current_owner=True
+            base,
+            label=f"{label} base",
+            require_current_owner=True,
+            sensitive_leaf=False,
         )
         try:
             current = base
             missing = False
-            for child in children:
+            for index, child in enumerate(children):
                 current /= child
                 if missing:
                     continue
@@ -3892,12 +4457,21 @@ def _preflight_creation_path(base: Path, children: Sequence[str], *, label: str)
                 except FileNotFoundError:
                     missing = True
                     continue
-                metadata = os.fstat(next_fd)
-                _validate_directory_metadata(
-                    metadata,
-                    label=f"{label} {current}",
-                    require_current_owner=True,
-                )
+                try:
+                    metadata = os.fstat(next_fd)
+                    _validate_directory_metadata(
+                        metadata,
+                        label=f"{label} {current}",
+                        require_current_owner=True,
+                    )
+                    _binding_from_fd(
+                        next_fd,
+                        label=f"{label} {current}",
+                        sensitive_leaf=index == len(children) - 1,
+                    )
+                except BaseException:
+                    os.close(next_fd)
+                    raise
                 os.close(descriptor)
                 descriptor = next_fd
         finally:
@@ -4126,7 +4700,7 @@ def _bind_helper_git_topology(
             guards.append(_inspect_git_topology_replacements(repository))
             continue
         if occupancy.status == "missing" and allow_missing:
-            guards.append(GitTopologyGuard(repository, None, None, None, None))
+            guards.append(GitTopologyGuard(repository, None, None, None, None, None))
             continue
         raise SetupError(occupancy.detail)
     return tuple(guards)
@@ -4154,12 +4728,23 @@ def _revalidate_helper_git_topology(guards: Sequence[GitTopologyGuard]) -> None:
         _inspect_git_topology_replacements(guard.repository, expected=guard)
 
 
+def _revalidate_workspace_manifest(manifest: WorkspaceManifest, *, phase: str) -> None:
+    current = _read_owned_regular_file(
+        manifest.path,
+        max_bytes=MAX_CONFIG_BYTES,
+        label=f"{phase} workspace manifest",
+    )
+    if current != manifest.snapshot:
+        raise SetupError(f"workspace manifest changed {phase}: {manifest.path}")
+
+
 def _run_helper(
     config: HostConfig,
     manifest: WorkspaceManifest,
     arguments: Sequence[str],
     runner: CommandRunner,
 ) -> subprocess.CompletedProcess[str]:
+    _revalidate_workspace_manifest(manifest, phase="before delegated helper")
     topology_guards = _bind_helper_git_topology(
         manifest,
         allow_missing=bool(arguments) and arguments[0] == "ensure",
@@ -4180,13 +4765,17 @@ def _run_helper(
             source=helper_snapshot,
             source_path=config.workspace_helper,
             cwd=config.workspace_root,
-            env=_git_environment(disable_hooks=False),
+            env=_git_environment(disable_hooks=True),
+            workspace_manifest=manifest,
         )
     finally:
         try:
-            runner.revalidate_helper_runtime(config)
+            _revalidate_workspace_manifest(manifest, phase="after delegated helper")
         finally:
-            _revalidate_helper_git_topology(topology_guards)
+            try:
+                runner.revalidate_helper_runtime(config)
+            finally:
+                _revalidate_helper_git_topology(topology_guards)
 
 
 def _run_ensure(config: HostConfig, runner: CommandRunner) -> None:

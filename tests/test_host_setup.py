@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import json
 import os
 import plistlib
@@ -305,10 +306,12 @@ class FakeRunner(hs.CommandRunner):
         source_path: Path,
         cwd: Path,
         env: Mapping[str, str],
+        workspace_manifest: hs.WorkspaceManifest | None = None,
     ) -> subprocess.CompletedProcess[str]:
         args = list(argv)
         assert Path(args[4]) == source_path
         assert source.data
+        assert workspace_manifest is not None
         self.calls.append((args, cwd))
         self.environments.append(dict(env))
         command = next((name for name in ("ensure", "prefetch", "status") if name in args), None)
@@ -510,6 +513,62 @@ cache_root = "{cache_root}"
 
 def _active(fixture: HostFixture) -> hs.HostConfig:
     return hs.load_config(fixture.config.control_mirror_manifest)
+
+
+def _write_bound_helper_fixture(path: Path, *, loaded_marker: Path | None = None) -> None:
+    marker_statement = (
+        f"    Path({str(loaded_marker)!r}).write_text('loaded', encoding='utf-8')\n"
+        if loaded_marker is not None
+        else ""
+    )
+    path.write_text(
+        "from __future__ import annotations\n"
+        "import dataclasses\n"
+        "import json\n"
+        "import sys\n"
+        "from pathlib import Path\n"
+        "class WorkspaceError(RuntimeError):\n"
+        "    pass\n"
+        "MIRROR_GUARD_HOOKS = ('pre-commit',)\n"
+        "@dataclasses.dataclass(frozen=True)\n"
+        "class RepoSpec:\n"
+        "    name: str\n"
+        "    url: str\n"
+        "    default_branch: str\n"
+        "    visibility: str\n"
+        "@dataclasses.dataclass(frozen=True)\n"
+        "class WorkspaceConfig:\n"
+        "    root: Path\n"
+        "    cache_root: Path\n"
+        "    repos: tuple[RepoSpec, ...]\n"
+        "    def repo_path(self, repo: RepoSpec) -> Path:\n"
+        "        return self.cache_root / 'repos' / repo.name\n"
+        "def load_config(path: Path) -> WorkspaceConfig:\n"
+        "    raise AssertionError(f'disk manifest loader ran: {path}')\n"
+        "def git_common_dir(mirror: Path) -> Path:\n"
+        "    return mirror / '.git'\n"
+        "def mirror_guard_hook(mirror: Path) -> str:\n"
+        "    return f'guard:{mirror}\\n'\n"
+        "def mirror_guard_path(mirror: Path, hook_name: str) -> Path:\n"
+        "    return mirror / '.git' / 'hooks' / hook_name\n"
+        "def install_mirror_guard(config: WorkspaceConfig, repo: RepoSpec) -> None:\n"
+        "    raise AssertionError('unbound installer ran')\n"
+        "def main(argv: list[str] | None = None) -> int:\n"
+        "    args = list(sys.argv[1:] if argv is None else argv)\n"
+        "    config_path = Path(args[args.index('--config') + 1])\n"
+        "    config = load_config(config_path)\n"
+        f"{marker_statement}"
+        "    print(json.dumps({\n"
+        "        'root': str(config.root),\n"
+        "        'cache_root': str(config.cache_root),\n"
+        "        'repos': [dataclasses.asdict(repo) for repo in config.repos],\n"
+        "    }, sort_keys=True))\n"
+        "    return 0\n"
+        "if __name__ == '__main__':\n"
+        "    raise SystemExit(main())\n",
+        encoding="utf-8",
+    )
+    path.chmod(0o755)
 
 
 def _apply_ready(fixture: HostFixture, runner: FakeRunner | None = None) -> dict[str, object]:
@@ -1103,7 +1162,11 @@ def test_stamp_validation_rebinds_manifest_content(tmp_path: Path) -> None:
     )
     assert evidence is None
     assert any(
-        check.status == "blocked" and "manifest identity or content changed" in check.detail
+        check.status == "blocked"
+        and (
+            "manifest identity or content changed" in check.detail
+            or "workspace manifest changed after delegated helper" in check.detail
+        )
         for check in checks
     )
 
@@ -1297,6 +1360,138 @@ def test_directory_child_churn_is_not_treated_as_object_replacement(
     monkeypatch.setattr(hs.os, "stat", churn_before_followed_stat)
     assert hs._check_locator(active).status == "ready"
     assert churned
+
+
+def test_acl_policy_canonicalizes_entries_and_rejects_allow_on_custody_ancestor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    descriptor = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    deny = hs.AclEntry(
+        tag=hs.ACL_EXTENDED_DENY,
+        qualifier=bytes.fromhex("abcdefabcdefabcdefabcdef0000000c"),
+        permissions=1 << 4,
+        flags=0,
+    )
+    allow = hs.AclEntry(
+        tag=hs.ACL_EXTENDED_ALLOW,
+        qualifier=bytes.fromhex("abcdefabcdefabcdefabcdef0000000c"),
+        permissions=1 << 1,
+        flags=0,
+    )
+    monkeypatch.setattr(hs.sys, "platform", "darwin")
+    try:
+        monkeypatch.setattr(hs, "_read_darwin_acl_entries", lambda _fd: (deny,))
+        first = hs._acl_digest_from_fd(
+            descriptor,
+            label="custody ancestor",
+            sensitive_leaf=False,
+        )
+        second = hs._acl_digest_from_fd(
+            descriptor,
+            label="custody ancestor",
+            sensitive_leaf=False,
+        )
+        assert first == second
+        with pytest.raises(hs.SetupError, match="has an extended ACL"):
+            hs._acl_digest_from_fd(
+                descriptor,
+                label="sensitive leaf",
+                sensitive_leaf=True,
+            )
+        monkeypatch.setattr(hs, "_read_darwin_acl_entries", lambda _fd: (allow,))
+        with pytest.raises(hs.SetupError, match="non-deny"):
+            hs._acl_digest_from_fd(
+                descriptor,
+                label="custody ancestor",
+                sensitive_leaf=False,
+            )
+    finally:
+        os.close(descriptor)
+
+
+def test_acl_digest_preserves_semantic_entry_order_and_non_darwin_is_explicit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    descriptor = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    first = hs.AclEntry(hs.ACL_EXTENDED_DENY, b"a" * 16, 1 << 4, 0)
+    second = hs.AclEntry(hs.ACL_EXTENDED_DENY, b"b" * 16, 1 << 6, 1 << 5)
+    try:
+        monkeypatch.setattr(hs.sys, "platform", "darwin")
+        monkeypatch.setattr(hs, "_read_darwin_acl_entries", lambda _fd: (first, second))
+        forward = hs._acl_digest_from_fd(
+            descriptor,
+            label="custody ancestor",
+            sensitive_leaf=False,
+        )
+        monkeypatch.setattr(hs, "_read_darwin_acl_entries", lambda _fd: (second, first))
+        reverse = hs._acl_digest_from_fd(
+            descriptor,
+            label="custody ancestor",
+            sensitive_leaf=False,
+        )
+        assert forward != reverse
+
+        monkeypatch.setattr(hs.sys, "platform", "linux")
+        monkeypatch.setattr(
+            hs,
+            "_read_darwin_acl_entries",
+            lambda _fd: pytest.fail("Darwin ACL reader must not run on non-Darwin"),
+        )
+        unsupported = hs._acl_digest_from_fd(
+            descriptor,
+            label="portable leaf",
+            sensitive_leaf=True,
+        )
+        assert (
+            unsupported
+            == hashlib.sha256(
+                hs._canonical_acl_payload((), platform_name="non-darwin-acl-unavailable")
+            ).hexdigest()
+        )
+    finally:
+        os.close(descriptor)
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="Darwin extended ACL API")
+def test_darwin_acl_reader_accepts_home_style_deny_only_on_custody_ancestor(
+    tmp_path: Path,
+) -> None:
+    directory = tmp_path / "acl-custody"
+    directory.mkdir()
+    added = subprocess.run(
+        ["chmod", "+a", "everyone deny delete", str(directory)],
+        check=False,
+        text=True,
+        capture_output=True,
+    )
+    if added.returncode != 0:
+        pytest.skip(f"temporary volume does not support extended ACLs: {added.stderr.strip()}")
+    descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        entries = hs._read_darwin_acl_entries(descriptor)
+        assert entries
+        assert all(entry.tag == hs.ACL_EXTENDED_DENY for entry in entries)
+        hs._acl_digest_from_fd(
+            descriptor,
+            label="custody ancestor",
+            sensitive_leaf=False,
+        )
+        with pytest.raises(hs.SetupError, match="has an extended ACL"):
+            hs._acl_digest_from_fd(
+                descriptor,
+                label="sensitive leaf",
+                sensitive_leaf=True,
+            )
+    finally:
+        os.close(descriptor)
+        subprocess.run(
+            ["chmod", "-N", str(directory)],
+            check=False,
+            text=True,
+            capture_output=True,
+        )
 
 
 def test_ensure_preflight_rejects_cache_symlink_before_helper_mutation(tmp_path: Path) -> None:
@@ -2074,8 +2269,10 @@ def test_git_and_helper_environments_disable_executable_fsmonitor(tmp_path: Path
     assert marker.read_text(encoding="utf-8") == "invoked"
     marker.unlink()
 
-    hs._run_git(mirror, "status", "--porcelain=v1")
+    with pytest.raises(hs.SetupError, match="core.fsmonitor"):
+        hs._run_git(mirror, "status", "--porcelain=v1")
     assert not marker.exists()
+    _git(mirror, "config", "--local", "--unset", "core.fsmonitor")
 
     runner = FakeRunner()
     manifest = hs._load_main_manifest(active)
@@ -2088,10 +2285,81 @@ def test_git_and_helper_environments_disable_executable_fsmonitor(tmp_path: Path
         ]
         for index in range(int(helper_environment["GIT_CONFIG_COUNT"]))
     }
+    assert overrides["core.attributesFile"] == "/dev/null"
     assert overrides["core.fsmonitor"] == "false"
+    assert overrides["core.hooksPath"] == "/dev/null"
     assert overrides["core.sshCommand"] == hs.SSH_EXECUTABLE
+    assert overrides["credential.helper"] == ""
+    assert overrides["protocol.ext.allow"] == "never"
     assert helper_environment["GIT_NO_REPLACE_OBJECTS"] == "1"
     assert helper_environment["GIT_GRAFT_FILE"] == "/dev/null"
+
+
+@pytest.mark.parametrize(
+    ("section", "setting"),
+    [
+        ('includeIf "gitdir:**"', "path = /tmp/hostile.gitconfig"),
+        ('filter "hostile"', "process = /tmp/hostile-filter"),
+        ("core", "hooksPath = /tmp/hostile-hooks"),
+        ('diff "hostile"', "textconv = /tmp/hostile-textconv"),
+        ('merge "hostile"', "driver = /tmp/hostile-merge %O %A %B"),
+        ('url "ssh://attacker.invalid/"', "insteadOf = git@github.com:"),
+        ("credential", "helper = /tmp/hostile-credential"),
+        ('remote "origin"', "uploadpack = /tmp/hostile-upload-pack"),
+    ],
+)
+def test_git_local_config_rejects_executable_or_redirected_behavior_before_git(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    section: str,
+    setting: str,
+) -> None:
+    fixture = _build_host(tmp_path)
+    mirror = fixture.config.cache_root / "repos" / "alpha"
+    local_config = mirror / ".git" / "config"
+    local_config.write_text(
+        local_config.read_text(encoding="utf-8") + f"\n[{section}]\n\t{setting}\n",
+        encoding="utf-8",
+    )
+    started = False
+
+    def forbidden_run(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        nonlocal started
+        started = True
+        raise AssertionError("Git must not start after hostile local config is found")
+
+    monkeypatch.setattr(hs.CommandRunner, "run", forbidden_run)
+    with pytest.raises(hs.SetupError, match="executable or redirected Git behavior"):
+        hs._run_git(mirror, "status", "--porcelain=v1")
+    assert started is False
+
+
+def test_helper_rejects_local_config_drift_after_child_without_executing_marker(
+    tmp_path: Path,
+) -> None:
+    fixture = _build_host(tmp_path)
+    active = _active(fixture)
+    manifest = hs._load_main_manifest(active)
+    mirror = manifest.repo_path(manifest.repos[0])
+    config_path = mirror / ".git" / "config"
+    marker = tmp_path / "hostile-filter-ran"
+
+    def mutate_config(_args: list[str]) -> None:
+        config_path.write_text(
+            config_path.read_text(encoding="utf-8")
+            + '\n[filter "hostile"]\n'
+            + f"\tprocess = {marker}\n",
+            encoding="utf-8",
+        )
+
+    with pytest.raises(hs.SetupError, match="executable or redirected Git behavior"):
+        hs._run_helper(
+            active,
+            manifest,
+            ["status", "--repo", manifest.repos[0].name],
+            FakeRunner(on_helper=mutate_config),
+        )
+    assert not marker.exists()
 
 
 def test_command_boundaries_use_fixed_executables_and_closed_environments(
@@ -2150,12 +2418,12 @@ def test_command_boundaries_use_fixed_executables_and_closed_environments(
     assert helper_environment["LANG"] == "en_GB.UTF-8"
     assert helper_environment["TMPDIR"] == str(tmp_path / "preserved-tmp")
     assert helper_environment["GIT_SSH"] == hs.SSH_EXECUTABLE
+    assert helper_environment["SSH_ASKPASS"] == "/usr/bin/false"
     for hostile_key in (
         "GIT_EXEC_PATH",
         "GIT_SSH_COMMAND",
         "PYTHONPATH",
         "DYLD_INSERT_LIBRARIES",
-        "SSH_ASKPASS",
     ):
         assert hostile_key not in helper_environment
 
@@ -2467,14 +2735,15 @@ def test_ensure_rejects_topology_replacement_that_masks_divergence(
         if check.name == "test-topology-replacements"
     )
     assert topology.status == "blocked"
-    assert {
+    expected_detail = {
         "loose-replace": "loose replacement refs",
         "packed-replace": "packed replacement ref",
         "graft": "graft file",
-    }[mechanism] in topology.detail
+    }[mechanism]
+    assert expected_detail in topology.detail
     semantic = hs._ensure_mirror_precheck(manifest, alpha)
     assert semantic.status == "blocked"
-    assert "ahead=1 behind=1" in semantic.detail
+    assert expected_detail in semantic.detail
 
     runner = FakeRunner()
     with pytest.raises(hs.SetupError, match="initial preflight blocked"):
@@ -2552,8 +2821,17 @@ def test_helper_revalidates_replacement_absence_after_invocation(tmp_path: Path)
     assert helper_environment["GIT_GRAFT_FILE"] == "/dev/null"
 
 
-def test_production_interpreter_policy_requires_exact_isolated_runtime() -> None:
-    config_path = REPO_ROOT / "config" / "host-workspace.toml"
+def test_production_interpreter_policy_requires_exact_isolated_runtime(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    cache_root = workspace / ".codex-local" / "daily-skill-friction"
+    config_path = tmp_path / "config" / "host-workspace.toml"
+    config_path.parent.mkdir()
+    executable = Path(sys.executable).resolve()
+    config_path.write_text(
+        _manifest_text(workspace, cache_root, executable, tmp_path / "control.git"),
+        encoding="utf-8",
+    )
     config = hs.load_config(config_path)
     module_path = REPO_ROOT / "scripts" / "host_setup.py"
     probe = (
@@ -2576,7 +2854,8 @@ def test_production_interpreter_policy_requires_exact_isolated_runtime() -> None
         env=hs._trusted_process_environment(),
     )
     assert isolated.returncode == 0, isolated.stderr
-    assert isolated.stdout.strip().startswith("3.14.")
+    observed_version = tuple(int(part) for part in isolated.stdout.strip().split("."))
+    assert observed_version >= (3, 12, 0)
 
     unisolated = subprocess.run(
         [str(config.python_executable), "-c", probe],
@@ -2687,6 +2966,97 @@ def test_helper_preflight_baseline_blocks_replacement_before_first_invocation(
         )
 
     assert not malicious_marker.exists()
+
+
+def test_bound_helper_consumes_inherited_manifest_during_replace_restore_aba(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _build_host(tmp_path)
+    active = _active(fixture)
+    loaded_marker = tmp_path / "bound-manifest-loaded"
+    _write_bound_helper_fixture(active.workspace_helper, loaded_marker=loaded_marker)
+    manifest = hs._load_main_manifest(active)
+    original_backup = manifest.path.with_name("workspace.original.toml")
+    malicious = manifest.path.with_name("workspace.malicious.toml")
+    displaced = manifest.path.with_name("workspace.displaced.toml")
+    malicious_marker = tmp_path / "malicious-repo-consumed"
+    malicious.write_text(
+        "version = 1\n"
+        f'cache_root = "{manifest.cache_root}"\n\n'
+        "[[repos]]\n"
+        'name = "malicious"\n'
+        f'url = "{malicious_marker}"\n'
+        'default_branch = "master"\n'
+        'visibility = "private"\n',
+        encoding="utf-8",
+    )
+    real_fork = hs.os.fork
+    swapped = False
+
+    def replace_and_restore_after_fork() -> int:
+        nonlocal swapped
+        pid = real_fork()
+        if pid <= 0:
+            return pid
+        os.replace(manifest.path, original_backup)
+        os.replace(malicious, manifest.path)
+        deadline = time.monotonic() + 2
+        while not loaded_marker.exists() and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert loaded_marker.exists()
+        os.replace(manifest.path, displaced)
+        os.replace(original_backup, manifest.path)
+        swapped = True
+        return pid
+
+    monkeypatch.setattr(hs.os, "fork", replace_and_restore_after_fork)
+    result = hs._run_helper(
+        active,
+        manifest,
+        ["status"],
+        ForkTestRunner(timeout_seconds=5),
+    )
+
+    assert result.returncode == 0, result.stderr
+    observed = json.loads(result.stdout)
+    assert observed == {
+        "cache_root": str(manifest.cache_root),
+        "repos": [
+            {
+                "default_branch": repo.default_branch,
+                "name": repo.name,
+                "url": repo.url,
+                "visibility": repo.visibility,
+            }
+            for repo in manifest.repos
+        ],
+        "root": str(manifest.root),
+    }
+    assert swapped is True
+    assert not malicious_marker.exists()
+
+
+def test_bound_helper_fails_closed_when_expected_api_drifts(tmp_path: Path) -> None:
+    fixture = _build_host(tmp_path)
+    active = _active(fixture)
+    _write_bound_helper_fixture(active.workspace_helper)
+    source = active.workspace_helper.read_text(encoding="utf-8")
+    active.workspace_helper.write_text(
+        source.replace("    visibility: str\n", "    visibility: str\n    extra: str = ''\n"),
+        encoding="utf-8",
+    )
+    active.workspace_helper.chmod(0o755)
+
+    result = hs._run_helper(
+        active,
+        hs._load_main_manifest(active),
+        ["status"],
+        ForkTestRunner(timeout_seconds=5),
+    )
+
+    assert result.returncode == 1
+    assert "RepoSpec constructor fields drifted" in result.stderr
 
 
 def test_forked_python_source_uses_os_pipe_closes_fds_and_preserves_environment(

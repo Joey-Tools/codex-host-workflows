@@ -78,11 +78,30 @@ until an audited skill and schema update is installed:
   approval receipt supplied with `--publish-receipt`; the manifest is not that
   approval. A scheduled Daily or Weekly run must never invent or apply either
   receipt.
+- Later interactive repair decision: `approve-repair` only after an exact
+  `published` closure is committed. It requires Joey's current interactive
+  confirmation and a separate time-bounded receipt binding the source and target
+  case tuples plus the closure, manifest, pull request, merge commit, and merge
+  time. Publication approval is not repair approval. Only a later exact `stage`
+  transaction may consume that authority once; scheduled Daily and Weekly runs
+  must never call this mode or stage a case from `proposed` to `approved`.
 
 Put durable run state under the host-local
 `/Users/hoteng/Program/GitHub/Joey-Tools/codex-workspace/.codex-local/daily-skill-friction/control-state`
 root, never in Git. If the helper, schema, or state root is missing or inconsistent,
 report blocked without inventing fields or rewriting existing state.
+
+The helper treats object identity, file content, and access policy as separate
+protected properties. On Darwin it reads extended ACLs through each retained file
+descriptor and binds a canonical digest of the kernel-ordered tag, UUID,
+permission, and flag entries. Sensitive state leaves must have no extended ACL;
+custody ancestors may retain deny-only entries such as the home-directory deny
+delete ACE, but any allow entry is rejected. State markers and external WAL
+bindings persist these ACL digests and every open/recovery path revalidates them.
+Legacy state without that binding fails closed. Other platforms record the
+explicit `posix-mode-only-v1` model and do not claim extended-ACL enforcement.
+`mtime`, `ctime`, link count, and ordinary directory child churn are not access or
+content changes by themselves.
 
 ## Run The Scheduled Preflight
 
@@ -129,6 +148,9 @@ path, and never combine `--historical` with the Weekly variant.
 ### Daily and historical replay
 
 - Read the corpus and write only host-local staging state through the state helper.
+- Keep repair lifecycle at `proposed` or earlier. Never submit a
+  `proposed`-to-`approved` candidate or invoke the interactive repair decision
+  path from a scheduled or replay run.
 - Do not edit canonical repositories, create commits, push, open pull requests,
   or make network-dependent changes.
 - Report blocked inputs distinctly from a clean no-change result.
@@ -150,13 +172,19 @@ path, and never combine `--historical` with the Weekly variant.
   requires a later exact Joey publish approval before any push, pull request, or
   merge.
 - Do not push, open a pull request, retry a failed publication automatically,
-  replace an approved commit, close publication state, or begin a repair.
+  replace an approved commit, close publication state, approve a repair, or begin
+  a repair.
 
 ### Repair handoff
 
 - Stop after presenting cases and exact publication artifacts for Joey's choice.
 - A later interactive workflow may publish approved case commits one PR per case.
-- Begin a repair only after its ledger case PR is squash-merged.
+- After the ledger case PR is squash-merged and its exact `published` closure is
+  committed, obtain and persist a separate exact repair approval. Stage only its
+  bound next revision; that stage consumes the approval once in the same WAL
+  transaction as the case and receipt.
+- Begin a repair only after that exact approved case revision has a committed
+  stage transaction.
 - Every repair commit must identify the concrete problem with the safe trailer
   `Friction-Case: DSF-<uuidv7>`.
 

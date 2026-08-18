@@ -89,20 +89,26 @@ the per-case semantic selection binding.
 The output parent must already exist and be owner-private. The WAL persists the
 complete parent-visible name chain plus each directory's device/inode/type and
 effective POSIX owner/mode policy (including group identity only when the group
-and other permission classes differ). Recovery reopens the exact chain with
-`create=False` before any state after-image, again at the external write, and
-again before commit. Commit publication retains descriptors for the bound parent
-and exact private after-image leaf, then revalidates both after the commit write;
-failure removes only that exact new commit and leaves the intent pending. A
-missing, symlinked, non-directory, or rebound component or changed access policy
-blocks recovery, and the helper never recreates the parent. Recovery repairs a
-missing committed after-image only from a parent-bound WAL. A committed legacy
-version 1 WAL without a parent binding is checked read-only, while a pending
-legacy external WAL fails closed and is never rebound to the current pathname.
-Timestamps, directory size, link count, and ordinary child-entry churn are not
-mutation evidence and do not block recovery. A non-cooperating same-UID process
-can still replace an artifact after the terminal revalidation; that post-terminal
-host mutation is outside this local transaction guarantee.
+and other permission classes differ). On Darwin, the same retained descriptors
+also bind the canonical kernel-ordered extended-ACL digest. Sensitive state and
+external artifact leaves must have no extended ACL; custody ancestors may have
+deny-only entries, but any allow entry fails closed. Other platforms persist the
+explicit POSIX-only ACL model without claiming extended-ACL enforcement. Recovery
+reopens the exact chain with `create=False` before any state after-image, again at
+the external write, and again before commit. Commit publication retains
+descriptors for the bound parent and exact private after-image leaf, then
+revalidates both after the commit write; failure removes only that exact new
+commit and leaves the intent pending. A missing, symlinked, non-directory, or
+rebound component or changed access policy blocks recovery, and the helper never
+recreates the parent. Recovery repairs a missing committed after-image only from
+a parent-bound WAL. A committed legacy version 1 WAL without a parent binding is
+checked read-only, while a pending legacy external WAL fails closed and is never
+rebound to the current pathname. A persisted state marker without the version 1
+ACL binding also fails closed. Timestamps, directory size, link count, and
+ordinary child-entry churn are not mutation evidence and do not block recovery.
+A non-cooperating same-UID process can still replace an artifact after the
+terminal revalidation; that post-terminal host mutation is outside this local
+transaction guarantee.
 
 Only cases bound by the immutable helper preflight and a strictly later trusted
 version 1 `publication-selection` approval are eligible. Together they bind the
@@ -225,7 +231,9 @@ helper-defined `publication-approval` receipt before acting. That receipt binds
 Joey's exact approved subset to the selection, plan, and finalized manifest. Only
 after verifying the approved publication outcome may that separate workflow call
 `close-publication` with both its closure receipt and `--publish-receipt`; the
-scheduled Weekly never creates either receipt or calls that command.
+scheduled Weekly never creates either receipt or calls that command. Publication
+approval and a finalized manifest never authorize the later repair decision; that
+requires a distinct interactive receipt after the exact `published` closure.
 
 The manifest defines the exact scope that Joey's later publish approval may bind:
 

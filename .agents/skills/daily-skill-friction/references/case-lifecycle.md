@@ -43,7 +43,8 @@ its top-level integer revision and `currentness_checked_at`. Always obtain it fr
 6. after either verified merge or a separate interactive cancellation/staleness
    decision, close the active publication control state with an exact receipt
    while retaining its immutable plan, manifest, and closure history;
-7. make a separate repair decision only after the ledger case is published;
+7. after a verified `published` closure, persist Joey's separate exact repair
+   approval and consume it once when staging the bound next revision;
 8. install the selected repair and begin effectiveness observation;
 9. mark the case effective, dormant, superseded, or no longer applicable.
 
@@ -56,8 +57,9 @@ The selection receipt, pending commit, manifest, publication approval, and PR
 workflow state belong to host-local control state, not the ledger case schema.
 Selection approval authorizes only local preparation; publication approval
 authorizes only the later bound push and PR; neither authorizes a repair. The
-ledger case status `approved` means repair-approved and cannot occur before step 5.
-Never let an automation infer steps 2, 4, or 6.
+ledger case status `approved` means repair-approved and occurs only through the
+separate authority and consumption in step 7.
+Never let a scheduled automation infer steps 2, 4, 6, or 7.
 
 The later interactive publisher records a verified published outcome through:
 
@@ -82,6 +84,49 @@ A changed currentness outcome or applicability is semantic and must advance the
 revision and semantic digest. Every lifecycle-status change and every other value
 included in the helper's canonical semantic projection must likewise increment
 the integer revision and recompute that digest.
+
+## Interactive Repair Approval
+
+This is a separate interactive control-plane action, not a scheduled Daily or
+Weekly mode. Start with the current `proposed` wrapper and construct the exact
+target wrapper at source revision plus one. The target may change only the
+lifecycle fields needed for `proposed` to `approved`, the active repair state from
+`planned` to `planned` or `open`, and that active repair's pull-request URL. It
+must not change evidence, scope, lineage, title, cause, applicability, repair
+history, or another semantic field. A same-outcome refresh to only
+`currentness_checked_at` does not invalidate the semantic tuple.
+
+The version 1 `repair-approval` receipt has exact top-level fields `version`,
+`kind`, `approval_id`, `interaction`, `expires_at`, `source`, `target`, and
+`publication`. `source` and `target` each bind the exact case ID, integer revision,
+and helper-produced canonical semantic digest. `interaction` is exactly
+`interactive: true`, `actor: Joey`, and `approved_at`. `publication` binds the
+exact committed `published` closure ID/digest, selection ID, plan and manifest
+digests, ledger pull-request URL, squash commit, and `merged_at`. The helper
+requires `approved_at` to be strictly later than both `merged_at` and the closure
+time, no later than the invocation time, and before `expires_at`; validity may not
+exceed seven days.
+
+Only after Joey makes that exact decision, run:
+
+```text
+/Users/hoteng/.local/share/uv/python/cpython-3.14.2-macos-aarch64-none/bin/python3.14 -I -B -S /Users/hoteng/Program/GitHub/Joey-Tools/codex-workspace/.codex-local/daily-skill-friction/repos/codex-host-workflows/.agents/skills/daily-skill-friction/scripts/friction_state.py approve-repair --state-root <DIR> --candidate <APPROVED-CANDIDATE> --approval <RECEIPT> --now <ISO> --confirm-interactive-joey-decision
+```
+
+The explicit confirmation flag attests the current interactive handoff; a caller
+must not set it from an unattended run. Success immutably writes the receipt and
+its exact source/target index in one committed `approve-repair` WAL transaction.
+The helper accepts neither a publication approval nor an uncommitted, cancelled,
+or stale closure as repair authority.
+
+Then call `stage` on only that bound target. The stage transaction revalidates the
+source and target semantic tuples, full closed repair delta, published closure
+provenance, authority WAL, time window, and unused state. It atomically writes one
+immutable consumption record together with the approved case and stage receipt.
+One authority permits one consumption; a different target, forged closure,
+expired receipt, or already consumed authority fails closed. Recovery or exact
+replay completes or returns the same committed transaction rather than consuming
+the decision again.
 
 ## Dormancy
 

@@ -1,0 +1,63 @@
+# Kept separate from generated CI because these tests exercise Darwin process and launchd behavior.
+name: Host macOS
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: host-macos-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  host-control:
+    name: Host control (macOS 15, Python 3.12.12)
+    runs-on: macos-15
+    timeout-minutes: 30
+    env:
+      UV_PYTHON_DOWNLOADS: never
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12.12'
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: '0.10.7'
+
+      - name: Report host toolchain
+        run: |
+          sw_vers
+          uname -m
+          python --version
+          uv --version
+
+      - name: Install locked development dependencies
+        run: uv sync --locked --group dev --python 3.12.12
+
+      - name: Check host-control formatting
+        run: uv run ruff format --check scripts/host_setup.py tests/test_host_setup.py
+
+      - name: Lint host-control Python
+        run: uv run ruff check scripts/host_setup.py tests/test_host_setup.py
+
+      - name: Type-check Python
+        run: uv run pyright
+
+      - name: Validate LaunchAgent plists with macOS
+        run: plutil -lint launchd/*.plist
+
+      - name: Test host-control behavior on macOS
+        run: uv run pytest -q tests/test_host_setup.py
