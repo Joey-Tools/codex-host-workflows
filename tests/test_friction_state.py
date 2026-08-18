@@ -27,7 +27,7 @@ VENDORED_LEDGER_ROOT = REPO_ROOT / "tests" / "fixtures" / "ledger_authority"
 LEDGER_VALIDATOR_PATH = VENDORED_LEDGER_ROOT / "scripts" / "validate_ledger.py"
 LEDGER_SCHEMA_PATH = VENDORED_LEDGER_ROOT / "schema" / "case.schema.json"
 LEDGER_MANIFEST_PATH = VENDORED_LEDGER_ROOT / "manifest.json"
-LEDGER_VALIDATOR_SHA256 = "63334ea90199215ab87abda5eb28551cc8c5780ce0b617f4e0e1cdbeb722f9b8"
+LEDGER_VALIDATOR_SHA256 = "b1200da23b4096b129f838acaee4937b33707e4c236bc7f2a2fc7ff83b52ad8f"
 LEDGER_SCHEMA_SHA256 = "10d29a101954e8c08e7c316d59dde3fb92d3ff53d719883ad9cf3204f23c2940"
 LEDGER_FIXTURE_DIGEST = "sha256:d90daeb497afd84872eda842dac8315aee0b60a18de98135e0dff7187408efb3"
 
@@ -510,8 +510,7 @@ def _wrapper_for_case(case: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _repair_lifecycle_candidates() -> list[dict[str, Any]]:
-    proposed = _candidate(status="proposed")
+def _with_planned_repair(proposed: dict[str, Any]) -> dict[str, Any]:
     case_id = proposed["case"]["id"]
     proposed["case"]["repairs"] = [
         {
@@ -538,6 +537,17 @@ def _repair_lifecycle_candidates() -> list[dict[str, Any]]:
         "behavioral": None,
     }
     proposed["control"]["semantic_digest"] = fs.semantic_digest(proposed["case"])
+    return proposed
+
+
+def _repair_lifecycle_candidates() -> list[dict[str, Any]]:
+    proposed = _with_planned_repair(
+        _candidate(
+            occurrences=[_occurrence(0), _occurrence(1)],
+            result="repeated",
+            status="proposed",
+        )
+    )
 
     approved = json.loads(json.dumps(proposed))
     approved["case"]["revision"] = 2
@@ -757,14 +767,15 @@ def _closed_reopen_candidate(
     wrapper["case"]["evidence"].append(occurrence)
     wrapper["case"]["evidence_last_seen"] = observed_at
     wrapper["case"]["currentness_checked_at"] = observed_at
+    evidence = wrapper["case"]["evidence"]
     wrapper["case"]["causal"].update(
         {
-            "occurrence_count": 2,
-            "root_task_count": 2,
-            "workflow_count": 1,
-            "repository_count": 1,
-            "opportunity_count": 2,
-            "causal_signature_count": 1,
+            "occurrence_count": len(evidence),
+            "root_task_count": len({item["root_task_id"] for item in evidence}),
+            "workflow_count": len({item["workflow_id"] for item in evidence}),
+            "repository_count": len({item["repository"] for item in evidence}),
+            "opportunity_count": len({item["opportunity_id"] for item in evidence}),
+            "causal_signature_count": len({item["causal_signature"] for item in evidence}),
         }
     )
     wrapper["case"]["lifecycle_changed_at"] = "2026-06-21T12:01:00Z"
@@ -1073,6 +1084,30 @@ def test_frozen_ledger_authority_identity_and_local_vector_do_not_skip() -> None
         assert hashlib.sha256(sibling.read_bytes()).hexdigest() == LEDGER_VALIDATOR_SHA256
 
 
+def test_frozen_ledger_authority_rejects_superseded_semantic_mutation() -> None:
+    ledger = _load_ledger_validator()
+    path = PurePosixPath("cases/2026/DSF-01a00f29-e900-7000-8000-000000000001.json")
+    base = _ledger_compatibility_case()
+    base["revision"] = 2
+    base["status"] = "superseded"
+    base["lifecycle_changed_at"] = "2026-08-17T10:35:00Z"
+    base["lifecycle"]["superseded_by"] = fs.new_case_id("2026-08-17T10:40:00Z")
+    assert ledger.validate_case(base, path) == []
+
+    changed = json.loads(json.dumps(base))
+    changed["revision"] += 1
+    changed["title"] = "Rewritten terminal history"
+    assert ledger.semantic_case_digest(changed) != ledger.semantic_case_digest(base)
+    assert ledger._validate_history_transition(base, changed, path) == [
+        f"{path}: superseded case canonical semantic digest is immutable"
+    ]
+
+    refreshed = json.loads(json.dumps(base))
+    refreshed["currentness_checked_at"] = "2026-08-18T10:30:00Z"
+    assert ledger.semantic_case_digest(refreshed) == ledger.semantic_case_digest(base)
+    assert ledger._validate_history_transition(base, refreshed, path) == []
+
+
 def test_all_control_candidate_shapes_and_weekly_export_are_ledger_clean(tmp_path: Path) -> None:
     ledger = _load_ledger_validator()
 
@@ -1298,22 +1333,105 @@ def test_new_case_rejects_every_structurally_valid_skipped_lifecycle(
         assert not (root / fs._case_relative_path(candidate)).exists()
 
 
-def test_new_case_allows_watching_and_proposed(tmp_path: Path) -> None:
-    candidates = {
-        "watching": _candidate(),
-        "proposed": _repair_lifecycle_candidates()[0],
-    }
-    for status, candidate in candidates.items():
-        receipt = fs.stage_candidate(
-            _write(tmp_path / status / "candidate.json", candidate),
-            tmp_path / status / "state",
+def test_new_case_requires_repeated_support_to_enter_proposed(tmp_path: Path) -> None:
+    watching = _candidate()
+    watching_receipt = fs.stage_candidate(
+        _write(tmp_path / "watching" / "candidate.json", watching),
+        tmp_path / "watching" / "state",
+        "2026-07-10T12:00:00Z",
+    )
+    assert watching_receipt["action"] == "created"
+    assert (
+        fs._load_json(Path(watching_receipt["path"]).parents[2] / watching_receipt["case_path"])[
+            "case"
+        ]["status"]
+        == "watching"
+    )
+
+    novel_proposed = _with_planned_repair(_candidate(status="proposed"))
+    assert fs.validate_candidate(novel_proposed)["support"] == "novel"
+    novel_root = tmp_path / "novel-proposed" / "state"
+    with pytest.raises(fs.StateError, match="entering proposed requires repeated support") as novel:
+        fs.stage_candidate(
+            _write(tmp_path / "novel-proposed" / "candidate.json", novel_proposed),
+            novel_root,
             "2026-07-10T12:00:00Z",
         )
-        assert receipt["action"] == "created"
-        assert (
-            fs._load_json(Path(receipt["path"]).parents[2] / receipt["case_path"])["case"]["status"]
-            == status
+    assert novel.value.code == "insufficient-proposed-support"
+    assert not (novel_root / fs._case_relative_path(novel_proposed)).exists()
+
+    repeated_proposed = _repair_lifecycle_candidates()[0]
+    proposed_receipt = fs.stage_candidate(
+        _write(tmp_path / "repeated-proposed" / "candidate.json", repeated_proposed),
+        tmp_path / "repeated-proposed" / "state",
+        "2026-07-10T12:00:00Z",
+    )
+    assert proposed_receipt["action"] == "created"
+    stored = fs._load_json(
+        Path(proposed_receipt["path"]).parents[2] / proposed_receipt["case_path"]
+    )
+    assert stored["case"]["status"] == "proposed"
+    assert stored["case"]["support"] == "repeated"
+
+
+def test_existing_case_promotion_to_proposed_requires_repeated_support(tmp_path: Path) -> None:
+    watching = _candidate()
+    root, _ = _stage(tmp_path, watching)
+
+    novel_promotion = json.loads(json.dumps(watching))
+    novel_promotion["case"]["revision"] = 2
+    novel_promotion["case"]["status"] = "proposed"
+    novel_promotion["case"]["lifecycle_changed_at"] = "2026-06-02T12:00:00Z"
+    _with_planned_repair(novel_promotion)
+    assert fs.validate_candidate(novel_promotion)["support"] == "novel"
+    before = _persistent_identity_snapshot(root)
+    with pytest.raises(fs.StateError, match="entering proposed requires repeated support") as novel:
+        fs.stage_candidate(
+            _write(tmp_path / "novel-promotion.json", novel_promotion),
+            root,
+            "2026-07-10T12:30:00Z",
         )
+    assert novel.value.code == "insufficient-proposed-support"
+    assert _persistent_identity_snapshot(root) == before
+    assert fs._load_json(root / fs._case_relative_path(watching))["case"]["status"] == "watching"
+
+    repeated_promotion = _with_planned_repair(
+        _candidate(
+            case_id=watching["case"]["id"],
+            occurrences=[_occurrence(0), _occurrence(1)],
+            result="repeated",
+            status="proposed",
+            revision=2,
+            lifecycle_at="2026-06-02T12:00:00Z",
+        )
+    )
+    promoted = fs.stage_candidate(
+        _write(tmp_path / "repeated-promotion.json", repeated_promotion),
+        root,
+        "2026-07-10T13:00:00Z",
+    )
+    assert promoted["action"] == "updated"
+    stored = fs._load_json(root / promoted["case_path"])
+    assert stored["case"]["status"] == "proposed"
+    assert stored["case"]["support"] == "repeated"
+
+    refreshed = json.loads(json.dumps(repeated_promotion))
+    refreshed["case"]["currentness_checked_at"] = "2026-07-11T12:00:00Z"
+    refreshed_receipt = fs.stage_candidate(
+        _write(tmp_path / "proposed-currentness.json", refreshed),
+        root,
+        "2026-07-11T12:01:00Z",
+    )
+    refreshed_stored = fs._load_json(root / refreshed_receipt["case_path"])
+    assert refreshed_stored["case"]["revision"] == 2
+    assert (
+        refreshed_stored["control"]["semantic_digest"]
+        == repeated_promotion["control"]["semantic_digest"]
+    )
+    assert (
+        refreshed_stored["case"]["lifecycle_changed_at"]
+        == repeated_promotion["case"]["lifecycle_changed_at"]
+    )
 
 
 def test_source_kind_cannot_bypass_initial_lifecycle(tmp_path: Path) -> None:
@@ -1992,6 +2110,64 @@ def test_finalize_requires_exact_receipts_rejects_drift_and_is_idempotent(tmp_pa
         "2026-07-12T08:06:00Z",
     )
     assert closure_result["status"] == "closed"
+
+
+def test_finalize_rejects_base_commit_before_claiming_immutable_writer(tmp_path: Path) -> None:
+    case = _candidate()
+    root, stage = _stage(tmp_path, case)
+    completed = _complete_live(tmp_path, root, [stage])
+    selection = _approved_selection(tmp_path, root, completed["snapshot_digest"], [case])
+    plan_path = tmp_path / "base-commit-plan.json"
+    fs.weekly_plan(
+        root,
+        _write(tmp_path / "base-commit-selection.json", selection),
+        plan_path,
+        "2026-07-11T08:01:00Z",
+    )
+    plan = fs._load_json(plan_path)
+    invalid_prepared = _prepared_receipt(plan)
+    base_sha = plan["base_intent"]["base_sha"]
+    invalid_prepared["entries"][0]["commit_sha"] = base_sha
+    invalid_prepared["entries"][0]["signature"]["commit_sha"] = base_sha
+    output = tmp_path / "base-commit-manifest.json"
+    before = _persistent_identity_snapshot(root)
+
+    with pytest.raises(fs.StateError, match="must differ from the bound base SHA") as invalid:
+        fs.finalize_publication(
+            root,
+            plan_path,
+            _write(tmp_path / "base-commit-prepared.json", invalid_prepared),
+            output,
+            "2026-07-11T08:32:00Z",
+        )
+    assert invalid.value.code == "prepared-base-commit"
+    assert _persistent_identity_snapshot(root) == before
+    assert not output.exists()
+    natural_key = f"{plan['selection_id']}:{plan['plan_digest']}"
+    intent_path, commit_path = fs._wal_paths("finalize-publication", natural_key)
+    assert not (root / intent_path).exists()
+    assert not (root / commit_path).exists()
+    assert not (root / "publication" / "manifests" / f"{plan['selection_id']}.json").exists()
+    assert not (root / "publication" / "prepared" / f"{plan['selection_id']}.json").exists()
+
+    valid_prepared = _prepared_receipt(plan)
+    valid_prepared_path = _write(tmp_path / "advanced-commit-prepared.json", valid_prepared)
+    first = fs.finalize_publication(
+        root,
+        plan_path,
+        valid_prepared_path,
+        output,
+        "2026-07-11T08:32:00Z",
+    )
+    replay = fs.finalize_publication(
+        root,
+        plan_path,
+        valid_prepared_path,
+        output,
+        "2026-07-11T08:32:00Z",
+    )
+    assert replay == first
+    assert fs._load_json(output)["entries"][0]["commit_sha"] != base_sha
 
 
 def test_finalize_public_conflict_does_not_repair_prior_external_output(

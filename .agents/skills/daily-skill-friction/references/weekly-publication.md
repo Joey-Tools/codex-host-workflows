@@ -276,7 +276,9 @@ For each selected case returned in the validated Weekly plan:
 6. Create one signed local commit whose subject names the concrete case problem.
    Do not mix cases or control-plane changes.
 7. Freeze a publication entry binding case ID/revision, branch, commit SHA, base
-   SHA, changed paths, validation result, and verified signature evidence.
+   SHA, changed paths, validation result, and verified signature evidence. The
+   prepared commit SHA must differ from the bound base SHA; the base tree itself
+   is not a prepared case commit.
 
 A signing failure is a blocker. Do not try alternate identities, unsigned commits,
 or a replacement branch. An already prepared exact commit is immutable.
@@ -300,15 +302,15 @@ preapproval finalization envelope. Then call:
 Require JSON `status: finalized`, manifest path, and manifest digest. The helper
 must revalidate the registered immutable plan, the selected cases' unchanged
 integer revisions and canonical semantic digests, the exact prepared set, branch,
-base, changed paths, local validation, and signature evidence before atomically
-writing the final batch manifest. A newer Daily snapshot or a same-outcome change
-only to `currentness_checked_at` may be recorded but cannot block finalization by
-itself. Preserve the helper's `finalized_against_current_snapshot_digest` as
-additional provenance, fixed ordering, and full digest. Semantic drift blocks
-finalization; never repair it by moving a branch or replacing a commit. The
-helper measures the actual prepared receipt, manifest, and finalize WAL against
-the selection's approved publication/finalization bounds before creating that
-transaction.
+base, a commit SHA distinct from that base, changed paths, local validation, and
+signature evidence before atomically writing the final batch manifest. A newer
+Daily snapshot or a same-outcome change only to `currentness_checked_at` may be
+recorded but cannot block finalization by itself. Preserve the helper's
+`finalized_against_current_snapshot_digest` as additional provenance, fixed
+ordering, and full digest. Semantic drift blocks finalization; never repair it by
+moving a branch or replacing a commit. The helper measures the actual prepared
+receipt, manifest, and finalize WAL against the selection's approved
+publication/finalization bounds before creating that transaction.
 
 The state helper never executes Git and therefore validates structured bindings,
 not the external repository by itself. Obtain every prepared field from direct

@@ -6611,6 +6611,11 @@ def _validate_case_delta(existing: Mapping[str, Any], candidate: Mapping[str, An
             "invalid-lifecycle-transition",
             f"invalid lifecycle transition {old_case['status']} -> {new_case['status']}",
         )
+    if status_changed and new_case["status"] == "proposed" and new_case["support"] != "repeated":
+        _fail(
+            "insufficient-proposed-support",
+            "entering proposed requires repeated support",
+        )
     if old_case["status"] == "dormant" and new_case["status"] in {"watching", "proposed"}:
         if new_case["status"] != old_case["lifecycle"]["dormant_from_status"]:
             _fail("invalid-reactivation", "dormant case may reactivate only to its origin status")
@@ -7500,6 +7505,11 @@ def stage_candidate(candidate_path: Path, state_root: Path, now: str) -> dict[st
                     "invalid-initial-lifecycle",
                     "a new case must start at watching or proposed; source_kind does not "
                     "authorize a lifecycle import",
+                )
+            if summary["status"] == "proposed" and summary["support"] != "repeated":
+                _fail(
+                    "insufficient-proposed-support",
+                    "entering proposed requires repeated support",
                 )
             if summary["revision"] != 1:
                 _fail("revision-order", "a new case must start at revision 1")
@@ -9349,6 +9359,11 @@ def _validate_prepared_entry(
     commit_sha = _require_string(entry.get("commit_sha"), "commit_sha")
     if GIT_SHA_RE.fullmatch(commit_sha) is None:
         _fail("invalid-git-sha", f"invalid commit SHA for {case_id}")
+    if commit_sha == entry["base_sha"]:
+        _fail(
+            "prepared-base-commit",
+            f"prepared commit must differ from the bound base SHA for {case_id}",
+        )
     validation = _require_object(entry.get("validation"), "validation")
     _exact_fields(validation, "prepared.validation", {"status", "commands", "validated_at"})
     if validation.get("status") != "passed":

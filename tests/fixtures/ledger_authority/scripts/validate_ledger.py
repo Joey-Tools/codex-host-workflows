@@ -2400,6 +2400,13 @@ def _validate_history_transition(
             f"{base_case.get('currentness_checked_at')!r}"
         )
 
+    if base_status == "superseded" and semantic_case_digest(
+        current_case
+    ) != semantic_case_digest(base_case):
+        errors.append(
+            f"{relative_path}: superseded case canonical semantic digest is immutable"
+        )
+
     base_lifecycle = base_case.get("lifecycle")
     current_lifecycle = current_case.get("lifecycle")
     if isinstance(base_lifecycle, dict) and isinstance(current_lifecycle, dict):
