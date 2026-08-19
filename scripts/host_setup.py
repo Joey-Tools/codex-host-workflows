@@ -66,6 +66,7 @@ EXCLUDE_ENTRY = "/.agents/skills/daily-skill-friction"
 EXCLUDE_END = "# <<< codex-host-workflows daily-skill-friction <<<"
 STAMP_NAME_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,79}\Z")
 REPO_NAME_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
+RETIRED_REPO_NAME_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}\Z")
 LAUNCH_AGENT_LABEL_PATTERN = re.compile(
     r"(?=.{3,128}\Z)(?:[A-Za-z0-9][A-Za-z0-9-]*\.){2,}"
     r"[A-Za-z0-9][A-Za-z0-9-]*\Z"
@@ -274,6 +275,7 @@ class WorkspaceManifest:
     path: Path
     cache_root: Path
     repos: tuple[RepoSpec, ...]
+    retired_repo_names: tuple[str, ...]
     snapshot: FileSnapshot
 
     @property
@@ -854,7 +856,15 @@ class CommandRunner:
         config_fields = tuple(field.name for field in dataclasses.fields(config_type))
         if repo_fields != ("name", "url", "default_branch", "visibility"):
             raise SetupError("workspace helper RepoSpec constructor fields drifted")
-        if config_fields != ("root", "cache_root", "repos"):
+        legacy_config_fields = ("root", "cache_root", "repos")
+        current_config_fields = (*legacy_config_fields, "retired_repo_names")
+        if config_fields == legacy_config_fields:
+            if manifest.retired_repo_names:
+                raise SetupError(
+                    "workspace helper legacy WorkspaceConfig cannot preserve non-empty "
+                    "retired_repo_names"
+                )
+        elif config_fields != current_config_fields:
             raise SetupError("workspace helper WorkspaceConfig constructor fields drifted")
 
         repo_factory = cast(Any, repo_type)
@@ -874,11 +884,14 @@ class CommandRunner:
             )
             for repo in manifest.repos
         )
-        bound_config = config_factory(
-            root=manifest.root,
-            cache_root=manifest.cache_root,
-            repos=repos,
-        )
+        config_arguments: dict[str, object] = {
+            "root": manifest.root,
+            "cache_root": manifest.cache_root,
+            "repos": repos,
+        }
+        if config_fields == current_config_fields:
+            config_arguments["retired_repo_names"] = manifest.retired_repo_names
+        bound_config = config_factory(**config_arguments)
 
         def bound_load_config(requested: object) -> object:
             try:
@@ -1629,7 +1642,38 @@ def _workspace_manifest_from_snapshot(
     if expected_cache_root is not None and cache_root != expected_cache_root:
         raise SetupError(f"{label} cache_root does not match the host cache root")
     repos = _parse_repo_specs(data.get("repos"), label=label)
-    return WorkspaceManifest(path=path, cache_root=cache_root, repos=repos, snapshot=snapshot), data
+    raw_retired_repo_names = data.get("retired_repo_names", [])
+    if not isinstance(raw_retired_repo_names, list) or any(
+        not isinstance(name, str) for name in raw_retired_repo_names
+    ):
+        raise SetupError(f"{label} retired_repo_names must be an array of strings")
+    retired_repo_names = tuple(raw_retired_repo_names)
+    invalid_retired_names = [
+        name for name in retired_repo_names if not RETIRED_REPO_NAME_PATTERN.fullmatch(name)
+    ]
+    if invalid_retired_names:
+        raise SetupError(
+            f"{label} retired_repo_names contains invalid names: "
+            + ", ".join(repr(name) for name in invalid_retired_names)
+        )
+    if len(set(retired_repo_names)) != len(retired_repo_names):
+        raise SetupError(f"{label} retired_repo_names must not contain duplicates")
+    active_names = {repo.name for repo in repos}
+    overlap = sorted(active_names.intersection(retired_repo_names))
+    if overlap:
+        raise SetupError(
+            f"{label} repositories cannot be both active and retired: " + ", ".join(overlap)
+        )
+    return (
+        WorkspaceManifest(
+            path=path,
+            cache_root=cache_root,
+            repos=repos,
+            retired_repo_names=retired_repo_names,
+            snapshot=snapshot,
+        ),
+        data,
+    )
 
 
 def load_workspace_manifest(
@@ -1655,6 +1699,8 @@ def load_config(path: Path) -> HostConfig:
     manifest, data = _workspace_manifest_from_snapshot(path, snapshot, label="host manifest")
     if len(manifest.repos) != 1 or manifest.repos[0].name != "codex-host-workflows":
         raise SetupError("host manifest must list only codex-host-workflows")
+    if manifest.retired_repo_names:
+        raise SetupError("host manifest retired_repo_names must be empty")
     host = data.get("host_setup")
     if not isinstance(host, dict):
         raise SetupError("host manifest must define [host_setup]")
@@ -5917,6 +5963,7 @@ def _run_ensure(config: HostConfig, runner: CommandRunner) -> None:
         path=config.path,
         cache_root=config.cache_root,
         repos=(config.control_repo,),
+        retired_repo_names=(),
         snapshot=config.manifest_snapshot,
     )
     main_manifest = _load_main_manifest(config)
@@ -7230,6 +7277,7 @@ def _initial_preflight_checks(
         path=config.path,
         cache_root=config.cache_root,
         repos=(config.control_repo,),
+        retired_repo_names=(),
         snapshot=config.manifest_snapshot,
     )
     try:

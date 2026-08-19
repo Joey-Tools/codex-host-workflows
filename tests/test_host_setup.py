@@ -519,6 +519,20 @@ def _active(fixture: HostFixture) -> hs.HostConfig:
     return hs.load_config(fixture.config.control_mirror_manifest)
 
 
+def _set_main_retired_repo_names(fixture: HostFixture, names: Sequence[str]) -> None:
+    manifest_path = fixture.workspace / "workspace.toml"
+    source = manifest_path.read_text(encoding="utf-8")
+    encoded_names = ", ".join(json.dumps(name) for name in names)
+    manifest_path.write_text(
+        source.replace(
+            "\n\n[[repos]]",
+            f"\nretired_repo_names = [{encoded_names}]\n\n[[repos]]",
+            1,
+        ),
+        encoding="utf-8",
+    )
+
+
 def _append_local_config(repository: Path, content: str) -> None:
     config = repository / ".git" / "config"
     config.write_text(
@@ -537,10 +551,21 @@ def _configure_managed_mirror_hooks(repository: Path) -> None:
         hook.chmod(0o755)
 
 
-def _write_bound_helper_fixture(path: Path, *, loaded_marker: Path | None = None) -> None:
+def _write_bound_helper_fixture(
+    path: Path,
+    *,
+    loaded_marker: Path | None = None,
+    current_workspace_config: bool = False,
+) -> None:
     marker_statement = (
         f"    Path({str(loaded_marker)!r}).write_text('loaded', encoding='utf-8')\n"
         if loaded_marker is not None
+        else ""
+    )
+    retired_field = "    retired_repo_names: tuple[str, ...]\n" if current_workspace_config else ""
+    retired_output = (
+        "        'retired_repo_names': list(config.retired_repo_names),\n"
+        if current_workspace_config
         else ""
     )
     path.write_text(
@@ -563,6 +588,7 @@ def _write_bound_helper_fixture(path: Path, *, loaded_marker: Path | None = None
         "    root: Path\n"
         "    cache_root: Path\n"
         "    repos: tuple[RepoSpec, ...]\n"
+        f"{retired_field}"
         "    def repo_path(self, repo: RepoSpec) -> Path:\n"
         "        return self.cache_root / 'repos' / repo.name\n"
         "def load_config(path: Path) -> WorkspaceConfig:\n"
@@ -587,6 +613,7 @@ def _write_bound_helper_fixture(path: Path, *, loaded_marker: Path | None = None
         "        'root': str(config.root),\n"
         "        'cache_root': str(config.cache_root),\n"
         "        'repos': [dataclasses.asdict(repo) for repo in config.repos],\n"
+        f"{retired_output}"
         "    }, sort_keys=True))\n"
         "    return 0\n"
         "if __name__ == '__main__':\n"
@@ -740,6 +767,66 @@ def test_production_manifest_and_both_launch_agents_are_exact() -> None:
     assert control["ProgramArguments"][-1] == "prefetch-control"
     assert weekly["ProgramArguments"][-1] == "prefetch-weekly"
     assert weekly["StartCalendarInterval"] == {"Weekday": 5, "Hour": 6, "Minute": 30}
+
+
+@pytest.mark.parametrize(
+    ("raw_value", "message"),
+    [
+        ('"retired"', "must be an array of strings"),
+        ("[1]", "must be an array of strings"),
+        ('["bad/name"]', "contains invalid names"),
+        (f"[{json.dumps('a' * 101)}]", "contains invalid names"),
+        ('["retired", "retired"]', "must not contain duplicates"),
+        ('["alpha"]', "cannot be both active and retired"),
+    ],
+)
+def test_main_manifest_rejects_invalid_retired_repo_names(
+    tmp_path: Path,
+    raw_value: str,
+    message: str,
+) -> None:
+    fixture = _build_host(tmp_path)
+    manifest_path = fixture.workspace / "workspace.toml"
+    source = manifest_path.read_text(encoding="utf-8")
+    manifest_path.write_text(
+        source.replace(
+            "\n\n[[repos]]",
+            f"\nretired_repo_names = {raw_value}\n\n[[repos]]",
+            1,
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(hs.SetupError, match=message):
+        hs._load_main_manifest(fixture.config)
+
+
+def test_host_manifest_requires_empty_retired_repo_names(tmp_path: Path) -> None:
+    fixture = _build_host(tmp_path)
+    manifest_path = fixture.control_source / "config" / "host-workspace.toml"
+    source = manifest_path.read_text(encoding="utf-8")
+    manifest_path.write_text(
+        source.replace(
+            "\n\n[host_setup]",
+            "\nretired_repo_names = []\n\n[host_setup]",
+            1,
+        ),
+        encoding="utf-8",
+    )
+
+    assert hs.load_config(manifest_path).control_repo.name == "codex-host-workflows"
+
+    manifest_path.write_text(
+        source.replace(
+            "\n\n[host_setup]",
+            '\nretired_repo_names = ["legacy-control"]\n\n[host_setup]',
+            1,
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(hs.SetupError, match="host manifest retired_repo_names must be empty"):
+        hs.load_config(manifest_path)
 
 
 def test_managed_mirror_hook_contract_matches_independent_fixed_fixture() -> None:
@@ -4884,6 +4971,88 @@ def test_bound_helper_consumes_inherited_manifest_during_replace_restore_aba(
     }
     assert swapped is True
     assert not malicious_marker.exists()
+
+
+def test_bound_helper_preserves_retired_repo_names_for_current_api(tmp_path: Path) -> None:
+    fixture = _build_host(tmp_path)
+    active = _active(fixture)
+    retired_names = ("a" * 100, "retired-two")
+    _set_main_retired_repo_names(fixture, retired_names)
+    _write_bound_helper_fixture(
+        active.workspace_helper,
+        current_workspace_config=True,
+    )
+    manifest = hs._load_main_manifest(active)
+
+    result = hs._run_helper(
+        active,
+        manifest,
+        ["status"],
+        ForkTestRunner(timeout_seconds=5),
+    )
+
+    assert result.returncode == 0, result.stderr
+    observed = json.loads(result.stdout)
+    assert observed["retired_repo_names"] == list(retired_names)
+    assert manifest.retired_repo_names == retired_names
+
+
+def test_bound_helper_rejects_nonempty_retired_names_for_legacy_api(tmp_path: Path) -> None:
+    fixture = _build_host(tmp_path)
+    active = _active(fixture)
+    _set_main_retired_repo_names(fixture, ("retired-one",))
+    _write_bound_helper_fixture(active.workspace_helper)
+
+    result = hs._run_helper(
+        active,
+        hs._load_main_manifest(active),
+        ["status"],
+        ForkTestRunner(timeout_seconds=5),
+    )
+
+    assert result.returncode == 1
+    assert "legacy WorkspaceConfig cannot preserve non-empty" in result.stderr
+
+
+@pytest.mark.parametrize("drift", ["extra", "reordered"])
+def test_bound_helper_rejects_current_workspace_config_field_drift(
+    tmp_path: Path,
+    drift: str,
+) -> None:
+    fixture = _build_host(tmp_path)
+    active = _active(fixture)
+    _write_bound_helper_fixture(
+        active.workspace_helper,
+        current_workspace_config=True,
+    )
+    source = active.workspace_helper.read_text(encoding="utf-8")
+    if drift == "extra":
+        replacement = "    retired_repo_names: tuple[str, ...]\n    extra: str = ''\n"
+    else:
+        source = source.replace(
+            "    repos: tuple[RepoSpec, ...]\n    retired_repo_names: tuple[str, ...]\n",
+            "    retired_repo_names: tuple[str, ...]\n    repos: tuple[RepoSpec, ...]\n",
+            1,
+        )
+        replacement = "    retired_repo_names: tuple[str, ...]\n"
+    if drift == "extra":
+        source = source.replace(
+            "    retired_repo_names: tuple[str, ...]\n",
+            replacement,
+            1,
+        )
+    active.workspace_helper.write_text(source, encoding="utf-8")
+    active.workspace_helper.chmod(0o755)
+
+    result = hs._run_helper(
+        active,
+        hs._load_main_manifest(active),
+        ["status"],
+        ForkTestRunner(timeout_seconds=5),
+    )
+
+    assert result.returncode == 1
+    assert "WorkspaceConfig constructor fields drifted" in result.stderr
 
 
 def test_bound_helper_fails_closed_when_expected_api_drifts(tmp_path: Path) -> None:
