@@ -148,10 +148,16 @@ an approval WAL contains exactly its immutable approval and index writes.
 Then call `stage` on only that bound target. The stage transaction revalidates the
 source and target semantic tuples, full closed repair delta, published closure
 provenance, authority WAL, time window, exact lifecycle decision time, and unused
-state. Pending stage WAL replay performs the same lifecycle-time check before any
-after-image. It atomically writes one immutable consumption record together with
-the approved case and stage receipt. One authority permits one consumption; a
-different target, forged closure,
+state. Its closed write set is an optional first-root marker followed by the exact
+immutable consumption and mutable active binding when approval-backed, the
+canonical mutable case, and one immutable stage receipt; no external, reordered,
+redirected, or additional write is permitted. Pending recovery accepts only a
+prefix of that write order and repeats the lifecycle, approval, and current
+binding proofs before any replay. An exact case after-image in a sealed
+`closed`-to-`proposed` reopen releases the old mutable binding, while every
+approval-bound after-image still requires either its exact in-flight
+consumption/binding pair or the current persisted binding. One authority permits
+one consumption; a different target, forged closure,
 expired receipt, or already consumed authority fails closed. Recovery or exact
 replay completes or returns the same committed transaction rather than consuming
 the decision again.

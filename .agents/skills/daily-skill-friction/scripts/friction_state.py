@@ -5522,6 +5522,7 @@ def _validate_wal_intent_domain(
         _validate_stage_intent_domain(
             store,
             intent,
+            committed=committed,
             recover_publication=recover_publication,
         )
     elif intent["operation"] == "approve-repair":
@@ -7907,27 +7908,17 @@ def _validate_approve_repair_intent_lifecycle(
 def _validate_stage_intent_repair_approval_lifecycle(
     store: StateStore,
     intent: Mapping[str, Any],
+    receipt: Mapping[str, Any],
+    target: Mapping[str, Any],
+    consumption_write: Mapping[str, Any],
+    consumption: Mapping[str, Any],
+    binding_write: Mapping[str, Any],
+    binding: Mapping[str, Any],
     *,
     recover_publication: bool = True,
-) -> None:
-    """Revalidate the approved lifecycle timestamp before replaying a stage WAL."""
+) -> dict[str, Any]:
+    """Bind one approval-backed stage projection to its immutable authority."""
 
-    consumptions: list[dict[str, Any]] = []
-    candidates: list[dict[str, Any]] = []
-    for index, raw_write in enumerate(_require_list(intent["writes"], "wal.writes")):
-        write = _require_object(raw_write, f"wal.writes[{index}]")
-        if write.get("scope") != "state":
-            continue
-        after = _require_object(write.get("after"), f"wal.writes[{index}].after")
-        if after.get("kind") == "repair-approval-consumption":
-            consumptions.append(after)
-        elif isinstance(after.get("case"), dict) and isinstance(after.get("control"), dict):
-            candidates.append(after)
-    if not consumptions:
-        return
-    if len(consumptions) != 1:
-        _fail("invalid-wal", "approval-bound stage intent must contain one consumption")
-    consumption = consumptions[0]
     _exact_fields(
         consumption,
         "wal.repair_approval_consumption",
@@ -7959,21 +7950,69 @@ def _validate_stage_intent_repair_approval_lifecycle(
         consumption.get("approval_digest"), "wal.consumption.approval_digest"
     )
     case_id = _validate_case_id(consumption.get("case_id"), "wal.consumption.case_id")
-    matching_candidates = [
-        candidate
-        for candidate in candidates
-        if _require_object(candidate.get("case"), "wal.candidate.case").get("id") == case_id
-    ]
-    if len(matching_candidates) != 1:
-        _fail("invalid-wal", "approval-bound stage intent must contain one target case")
-    target = matching_candidates[0]
-    validate_candidate(target)
+    approval_ref = _require_object(receipt.get("repair_approval"), "receipt.repair_approval")
     target_tuple = _case_tuple(target)
-    if any(
-        consumption.get(field) != target_tuple[field]
-        for field in ("case_id", "revision", "semantic_digest")
+    repair_binding = _repair_binding_projection(_require_object(target["case"], "target.case"))
+    consumed_at = _timestamp(consumption.get("consumed_at"), "wal.consumption.consumed_at")
+    if (
+        consumption_write.get("path") != f"repairs/consumptions/{approval_id}.json"
+        or consumption_write.get("before_sha256") is not None
+        or consumption_write.get("immutable") is not True
+        or approval_ref
+        != {
+            "approval_id": approval_id,
+            "approval_digest": approval_digest,
+        }
+        or case_id != target_tuple["case_id"]
+        or consumption.get("revision") != target_tuple["revision"]
+        or consumption.get("semantic_digest") != target_tuple["semantic_digest"]
+        or _normalize_repair_binding_projection(
+            consumption.get("repair_binding"), "wal.consumption.repair_binding"
+        )
+        != repair_binding
+        or consumed_at != receipt["created_at"]
+        or consumed_at != intent["captured_at"]
+        or consumption.get("stage_receipt_id") != receipt["receipt_id"]
     ):
-        _fail("invalid-wal", "stage consumption does not bind its target case")
+        _fail("invalid-wal", "stage consumption does not bind its exact approval and target")
+
+    _exact_fields(
+        binding,
+        "wal.active_repair_binding",
+        {
+            "version",
+            "kind",
+            "case_id",
+            "approval_id",
+            "approval_digest",
+            "target",
+            "repair_binding",
+            "consumption_digest",
+            "binding_digest",
+        },
+    )
+    binding_body = {key: value for key, value in binding.items() if key != "binding_digest"}
+    if (
+        binding.get("version") != VERSION
+        or binding.get("kind") != "active-repair-approval-binding"
+        or binding.get("binding_digest") != _digest(binding_body)
+        or binding_write.get("path") != f"repairs/bindings/{case_id}.json"
+        or binding_write.get("immutable") is not False
+        or (
+            binding_write.get("before_sha256") is not None
+            and binding_write.get("before_sha256") == binding_write.get("after_sha256")
+        )
+        or binding.get("case_id") != case_id
+        or binding.get("approval_id") != approval_id
+        or binding.get("approval_digest") != approval_digest
+        or _normalize_case_tuple_value(binding.get("target"), "wal.binding.target") != target_tuple
+        or _normalize_repair_binding_projection(
+            binding.get("repair_binding"), "wal.binding.repair_binding"
+        )
+        != repair_binding
+        or binding.get("consumption_digest") != consumption.get("consumption_digest")
+    ):
+        _fail("invalid-wal", "stage active binding does not match its exact consumption")
 
     approval_relative = Path("repairs") / "approvals" / f"{approval_id}.json"
     record = _read_state_json(
@@ -8020,25 +8059,139 @@ def _validate_stage_intent_repair_approval_lifecycle(
     )
     _validate_repair_approval_times(approval, closure, intent["captured_at"])
     _validate_repair_approval_lifecycle_time(approval, target)
+    return approval
+
+
+def _validate_pending_stage_case_transition(
+    store: StateStore,
+    candidate_write: Mapping[str, Any],
+    candidate: Mapping[str, Any],
+    repair_approval: Mapping[str, Any] | None,
+    *,
+    committed: bool,
+    recover_publication: bool,
+) -> None:
+    """Revalidate an unapplied existing-case transition without mutating state.
+
+    A pending stage whose case target is still the exact before-image must retain
+    every authority required by the original transition.  Once that same intent
+    has written its exact after-image, a sealed reopen has released the prior
+    mutable repair binding.  Committed mutable case targets may have advanced via
+    later transactions, so their immutable receipt remains the replay authority.
+    """
+
+    if committed or candidate_write.get("before_sha256") is None:
+        return
+    relative = Path(_require_string(candidate_write.get("path"), "wal.stage.case_path"))
+    if not store.exists(relative):
+        return
+    current = (
+        store.read_bytes(relative)
+        if recover_publication
+        else store.read_bytes_without_publication_recovery(relative)
+    )
+    if current[1] == candidate_write.get("before_sha256"):
+        existing = _json_from_bytes(current[0], str(store.root / relative))
+        validate_candidate(existing)
+        _validate_case_delta(existing, candidate)
+        _validate_persisted_repair_binding(
+            store,
+            existing,
+            candidate,
+            recover_publication=recover_publication,
+        )
+        approval_transition = (
+            existing["case"]["status"] == "proposed" and candidate["case"]["status"] == "approved"
+        )
+        if approval_transition:
+            if repair_approval is None or repair_approval["source"] != _case_tuple(existing):
+                _fail("invalid-wal", "stage approval does not bind its exact proposed source")
+            _validate_repair_approval_delta(existing, candidate)
+        elif repair_approval is not None:
+            _fail("invalid-wal", "stage repair approval does not bind proposed -> approved")
+        return
+    if current[1] == candidate_write.get("after_sha256"):
+        applied = _json_from_bytes(current[0], str(store.root / relative))
+        validate_candidate(applied)
+        if repair_approval is not None:
+            return
+        _validate_persisted_repair_binding(
+            store,
+            applied,
+            applied,
+            recover_publication=recover_publication,
+        )
+
+
+def _validate_pending_stage_write_prefix(
+    store: StateStore,
+    writes: Sequence[Mapping[str, Any]],
+    *,
+    committed: bool,
+    recover_publication: bool,
+) -> None:
+    """Require a pending stage to expose one exact write-order prefix."""
+
+    if committed:
+        return
+    reached_before_image = False
+    for write in writes:
+        relative = Path(_require_string(write.get("path"), "wal.stage.write.path"))
+        if store.exists(relative):
+            current = (
+                store.read_bytes(relative)
+                if recover_publication
+                else store.read_bytes_without_publication_recovery(relative)
+            )
+            current_digest: str | None = current[1]
+        else:
+            current_digest = None
+        before_digest = write.get("before_sha256")
+        after_digest = write.get("after_sha256")
+        if before_digest == after_digest and current_digest == before_digest:
+            continue
+        if current_digest == after_digest:
+            if reached_before_image:
+                _fail("invalid-wal", "pending stage after-images are not a write-order prefix")
+            continue
+        if current_digest == before_digest:
+            reached_before_image = True
 
 
 def _validate_stage_intent_domain(
     store: StateStore,
     intent: Mapping[str, Any],
     *,
+    committed: bool,
     recover_publication: bool = True,
 ) -> None:
+    markers: list[tuple[dict[str, Any], dict[str, Any]]] = []
     receipts: list[tuple[dict[str, Any], dict[str, Any]]] = []
     candidates: list[tuple[dict[str, Any], dict[str, Any]]] = []
-    for index, raw_write in enumerate(_require_list(intent["writes"], "wal.writes")):
-        write = _require_object(raw_write, f"wal.writes[{index}]")
+    consumptions: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    bindings: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    writes = [
+        _require_object(raw_write, f"wal.writes[{index}]")
+        for index, raw_write in enumerate(_require_list(intent["writes"], "wal.writes"))
+    ]
+    for index, write in enumerate(writes):
         if write.get("scope") != "state":
-            continue
+            _fail("invalid-wal", "stage intent cannot contain external writes")
         after = _require_object(write.get("after"), f"wal.writes[{index}].after")
         if after.get("kind") == "stage":
             receipts.append((write, after))
+        elif after.get("kind") == "daily-skill-friction-state":
+            markers.append((write, after))
+        elif after.get("kind") == "repair-approval-consumption":
+            consumptions.append((write, after))
+        elif after.get("kind") == "active-repair-approval-binding":
+            bindings.append((write, after))
         elif isinstance(after.get("case"), dict) and isinstance(after.get("control"), dict):
             candidates.append((write, after))
+        else:
+            _fail("invalid-wal", "stage intent contains an unrecognized state after-image")
+    if len(markers) > 1:
+        _fail("invalid-wal", "stage intent contains multiple state markers")
     if len(receipts) != 1:
         _fail("invalid-wal", "stage intent must contain one immutable stage receipt")
     receipt_write, receipt = receipts[0]
@@ -8047,33 +8200,160 @@ def _validate_stage_intent_domain(
     expected_receipt_path = f"receipts/stage/{receipt_id}.json"
     if (
         receipt_write.get("path") != expected_receipt_path
+        or receipt_write.get("before_sha256") is not None
         or receipt_write.get("immutable") is not True
     ):
         _fail("invalid-wal", "stage receipt after-image path or mutability is invalid")
-    matching_candidates = [
-        (write, candidate)
-        for write, candidate in candidates
-        if _require_object(candidate.get("case"), "wal.candidate.case").get("id")
-        == receipt["case_id"]
-    ]
-    if len(matching_candidates) != 1:
+    if len(candidates) != 1:
         _fail("invalid-wal", "stage intent must contain one case after-image for its receipt")
-    candidate_write, candidate = matching_candidates[0]
+    candidate_write, candidate = candidates[0]
     summary = validate_candidate(candidate)
+    if candidate_write.get("before_sha256") is None and (
+        summary["status"] not in INITIAL_CASE_STATUSES
+        or summary["revision"] != 1
+        or (summary["status"] == "proposed" and summary["support"] != "repeated")
+    ):
+        _fail("invalid-wal", "created stage case has an invalid initial lifecycle")
+    expected_action = (
+        "created"
+        if candidate_write.get("before_sha256") is None
+        else (
+            "unchanged"
+            if candidate_write.get("before_sha256") == candidate_write.get("after_sha256")
+            else "updated"
+        )
+    )
     if (
         candidate_write.get("path") != receipt["case_path"]
+        or candidate_write.get("immutable") is not False
+        or candidate_write.get("before_sha256") != receipt["before_wrapper_file_sha256"]
+        or candidate_write.get("after_sha256") != receipt["wrapper_file_sha256"]
+        or receipt["action"] != expected_action
+        or summary["case_id"] != receipt["case_id"]
         or summary["revision"] != receipt["revision"]
         or summary["semantic_digest"] != receipt["semantic_digest"]
         or hashlib.sha256(_canonical_bytes(candidate)).hexdigest() != receipt["wrapper_file_sha256"]
         or hashlib.sha256(_canonical_bytes(candidate["case"])).hexdigest() != receipt["case_sha256"]
     ):
         _fail("invalid-wal", "stage case after-image differs from its receipt")
+    if receipt["created_at"] != intent["captured_at"]:
+        _fail("invalid-wal", "stage receipt time differs from its first-writer decision")
     expected_result = {**receipt, "path": str(store.root / expected_receipt_path)}
     if intent.get("result") != expected_result:
         _fail("invalid-wal", "stage WAL result differs from its receipt")
-    _validate_stage_intent_repair_approval_lifecycle(
+
+    natural_key = _require_string(intent.get("natural_key"), "wal.natural_key")
+    natural_key_parts = natural_key.split(":")
+    if len(natural_key_parts) != 3:
+        _fail("invalid-wal", "stage natural key does not bind anchor, case, and input")
+    anchor_token, natural_case_id, candidate_file_sha = natural_key_parts
+    _raw_sha256(candidate_file_sha, "wal.natural_key.candidate_file_sha256")
+    request_anchor = (
+        None if anchor_token == "none" else _raw_sha256(anchor_token, "wal.natural_key.anchor")
+    )
+    expected_request = {
+        "candidate_file_sha256": candidate_file_sha,
+        "anchor": request_anchor,
+        "repair_approval": receipt["repair_approval"],
+    }
+    if (
+        request_anchor != receipt["anchor_snapshot_digest"]
+        or natural_case_id != summary["case_id"]
+        or intent.get("request_digest") != _digest(expected_request)
+        or receipt_id != str(uuid.uuid5(uuid.NAMESPACE_URL, f"dsf-stage:{natural_key}"))
+    ):
+        _fail("invalid-wal", "stage request does not bind its exact receipt and case")
+
+    if markers:
+        marker_write, marker = markers[0]
+        _exact_fields(
+            marker,
+            "wal.state_marker",
+            {"version", "kind", "mode", "state_id", "created_at", "access_policy"},
+        )
+        try:
+            uuid.UUID(_require_string(marker.get("state_id"), "wal.state_marker.state_id"))
+        except ValueError:
+            _fail("invalid-wal", "stage state marker state_id must be UUID")
+        _validate_state_access_policy_binding(marker.get("access_policy"), store)
+        if (
+            marker.get("version") != VERSION
+            or marker.get("kind") != "daily-skill-friction-state"
+            or marker.get("mode") != "unbound"
+            or _timestamp(marker.get("created_at"), "wal.state_marker.created_at")
+            != intent["captured_at"]
+            or marker_write.get("path") != STATE_MARKER
+            or marker_write.get("before_sha256") is not None
+            or marker_write.get("immutable") is not True
+            or candidate_write.get("before_sha256") is not None
+            or receipt["action"] != "created"
+        ):
+            _fail("invalid-wal", "stage state marker is not an exact first-write marker")
+
+    marker_exists = store.exists(Path(STATE_MARKER))
+    if marker_exists:
+        _read_marker(store.root, recover_publication=recover_publication)
+    if candidate_write.get("before_sha256") is None:
+        if not markers and not marker_exists:
+            _fail("invalid-wal", "created stage case has no existing or planned state marker")
+    elif markers:
+        _fail("invalid-wal", "existing stage case cannot create another state marker")
+
+    repair_approval: dict[str, Any] | None = None
+    expected_paths: list[str] = []
+    if markers:
+        expected_paths.append(STATE_MARKER)
+    if receipt["repair_approval"] is None:
+        if consumptions or bindings:
+            _fail("invalid-wal", "unapproved stage intent contains repair authority writes")
+    else:
+        if len(consumptions) != 1 or len(bindings) != 1:
+            _fail(
+                "invalid-wal",
+                "approval-backed stage intent requires one consumption and one active binding",
+            )
+        consumption_write, consumption = consumptions[0]
+        binding_write, binding = bindings[0]
+        approval_ref = _require_object(receipt["repair_approval"], "receipt.repair_approval")
+        approval_id = _safe_object_id(
+            approval_ref.get("approval_id"), "receipt.repair_approval.approval_id"
+        )
+        expected_paths.extend(
+            [
+                f"repairs/consumptions/{approval_id}.json",
+                f"repairs/bindings/{summary['case_id']}.json",
+            ]
+        )
+    expected_paths.extend([receipt["case_path"], expected_receipt_path])
+    if [write["path"] for write in writes] != expected_paths:
+        _fail("invalid-wal", "stage intent writes are not its exact canonical ordered set")
+    _validate_pending_stage_write_prefix(
         store,
-        intent,
+        writes,
+        committed=committed,
+        recover_publication=recover_publication,
+    )
+
+    if receipt["repair_approval"] is not None:
+        consumption_write, consumption = consumptions[0]
+        binding_write, binding = bindings[0]
+        repair_approval = _validate_stage_intent_repair_approval_lifecycle(
+            store,
+            intent,
+            receipt,
+            candidate,
+            consumption_write,
+            consumption,
+            binding_write,
+            binding,
+            recover_publication=recover_publication,
+        )
+    _validate_pending_stage_case_transition(
+        store,
+        candidate_write,
+        candidate,
+        repair_approval,
+        committed=committed,
         recover_publication=recover_publication,
     )
 
@@ -8318,9 +8598,18 @@ def _repair_binding_relative(case_id: str) -> Path:
     return Path("repairs") / "bindings" / f"{_validate_case_id(case_id)}.json"
 
 
-def _load_repair_approval_consumption(store: StateStore, approval_id: str) -> dict[str, Any]:
+def _load_repair_approval_consumption(
+    store: StateStore,
+    approval_id: str,
+    *,
+    recover_publication: bool = True,
+) -> dict[str, Any]:
     relative = Path("repairs") / "consumptions" / f"{approval_id}.json"
-    consumption = store.read_json(relative)[0]
+    consumption = _read_state_json(
+        store,
+        relative,
+        recover_publication=recover_publication,
+    )
     _exact_fields(
         consumption,
         "repair_approval_consumption",
@@ -8376,11 +8665,20 @@ def _load_repair_approval_consumption(store: StateStore, approval_id: str) -> di
     return normalized
 
 
-def _load_active_repair_binding(store: StateStore, case_id: str) -> dict[str, Any] | None:
+def _load_active_repair_binding(
+    store: StateStore,
+    case_id: str,
+    *,
+    recover_publication: bool = True,
+) -> dict[str, Any] | None:
     relative = _repair_binding_relative(case_id)
     if not store.exists(relative):
         return None
-    binding = store.read_json(relative)[0]
+    binding = _read_state_json(
+        store,
+        relative,
+        recover_publication=recover_publication,
+    )
     _exact_fields(
         binding,
         "active_repair_binding",
@@ -8426,7 +8724,11 @@ def _load_active_repair_binding(store: StateStore, case_id: str) -> dict[str, An
         _fail("invalid-repair-binding", "active repair approval binding is invalid")
 
     approval_relative = Path("repairs") / "approvals" / f"{normalized['approval_id']}.json"
-    approval_record = store.read_json(approval_relative)[0]
+    approval_record = _read_state_json(
+        store,
+        approval_relative,
+        recover_publication=recover_publication,
+    )
     approval_digest = _raw_sha256(
         approval_record.get("approval_digest"), "repair_binding.approval_record_digest"
     )
@@ -8442,12 +8744,19 @@ def _load_active_repair_binding(store: StateStore, case_id: str) -> dict[str, An
     ):
         _fail("invalid-repair-binding", "active binding does not match its repair approval")
     authority_intent = _require_committed_transaction(
-        store, "approve-repair", normalized["approval_id"]
+        store,
+        "approve-repair",
+        normalized["approval_id"],
+        recover_publication=recover_publication,
     )
     if authority_intent["result"].get("approval_digest") != normalized["approval_digest"]:
         _fail("missing-authority-transaction", "active binding has no exact approval WAL")
 
-    consumption = _load_repair_approval_consumption(store, normalized["approval_id"])
+    consumption = _load_repair_approval_consumption(
+        store,
+        normalized["approval_id"],
+        recover_publication=recover_publication,
+    )
     consumption_target = {
         "case_id": consumption["case_id"],
         "revision": consumption["revision"],
@@ -8461,7 +8770,11 @@ def _load_active_repair_binding(store: StateStore, case_id: str) -> dict[str, An
     ):
         _fail("invalid-repair-binding", "active binding does not match its consumption")
     receipt_relative = Path("receipts") / "stage" / f"{consumption['stage_receipt_id']}.json"
-    receipt = store.read_json(receipt_relative)[0]
+    receipt = _read_state_json(
+        store,
+        receipt_relative,
+        recover_publication=recover_publication,
+    )
     _validate_persisted_receipt(receipt, "stage", consumption["stage_receipt_id"])
     if (
         receipt["case_id"] != case_id
@@ -8481,12 +8794,18 @@ def _validate_persisted_repair_binding(
     store: StateStore,
     existing: Mapping[str, Any],
     candidate: Mapping[str, Any],
+    *,
+    recover_publication: bool = True,
 ) -> None:
     old_case = _require_object(existing.get("case"), "existing.case")
     case_id = _validate_case_id(old_case.get("id"))
-    binding = _load_active_repair_binding(store, case_id)
     if old_case["status"] not in APPROVAL_BOUND_CASE_STATUSES:
         return
+    binding = _load_active_repair_binding(
+        store,
+        case_id,
+        recover_publication=recover_publication,
+    )
     if binding is None:
         _fail(
             "missing-repair-binding",
