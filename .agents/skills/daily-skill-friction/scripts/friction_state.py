@@ -7776,7 +7776,9 @@ def _validate_repair_approval_lifecycle_time(
     approval: Mapping[str, Any], target: Mapping[str, Any]
 ) -> None:
     target_case = _require_object(target.get("case"), "target.case")
-    if target_case.get("lifecycle_changed_at") != approval["interaction"]["approved_at"]:
+    if _parse_time(
+        target_case.get("lifecycle_changed_at"), "target.case.lifecycle_changed_at"
+    ) != _parse_time(approval["interaction"]["approved_at"], "repair_approval.approved_at"):
         _fail(
             "repair-approval-lifecycle-mismatch",
             "approved target lifecycle_changed_at must equal repair approved_at",
@@ -8467,7 +8469,7 @@ def approve_repair(
             "approval_digest": approval_digest,
             "approval_key": approval_key,
             "expires_at": approval["expires_at"],
-            "target_lifecycle_changed_at": candidate["case"]["lifecycle_changed_at"],
+            "target_lifecycle_changed_at": approval["interaction"]["approved_at"],
         }
         return _run_transaction(
             store,

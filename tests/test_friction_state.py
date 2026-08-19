@@ -8812,7 +8812,7 @@ def test_repair_approval_requires_strict_post_closure_time_and_next_revision(
     assert revision.value.code == "invalid-repair-approval"
 
 
-def test_repair_approval_creation_binds_exact_lifecycle_decision_time_without_mutation(
+def test_repair_approval_creation_rejects_distinct_lifecycle_instant_without_mutation(
     tmp_path: Path,
 ) -> None:
     proposed, approved = _repair_lifecycle_candidates()[:2]
@@ -8821,7 +8821,7 @@ def test_repair_approval_creation_binds_exact_lifecycle_decision_time_without_mu
         tmp_path, root, proposed, approved, proposed_stage, persist=False
     )
     mismatched = json.loads(json.dumps(approved))
-    mismatched["case"]["lifecycle_changed_at"] = "2026-07-11T08:36:59Z"
+    mismatched["case"]["lifecycle_changed_at"] = "2026-07-11T08:37:00.000001Z"
     mismatched["control"]["semantic_digest"] = fs.semantic_digest(mismatched["case"])
     mismatched_approval = json.loads(json.dumps(approval))
     mismatched_approval["approval_id"] = "mismatched-lifecycle-authority"
@@ -8851,6 +8851,143 @@ def test_repair_approval_creation_binds_exact_lifecycle_decision_time_without_mu
     )
     assert not (root / intent_relative).exists()
     assert not (root / commit_relative).exists()
+
+
+@pytest.mark.parametrize("authority_state", ["pending", "committed", "retired"])
+def test_equivalent_fractional_repair_approval_times_replay_and_consume(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    authority_state: str,
+) -> None:
+    proposed, approved = _repair_lifecycle_candidates()[:2]
+    approved["case"]["lifecycle_changed_at"] = "2026-07-11T08:37:00.1Z"
+    approved["control"]["semantic_digest"] = fs.semantic_digest(approved["case"])
+    root, proposed_stage = _stage(tmp_path, proposed)
+    approval, _ = _publish_and_approve_repair(
+        tmp_path,
+        root,
+        proposed,
+        approved,
+        proposed_stage,
+        approval_id=f"fractional-equivalent-{authority_state}",
+        approved_at="2026-07-11T08:37:00.100000Z",
+        persist=False,
+    )
+    candidate_path = _write(
+        tmp_path / f"fractional-equivalent-{authority_state}-candidate.json",
+        approved,
+    )
+    approval_path = _write(
+        tmp_path / f"fractional-equivalent-{authority_state}-approval.json",
+        approval,
+    )
+    approval_relative = Path("repairs") / "approvals" / f"{approval['approval_id']}.json"
+    original_write = fs.StateStore.write_json
+
+    if authority_state == "pending":
+
+        def interrupt_approval(
+            store: Any,
+            relative: Path | str,
+            value: dict[str, Any],
+            *,
+            immutable: bool = False,
+            max_bytes: int | None = None,
+        ) -> str:
+            if Path(relative) == approval_relative:
+                raise OSError("injected fractional approval interruption")
+            return original_write(
+                store,
+                relative,
+                value,
+                immutable=immutable,
+                max_bytes=max_bytes,
+            )
+
+        monkeypatch.setattr(fs.StateStore, "write_json", interrupt_approval)
+        with pytest.raises(OSError, match="fractional approval interruption"):
+            fs.approve_repair(
+                root,
+                candidate_path,
+                approval_path,
+                "2026-07-11T08:38:00Z",
+                interactive_confirmed=True,
+            )
+        monkeypatch.setattr(fs.StateStore, "write_json", original_write)
+        intent_relative, _ = fs._wal_paths("approve-repair", approval["approval_id"])
+        intent_path = root / intent_relative
+        original_intent = intent_path.read_bytes()
+        tampered_intent = fs._load_json(intent_path)
+        tampered_intent["result"]["target_lifecycle_changed_at"] = approved["case"][
+            "lifecycle_changed_at"
+        ]
+        intent_body = {
+            key: value for key, value in tampered_intent.items() if key != "intent_digest"
+        }
+        tampered_intent["intent_digest"] = fs._digest(intent_body)
+        intent_path.write_bytes(fs._canonical_bytes(tampered_intent))
+        before_witness_recovery = _persistent_identity_snapshot(root)
+        with pytest.raises(fs.StateError, match="WAL target lifecycle_changed_at") as raised:
+            with fs._state_lock(root, create=False) as store:
+                fs._recover_pending_wal(store)
+        assert raised.value.code == "repair-approval-lifecycle-mismatch"
+        assert _persistent_identity_snapshot(root) == before_witness_recovery
+        intent_path.write_bytes(original_intent)
+    else:
+        fs.approve_repair(
+            root,
+            candidate_path,
+            approval_path,
+            "2026-07-11T08:38:00Z",
+            interactive_confirmed=True,
+        )
+        if authority_state == "retired":
+            with fs._state_lock(root, create=False) as store:
+                fs._recover_pending_wal(store, compact_committed=True)
+
+    authority = fs.approve_repair(
+        root,
+        candidate_path,
+        approval_path,
+        "2026-07-11T08:39:00Z",
+        interactive_confirmed=True,
+    )
+    assert authority["target_lifecycle_changed_at"] == "2026-07-11T08:37:00.100000Z"
+    assert fs._load_json(candidate_path)["case"]["lifecycle_changed_at"] == (
+        "2026-07-11T08:37:00.1Z"
+    )
+    persisted_approval = fs._load_json(root / approval_relative)
+    assert persisted_approval["interaction"]["approved_at"] == ("2026-07-11T08:37:00.100000Z")
+
+    before_retry = _persistent_identity_snapshot(root)
+    assert (
+        fs.approve_repair(
+            root,
+            candidate_path,
+            approval_path,
+            "2026-07-11T08:40:00Z",
+            interactive_confirmed=True,
+        )
+        == authority
+    )
+    assert _persistent_identity_snapshot(root) == before_retry
+
+    staged = fs.stage_candidate(
+        candidate_path,
+        root,
+        "2026-07-11T08:41:00Z",
+    )
+    assert staged["repair_approval"] == {
+        "approval_id": approval["approval_id"],
+        "approval_digest": persisted_approval["approval_digest"],
+    }
+    current = fs._load_json(root / fs._case_relative_path(approved))
+    assert current["case"]["lifecycle_changed_at"] == "2026-07-11T08:37:00.1Z"
+    assert (
+        fs._load_json(root / approval_relative)["interaction"]["approved_at"]
+        == "2026-07-11T08:37:00.100000Z"
+    )
+    assert (root / "repairs" / "consumptions" / f"{approval['approval_id']}.json").exists()
 
 
 def test_legacy_repair_approval_result_replays_active_and_retired_without_new_field(
@@ -9291,6 +9428,68 @@ def test_pending_stage_wal_revalidates_repair_approval_lifecycle_before_replay(
     assert not (root / consumption_relative).exists()
     assert not (root / binding_relative).exists()
     assert fs._load_json(root / fs._case_relative_path(proposed))["case"]["status"] == "proposed"
+
+
+def test_pending_stage_consumption_replays_equivalent_fractional_decision_time(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    proposed, approved = _repair_lifecycle_candidates()[:2]
+    approved["case"]["lifecycle_changed_at"] = "2026-07-11T08:37:00.1Z"
+    approved["control"]["semantic_digest"] = fs.semantic_digest(approved["case"])
+    root, proposed_stage = _stage(tmp_path, proposed)
+    approval, authority = _publish_and_approve_repair(
+        tmp_path,
+        root,
+        proposed,
+        approved,
+        proposed_stage,
+        approval_id="pending-fractional-consumption",
+        approved_at="2026-07-11T08:37:00.100000Z",
+    )
+    assert authority["target_lifecycle_changed_at"] == approval["interaction"]["approved_at"]
+    target_path = _write(tmp_path / "pending-fractional-target.json", approved)
+    consumption_relative = Path("repairs") / "consumptions" / f"{approval['approval_id']}.json"
+    original_write = fs.StateStore.write_json
+
+    def interrupt_consumption(
+        store: Any,
+        relative: Path | str,
+        value: dict[str, Any],
+        *,
+        immutable: bool = False,
+        max_bytes: int | None = None,
+    ) -> str:
+        if Path(relative) == consumption_relative:
+            raise OSError("injected fractional consumption interruption")
+        return original_write(
+            store,
+            relative,
+            value,
+            immutable=immutable,
+            max_bytes=max_bytes,
+        )
+
+    monkeypatch.setattr(fs.StateStore, "write_json", interrupt_consumption)
+    with pytest.raises(OSError, match="fractional consumption interruption"):
+        fs.stage_candidate(target_path, root, "2026-07-11T08:39:00Z")
+    monkeypatch.setattr(fs.StateStore, "write_json", original_write)
+
+    recovered = fs.stage_candidate(target_path, root, "2026-07-11T08:40:00Z")
+    assert recovered["repair_approval"] == {
+        "approval_id": approval["approval_id"],
+        "approval_digest": authority["approval_digest"],
+    }
+    current = fs._load_json(root / fs._case_relative_path(approved))
+    assert current["case"]["lifecycle_changed_at"] == "2026-07-11T08:37:00.1Z"
+    persisted_approval = fs._load_json(
+        root / "repairs" / "approvals" / f"{approval['approval_id']}.json"
+    )
+    assert persisted_approval["interaction"]["approved_at"] == ("2026-07-11T08:37:00.100000Z")
+    assert (root / consumption_relative).exists()
+
+    before_retry = _persistent_identity_snapshot(root)
+    assert fs.stage_candidate(target_path, root, "2026-07-11T08:41:00Z") == recovered
+    assert _persistent_identity_snapshot(root) == before_retry
 
 
 @pytest.mark.parametrize("interruption_target", ["case", "receipt"])
