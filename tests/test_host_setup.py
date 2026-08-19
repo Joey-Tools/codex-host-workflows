@@ -893,8 +893,9 @@ def test_launch_agent_mode_drift_is_planned_repaired_and_doctor_ready(
     assert _check(ready, "launch-agent-file-control")["status"] == "ready"
 
 
+@pytest.mark.parametrize("ssh_auth_sock", [None, "/tmp/test-agent.sock"])
 def test_launch_agent_clean_launcher_drops_inherited_tool_control_environment(
-    tmp_path: Path,
+    tmp_path: Path, ssh_auth_sock: str | None
 ) -> None:
     config = hs.load_config(REPO_ROOT / "config" / "host-workspace.toml")
     launch_arguments = hs.desired_launch_agent(config, "control")["ProgramArguments"]
@@ -909,7 +910,6 @@ def test_launch_agent_clean_launcher_drops_inherited_tool_control_environment(
         **os.environ,
         "PATH": "/tmp/hostile-path",
         "HOME": "/tmp/hostile-home",
-        "SSH_AUTH_SOCK": "/tmp/test-agent.sock",
         "PYTHONHOME": "/tmp/hostile-python-home",
         "PYTHONPATH": "/tmp/hostile-python-path",
         "GIT_EXEC_PATH": "/tmp/hostile-git-exec",
@@ -918,6 +918,10 @@ def test_launch_agent_clean_launcher_drops_inherited_tool_control_environment(
         "__CF_USER_TEXT_ENCODING": "hostile-platform-metadata",
         "BASH_FUNC_[%%": f'() {{ /usr/bin/touch "{startup_marker}"; return 1; }}',
     }
+    if ssh_auth_sock is None:
+        hostile_environment.pop("SSH_AUTH_SOCK", None)
+    else:
+        hostile_environment["SSH_AUTH_SOCK"] = ssh_auth_sock
     probe = (
         "import json, os, sys; "
         "print(json.dumps({'environment': dict(os.environ), "
@@ -941,20 +945,21 @@ def test_launch_agent_clean_launcher_drops_inherited_tool_control_environment(
     environment = observed["environment"]
     platform_encoding = environment.pop("__CF_USER_TEXT_ENCODING", None)
     if sys.platform == "darwin" and platform_encoding is not None:
-        encoding_user, encoding_zero, encoding_script = platform_encoding.split(":")
-        assert encoding_user.startswith("0x")
-        int(encoding_user, 16)
-        assert encoding_zero == "0"
-        int(encoding_script)
+        encoding_uid, encoding_script, encoding_region = platform_encoding.split(":")
+        assert int(encoding_uid, 0) == os.getuid()
+        assert int(encoding_script, 0) >= 0
+        assert int(encoding_region, 0) >= 0
     else:
         assert platform_encoding is None
-    assert environment == {
+    expected_environment = {
         "HOME": str(config.account_home),
         "LANG": hs.TRUSTED_LOCALE,
         "PATH": hs.TRUSTED_SYSTEM_PATH,
-        "SSH_AUTH_SOCK": "/tmp/test-agent.sock",
         "TMPDIR": hs.TRUSTED_TMPDIR,
     }
+    if ssh_auth_sock is not None:
+        expected_environment["SSH_AUTH_SOCK"] = ssh_auth_sock
+    assert environment == expected_environment
     assert not startup_marker.exists()
     assert observed["isolated"] == 1
     assert observed["no_site"] == 1

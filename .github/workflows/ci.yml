@@ -129,10 +129,28 @@ jobs:
         with:
           go-version: '1.26.6'
       - name: Install repository lint tools
+        timeout-minutes: 10
         run: |
+          set -euo pipefail
           go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
-          sudo apt-get update
-          sudo apt-get install -y shellcheck
+          platform="$(uname -s):$(uname -m)"
+          if [ "$platform" != Linux:x86_64 ]; then
+            printf 'Unsupported ShellCheck platform: %s; expected Linux:x86_64\n' "$platform" >&2
+            exit 1
+          fi
+          umask 077
+          shellcheck_tmp="$(mktemp -d "${RUNNER_TEMP:?}/shellcheck.XXXXXX")"
+          trap 'rm -rf -- "${shellcheck_tmp:?}"' EXIT
+          archive="$shellcheck_tmp/shellcheck-v0.11.0.linux.x86_64.tar.gz"
+          extract="$shellcheck_tmp/extract"
+          lint_bin="${RUNNER_TEMP:?}/repo-lint-bin"
+          curl --disable --fail --location --silent --show-error --proto '=https' --proto-redir '=https' --tlsv1.2 --connect-timeout 15 --max-time 120 --retry 2 --retry-all-errors --retry-delay 1 --retry-max-time 180 --max-filesize 3773312 --output "$archive" "https://github.com/koalaman/shellcheck/releases/download/v0.11.0/shellcheck-v0.11.0.linux.x86_64.tar.gz"
+          printf '%s  %s\n' 'b7af85e41cc99489dcc21d66c6d5f3685138f06d34651e6d34b42ec6d54fe6f6' "$archive" | sha256sum --check --strict -
+          install -d -m 0700 "$extract" "$lint_bin"
+          tar -xzf "$archive" --no-same-owner --no-same-permissions -C "$extract" -- shellcheck-v0.11.0/shellcheck
+          install -m 0700 "$extract/shellcheck-v0.11.0/shellcheck" "$lint_bin/shellcheck"
+          "$lint_bin/shellcheck" --version | grep -Fqx 'version: 0.11.0'
+          printf '%s\n' "$lint_bin" >> "$GITHUB_PATH"
           go install mvdan.cc/sh/v3/cmd/shfmt@v3.13.1
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
       - name: Lint GitHub Actions workflows

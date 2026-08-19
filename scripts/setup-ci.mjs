@@ -89,6 +89,10 @@ const UV_VERSION = '0.10.7';
 const GO_VERSION = '1.26.6';
 const RUST_TOOLCHAIN_VERSION = '1.97.1';
 const ACTIONLINT_VERSION = 'v1.7.12';
+const SHELLCHECK_VERSION = 'v0.11.0';
+const SHELLCHECK_LINUX_X86_64_SHA256 =
+  'b7af85e41cc99489dcc21d66c6d5f3685138f06d34651e6d34b42ec6d54fe6f6';
+const SHELLCHECK_LINUX_X86_64_SIZE = 3773312;
 const SHFMT_VERSION = 'v3.13.1';
 
 class UsageError extends Error {
@@ -888,13 +892,44 @@ function repoHygieneJob(selected) {
     );
   }
   if (selected.has('bash')) {
-    installLines.push('sudo apt-get update');
-    installLines.push('sudo apt-get install -y shellcheck');
+    const shellcheckArchive = `shellcheck-${SHELLCHECK_VERSION}.linux.x86_64.tar.gz`;
+    installLines.push('platform="$(uname -s):$(uname -m)"');
+    installLines.push('if [ "$platform" != Linux:x86_64 ]; then');
+    installLines.push(
+      '  printf \'Unsupported ShellCheck platform: %s; expected Linux:x86_64\\n\' "$platform" >&2',
+    );
+    installLines.push('  exit 1');
+    installLines.push('fi');
+    installLines.push('umask 077');
+    installLines.push('shellcheck_tmp="$(mktemp -d "${RUNNER_TEMP:?}/shellcheck.XXXXXX")"');
+    installLines.push('trap \'rm -rf -- "${shellcheck_tmp:?}"\' EXIT');
+    installLines.push(`archive="$shellcheck_tmp/${shellcheckArchive}"`);
+    installLines.push('extract="$shellcheck_tmp/extract"');
+    installLines.push('lint_bin="${RUNNER_TEMP:?}/repo-lint-bin"');
+    installLines.push(
+      `curl --disable --fail --location --silent --show-error --proto '=https' --proto-redir '=https' --tlsv1.2 --connect-timeout 15 --max-time 120 --retry 2 --retry-all-errors --retry-delay 1 --retry-max-time 180 --max-filesize ${SHELLCHECK_LINUX_X86_64_SIZE} --output "$archive" "https://github.com/koalaman/shellcheck/releases/download/${SHELLCHECK_VERSION}/${shellcheckArchive}"`,
+    );
+    installLines.push(
+      `printf '%s  %s\\n' '${SHELLCHECK_LINUX_X86_64_SHA256}' "$archive" | sha256sum --check --strict -`,
+    );
+    installLines.push('install -d -m 0700 "$extract" "$lint_bin"');
+    installLines.push(
+      `tar -xzf "$archive" --no-same-owner --no-same-permissions -C "$extract" -- shellcheck-${SHELLCHECK_VERSION}/shellcheck`,
+    );
+    installLines.push(
+      `install -m 0700 "$extract/shellcheck-${SHELLCHECK_VERSION}/shellcheck" "$lint_bin/shellcheck"`,
+    );
+    installLines.push(
+      `"$lint_bin/shellcheck" --version | grep -Fqx 'version: ${SHELLCHECK_VERSION.slice(1)}'`,
+    );
+    installLines.push('printf \'%s\\n\' "$lint_bin" >> "$GITHUB_PATH"');
     installLines.push(`go install mvdan.cc/sh/v3/cmd/shfmt@${SHFMT_VERSION}`);
   }
   if (installLines.length > 0) {
     steps.push(`      - name: Install repository lint tools
+        timeout-minutes: 10
         run: |
+          set -euo pipefail
           ${installLines.join('\n          ')}
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"`);
   }

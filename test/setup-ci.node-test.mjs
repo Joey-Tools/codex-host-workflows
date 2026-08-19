@@ -154,7 +154,7 @@ describe('setup-ci file plan', () => {
     assert.doesNotMatch(workflow, /node-tooling:/);
   });
 
-  it('pins external Actions, checkout credentials, runtimes, and Go-installed tools', () => {
+  it('pins external Actions, checkout credentials, runtimes, and installed tools', () => {
     const plan = buildFilePlan({ tools: TOOL_ORDER, benchmark: false });
     const workflow = plan.files.find((file) => file.path === '.github/workflows/ci.yml').content;
     const actionRefs = [...workflow.matchAll(/^\s*uses:\s+([^@\s]+)@([^\s#]+)/gm)];
@@ -178,7 +178,46 @@ describe('setup-ci file plan', () => {
     assert.match(workflow, /go-version: '1\.26\.6'/);
     assert.match(workflow, /toolchain: '1\.97\.1'/);
     assert.match(workflow, /actionlint@v1\.7\.12/);
+    assert.ok(
+      workflow.includes(
+        'https://github.com/koalaman/shellcheck/releases/download/v0.11.0/shellcheck-v0.11.0.linux.x86_64.tar.gz',
+      ),
+    );
+    assert.ok(
+      workflow.includes('b7af85e41cc99489dcc21d66c6d5f3685138f06d34651e6d34b42ec6d54fe6f6'),
+    );
+    assert.match(workflow, /timeout-minutes: 10\n\s+run: \|\n\s+set -euo pipefail\n/);
+    assert.match(workflow, /platform="\$\(uname -s\):\$\(uname -m\)"/);
+    assert.match(workflow, /if \[ "\$platform" != Linux:x86_64 \]; then/);
+    assert.match(workflow, /Unsupported ShellCheck platform: %s; expected Linux:x86_64/);
+    assert.match(workflow, /umask 077/);
+    assert.match(workflow, /curl --disable --fail --location/);
+    assert.match(workflow, /--proto '=https' --proto-redir '=https' --tlsv1\.2/);
+    assert.match(workflow, /--connect-timeout 15 --max-time 120/);
+    assert.match(
+      workflow,
+      /--retry 2 --retry-all-errors --retry-delay 1 --retry-max-time 180 --max-filesize 3773312/,
+    );
+    assert.match(workflow, /mktemp -d "\$\{RUNNER_TEMP:\?\}\/shellcheck\.XXXXXX"/);
+    assert.match(workflow, /trap 'rm -rf -- "\$\{shellcheck_tmp:\?\}"' EXIT/);
+    assert.match(workflow, /sha256sum --check --strict -/);
+    assert.match(workflow, /tar -xzf "\$archive" --no-same-owner --no-same-permissions/);
+    assert.match(workflow, /install -m 0700 .* "\$lint_bin\/shellcheck"/);
+    assert.match(workflow, /"\$lint_bin\/shellcheck" --version \| grep -Fqx 'version: 0\.11\.0'/);
+    assert.match(workflow, /printf '%s\\n' "\$lint_bin" >> "\$GITHUB_PATH"/);
+    const checksumIndex = workflow.indexOf('sha256sum --check --strict -');
+    const extractIndex = workflow.indexOf('tar -xzf "$archive"');
+    const installIndex = workflow.indexOf(
+      'install -m 0700 "$extract/shellcheck-v0.11.0/shellcheck" "$lint_bin/shellcheck"',
+    );
+    const versionIndex = workflow.indexOf('"$lint_bin/shellcheck" --version');
+    const pathIndex = workflow.indexOf('printf \'%s\\n\' "$lint_bin" >> "$GITHUB_PATH"');
+    assert.ok(checksumIndex >= 0 && checksumIndex < extractIndex);
+    assert.ok(
+      extractIndex < installIndex && installIndex < versionIndex && versionIndex < pathIndex,
+    );
     assert.match(workflow, /shfmt@v3\.13\.1/);
+    assert.doesNotMatch(workflow, /apt-get/);
     assert.doesNotMatch(workflow, /go install [^\n]+@latest/);
   });
 
@@ -203,6 +242,7 @@ describe('setup-ci file plan', () => {
     );
 
     assert.match(workflow, /Host control \(macOS 15, Python 3\.12\.10\)/);
+    assert.match(workflow, /timeout-minutes: 45/);
     assert.doesNotMatch(workflow, /uses: actions\/setup-python@/);
     assert.doesNotMatch(workflow, /UV_PYTHON_DOWNLOADS: never/);
     assert.match(workflow, /UV_MANAGED_PYTHON: 'true'/);
