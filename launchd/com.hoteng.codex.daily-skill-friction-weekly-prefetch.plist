@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Managed by Joey-Tools/codex-host-workflows:scripts/host_setup.py -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.hoteng.codex.daily-skill-friction-weekly-prefetch</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/sh</string>
+        <string>-p</string>
+        <string>-c</string>
+        <string>account_home=$1; shift; if [ -n "${SSH_AUTH_SOCK-}" ]; then exec /usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin "HOME=$account_home" LANG=en_US.UTF-8 TMPDIR=/tmp "SSH_AUTH_SOCK=$SSH_AUTH_SOCK" "$@"; fi; exec /usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin "HOME=$account_home" LANG=en_US.UTF-8 TMPDIR=/tmp "$@"</string>
+        <string>daily-skill-friction-clean-env</string>
+        <string>/Users/hoteng</string>
+        <string>/Users/hoteng/.local/share/uv/python/cpython-3.14.2-macos-aarch64-none/bin/python3.14</string>
+        <string>-I</string>
+        <string>-B</string>
+        <string>-S</string>
+        <string>/Users/hoteng/Program/GitHub/Joey-Tools/codex-workspace/.codex-local/daily-skill-friction/repos/codex-host-workflows/scripts/host_setup.py</string>
+        <string>prefetch-weekly</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/hoteng/Program/GitHub/Joey-Tools/codex-workspace</string>
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Weekday</key>
+        <integer>5</integer>
+        <key>Hour</key>
+        <integer>6</integer>
+        <key>Minute</key>
+        <integer>30</integer>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>/Users/hoteng/Program/GitHub/Joey-Tools/codex-workspace/.codex-local/daily-skill-friction/logs/daily-skill-friction-weekly-prefetch.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/hoteng/Program/GitHub/Joey-Tools/codex-workspace/.codex-local/daily-skill-friction/logs/daily-skill-friction-weekly-prefetch.err.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+</dict>
+</plist>

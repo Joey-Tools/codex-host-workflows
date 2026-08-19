@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "source_repository": "Joey-Tools/codex-skill-friction-ledger",
+  "authority": "frozen-validator-bytes",
+  "files": {
+    "schema/case.schema.json": "10d29a101954e8c08e7c316d59dde3fb92d3ff53d719883ad9cf3204f23c2940",
+    "scripts/validate_ledger.py": "b1200da23b4096b129f838acaee4937b33707e4c236bc7f2a2fc7ff83b52ad8f"
+  },
+  "semantic_fixture_digest": "sha256:d90daeb497afd84872eda842dac8315aee0b60a18de98135e0dff7187408efb3"
+}

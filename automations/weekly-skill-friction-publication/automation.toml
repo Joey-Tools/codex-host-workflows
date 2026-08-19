@@ -1,0 +1,11 @@
+version = 1
+id = "weekly-skill-friction-publication"
+kind = "cron"
+name = "Weekly Skill Friction Publication"
+prompt = "Use $daily-skill-friction to run Weekly publication preparation from the last completed Daily state. Depend on the host-owned combined prefetch at Friday 06:30, then run `/Users/hoteng/.local/share/uv/python/cpython-3.14.2-macos-aarch64-none/bin/python3.14 -I -B -S /Users/hoteng/Program/GitHub/Joey-Tools/codex-workspace/.codex-local/daily-skill-friction/repos/codex-host-workflows/scripts/host_setup.py doctor --weekly --no-launchctl`; require JSON `status: ready` including `freshness-final-rebind` and the current `weekly-pair-receipt`, keep the 60-minute age limit, and never add `--historical`. Require this prior interactive order: run `selection-preflight` on the basis-only original draft with no actor or approval time; persist its immutable ready receipt and committed WAL; then have Joey separately approve that exact basis, resource preflight, and receipt ID/digest strictly after its `checked_at`. Only `weekly-plan` may consume the resulting approved selection. The scheduled run must never create, edit, infer, or impersonate approval. Apply no count cap, but require the helper's exact aggregate publication and Weekly/finalization WAL byte envelope to fit. Prepare one verified signed local ledger commit per selected case, finalize one exact binding-and-scope publication manifest, then stop; the manifest is not publish approval. Never advance a case into `approved` repair status. Do not wait for Daily, implement repairs, fetch, push, open pull requests, merge, replace a pending-publication commit, or close publication state."
+status = "PAUSED"
+rrule = "RRULE:FREQ=WEEKLY;BYDAY=FR;BYHOUR=7;BYMINUTE=0"
+model = "gpt-5.6-sol"
+reasoning_effort = "xhigh"
+execution_environment = "local"
+cwds = ["/Users/hoteng/Program/GitHub/Joey-Tools/codex-workspace"]

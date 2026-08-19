@@ -1,0 +1,29 @@
+version = 1
+cache_root = "/Users/hoteng/Program/GitHub/Joey-Tools/codex-workspace/.codex-local/daily-skill-friction"
+
+[host_setup]
+workspace_root = "/Users/hoteng/Program/GitHub/Joey-Tools/codex-workspace"
+account_home = "/Users/hoteng"
+python_executable = "/Users/hoteng/.local/share/uv/python/cpython-3.14.2-macos-aarch64-none/bin/python3.14"
+control_repo = "codex-host-workflows"
+skill_relative_path = ".agents/skills/daily-skill-friction"
+locator_relative_path = ".agents/skills/daily-skill-friction"
+launch_agent_label = "com.hoteng.codex.daily-skill-friction-control-prefetch"
+launch_agent_source = "launchd/com.hoteng.codex.daily-skill-friction-control-prefetch.plist"
+weekly_launch_agent_label = "com.hoteng.codex.daily-skill-friction-weekly-prefetch"
+weekly_launch_agent_source = "launchd/com.hoteng.codex.daily-skill-friction-weekly-prefetch.plist"
+control_stamp = "daily-skill-friction-control"
+main_stamp = "daily-skill-friction"
+weekly_pair_receipt = "daily-skill-friction-weekly-pair"
+prefetch_hour = 2
+prefetch_minute = 45
+weekly_prefetch_weekday = 5
+weekly_prefetch_hour = 6
+weekly_prefetch_minute = 30
+default_max_age_minutes = 60
+
+[[repos]]
+name = "codex-host-workflows"
+url = "git@github.com:Joey-Tools/codex-host-workflows.git"
+default_branch = "master"
+visibility = "public"

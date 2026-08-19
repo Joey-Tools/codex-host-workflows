@@ -60,7 +60,10 @@ describe('setup-ci file plan', () => {
     assert.equal(packagePatch.devDependencies['@types/node'], '^24.13.1');
     assert.equal(packagePatch.devDependencies.vitest, '^4.1.8');
     assert.equal(packagePatch.devDependencies['markdownlint-cli2'], '^0.22.1');
-    assert.match(workflow, /uses: pnpm\/action-setup@v6/);
+    assert.match(
+      workflow,
+      /uses: pnpm\/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6\.0\.10/,
+    );
     assert.doesNotMatch(workflow, /version: 11/);
     assert.match(workflow, /if: \$\{\{ hashFiles\('pnpm-lock\.yaml'\) == '' \}\}/);
     assert.match(workflow, /if: \$\{\{ hashFiles\('pnpm-lock\.yaml'\) != '' \}\}/);
@@ -108,18 +111,155 @@ describe('setup-ci file plan', () => {
     assert.match(config, /"MD013": false,/);
     assert.match(
       config,
-      /"globs": \["\*\*\/\*\.md", "!node_modules", "!dist", "!build", "!out", "!target"\],/,
+      /"globs": \["\*\*\/\*\.md", "!\.venv", "!node_modules", "!dist", "!build", "!out", "!target"\],/,
     );
   });
 
-  it('skips pytest before invoking it when the tests directory is missing', () => {
+  it('uses an exact uv-managed Python from the runner-owned temporary tree', () => {
     const plan = buildFilePlan({ tools: ['python'], benchmark: false });
     const workflow = plan.files.find((file) => file.path === '.github/workflows/ci.yml').content;
 
-    assert.match(workflow, /uses: astral-sh\/setup-uv@v8\.1\.0/);
-    assert.match(workflow, /python-version: '3\.12'/);
+    assert.doesNotMatch(workflow, /uses: actions\/setup-python@/);
+    assert.match(
+      workflow,
+      /uses: astral-sh\/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8\.1\.0/,
+    );
+    assert.match(workflow, /UV_MANAGED_PYTHON: 'true'/);
+    assert.equal(
+      (workflow.match(/UV_PYTHON_INSTALL_DIR: \$\{\{ runner\.temp \}\}\/uv-python-dir/g) ?? [])
+        .length,
+      4,
+    );
+    assert.match(workflow, /python-version: '3\.12\.10'/);
+    assert.match(workflow, /version: '0\.10\.7'/);
+    assert.match(workflow, /install -d -m 0700 "\$UV_PYTHON_INSTALL_DIR"/);
+    assert.ok(workflow.indexOf('Prepare trusted Python directory') < workflow.indexOf('Set up uv'));
+    assert.match(workflow, /uv python install --managed-python '3\.12\.10'/);
+    assert.match(workflow, /if \[ -f uv\.lock \]; then/);
+    assert.match(workflow, /uv sync --locked --group dev --managed-python --python '3\.12\.10'/);
+    assert.match(workflow, /uv sync --group dev --managed-python --python '3\.12\.10'/);
     assert.match(workflow, /if \[ ! -d tests \]; then/);
     assert.match(workflow, /No tests\/ directory found; skipping pytest\./);
+  });
+
+  it('runs setup-ci generator tests when the GitHub Actions module is selected', () => {
+    const plan = buildFilePlan({ tools: ['github-actions'], benchmark: false });
+    const workflow = plan.files.find((file) => file.path === '.github/workflows/ci.yml').content;
+
+    assert.match(workflow, /setup-ci-generator:/);
+    assert.match(workflow, /name: setup-ci generator/);
+    assert.match(workflow, /node-version: '24\.19\.0'/);
+    assert.match(workflow, /if \[ ! -f test\/setup-ci\.node-test\.mjs \]; then/);
+    assert.match(workflow, /node --test test\/setup-ci\.node-test\.mjs/);
+    assert.doesNotMatch(workflow, /node-tooling:/);
+  });
+
+  it('pins external Actions, checkout credentials, runtimes, and installed tools', () => {
+    const plan = buildFilePlan({ tools: TOOL_ORDER, benchmark: false });
+    const workflow = plan.files.find((file) => file.path === '.github/workflows/ci.yml').content;
+    const actionRefs = [...workflow.matchAll(/^\s*uses:\s+([^@\s]+)@([^\s#]+)/gm)];
+
+    assert(actionRefs.length > 0);
+    for (const [, action, ref] of actionRefs) {
+      assert.match(ref, /^[0-9a-f]{40}$/, `${action} must use a full commit SHA`);
+    }
+
+    const checkoutCount = actionRefs.filter(([, action]) => action === 'actions/checkout').length;
+    const hardenedCheckoutCount = [
+      ...workflow.matchAll(
+        /uses: actions\/checkout@[0-9a-f]{40} # v6\.1\.0\n\s+with:\n\s+persist-credentials: false/g,
+      ),
+    ].length;
+    assert.equal(hardenedCheckoutCount, checkoutCount);
+
+    assert.match(workflow, /node-version: '24\.19\.0'/);
+    assert.match(workflow, /python-version: '3\.12\.10'/);
+    assert.match(workflow, /version: '0\.10\.7'/);
+    assert.match(workflow, /go-version: '1\.26\.6'/);
+    assert.match(workflow, /toolchain: '1\.97\.1'/);
+    assert.match(workflow, /actionlint@v1\.7\.12/);
+    assert.ok(
+      workflow.includes(
+        'https://github.com/koalaman/shellcheck/releases/download/v0.11.0/shellcheck-v0.11.0.linux.x86_64.tar.gz',
+      ),
+    );
+    assert.ok(
+      workflow.includes('b7af85e41cc99489dcc21d66c6d5f3685138f06d34651e6d34b42ec6d54fe6f6'),
+    );
+    assert.match(workflow, /timeout-minutes: 10\n\s+run: \|\n\s+set -euo pipefail\n/);
+    assert.match(workflow, /platform="\$\(uname -s\):\$\(uname -m\)"/);
+    assert.match(workflow, /if \[ "\$platform" != Linux:x86_64 \]; then/);
+    assert.match(workflow, /Unsupported ShellCheck platform: %s; expected Linux:x86_64/);
+    assert.match(workflow, /umask 077/);
+    assert.match(workflow, /curl --disable --fail --location/);
+    assert.match(workflow, /--proto '=https' --proto-redir '=https' --tlsv1\.2/);
+    assert.match(workflow, /--connect-timeout 15 --max-time 120/);
+    assert.match(
+      workflow,
+      /--retry 2 --retry-all-errors --retry-delay 1 --retry-max-time 180 --max-filesize 3773312/,
+    );
+    assert.match(workflow, /mktemp -d "\$\{RUNNER_TEMP:\?\}\/shellcheck\.XXXXXX"/);
+    assert.match(workflow, /trap 'rm -rf -- "\$\{shellcheck_tmp:\?\}"' EXIT/);
+    assert.match(workflow, /sha256sum --check --strict -/);
+    assert.match(workflow, /tar -xzf "\$archive" --no-same-owner --no-same-permissions/);
+    assert.match(workflow, /install -m 0700 .* "\$lint_bin\/shellcheck"/);
+    assert.match(workflow, /"\$lint_bin\/shellcheck" --version \| grep -Fqx 'version: 0\.11\.0'/);
+    assert.match(workflow, /printf '%s\\n' "\$lint_bin" >> "\$GITHUB_PATH"/);
+    const checksumIndex = workflow.indexOf('sha256sum --check --strict -');
+    const extractIndex = workflow.indexOf('tar -xzf "$archive"');
+    const installIndex = workflow.indexOf(
+      'install -m 0700 "$extract/shellcheck-v0.11.0/shellcheck" "$lint_bin/shellcheck"',
+    );
+    const versionIndex = workflow.indexOf('"$lint_bin/shellcheck" --version');
+    const pathIndex = workflow.indexOf('printf \'%s\\n\' "$lint_bin" >> "$GITHUB_PATH"');
+    assert.ok(checksumIndex >= 0 && checksumIndex < extractIndex);
+    assert.ok(
+      extractIndex < installIndex && installIndex < versionIndex && versionIndex < pathIndex,
+    );
+    assert.match(workflow, /shfmt@v3\.13\.1/);
+    assert.doesNotMatch(workflow, /apt-get/);
+    assert.doesNotMatch(workflow, /go install [^\n]+@latest/);
+  });
+
+  it('round-trips the checked-in generated workflow', async () => {
+    const plan = buildFilePlan({
+      tools: ['python', 'bash', 'github-actions', 'markdown'],
+      benchmark: false,
+    });
+    const generated = plan.files.find((file) => file.path === '.github/workflows/ci.yml').content;
+    const checkedIn = await fs.readFile(
+      path.join(import.meta.dirname, '..', '.github', 'workflows', 'ci.yml'),
+      'utf8',
+    );
+
+    assert.equal(checkedIn, generated);
+  });
+
+  it('pins the host macOS workflow to the available Darwin ARM64 Python patch', async () => {
+    const workflow = await fs.readFile(
+      path.join(import.meta.dirname, '..', '.github', 'workflows', 'host-macos.yml'),
+      'utf8',
+    );
+
+    assert.match(workflow, /Host control \(macOS 15, Python 3\.12\.10\)/);
+    assert.match(workflow, /timeout-minutes: 45/);
+    assert.doesNotMatch(workflow, /uses: actions\/setup-python@/);
+    assert.doesNotMatch(workflow, /UV_PYTHON_DOWNLOADS: never/);
+    assert.match(workflow, /UV_MANAGED_PYTHON: 'true'/);
+    assert.equal(
+      (workflow.match(/UV_PYTHON_INSTALL_DIR: \$\{\{ runner\.temp \}\}\/uv-python-dir/g) ?? [])
+        .length,
+      5,
+    );
+    assert.match(workflow, /run: install -d -m 0700 "\$UV_PYTHON_INSTALL_DIR"/);
+    assert.match(workflow, /python-version: '3\.12\.10'/);
+    assert.match(workflow, /uv python install --managed-python '3\.12\.10'/);
+    assert.match(workflow, /uv sync --locked --group dev --managed-python --python '3\.12\.10'/);
+    assert.doesNotMatch(workflow, /3\.12\.12/);
+    assert.ok(
+      workflow.indexOf('- name: Prepare trusted Python directory') <
+        workflow.indexOf('- name: Set up uv'),
+    );
   });
 
   it('disables SwiftLint cache in generated CI', () => {

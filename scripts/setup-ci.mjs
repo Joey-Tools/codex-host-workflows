@@ -76,6 +76,24 @@ const TOOL_IGNORES = {
 };
 
 const PACKAGE_MANAGER = 'pnpm@11.5.2';
+const CHECKOUT_ACTION = 'actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0';
+const SETUP_NODE_ACTION = 'actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0';
+const SETUP_GO_ACTION = 'actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0';
+const PNPM_SETUP_ACTION = 'pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10';
+const SETUP_UV_ACTION = 'astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0';
+const RUST_TOOLCHAIN_ACTION =
+  'dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable';
+const NODE_VERSION = '24.19.0';
+const PYTHON_VERSION = '3.12.10';
+const UV_VERSION = '0.10.7';
+const GO_VERSION = '1.26.6';
+const RUST_TOOLCHAIN_VERSION = '1.97.1';
+const ACTIONLINT_VERSION = 'v1.7.12';
+const SHELLCHECK_VERSION = 'v0.11.0';
+const SHELLCHECK_LINUX_X86_64_SHA256 =
+  'b7af85e41cc99489dcc21d66c6d5f3685138f06d34651e6d34b42ec6d54fe6f6';
+const SHELLCHECK_LINUX_X86_64_SIZE = 3773312;
+const SHFMT_VERSION = 'v3.13.1';
 
 class UsageError extends Error {
   constructor(message) {
@@ -422,7 +440,7 @@ function buildPackagePatch(selected) {
   }
 
   return {
-    name: 'replace-me',
+    name: '@joey-tools/codex-host-workflows',
     version: '0.1.0',
     private: true,
     type: 'module',
@@ -607,6 +625,8 @@ function buildCiWorkflow(selected) {
   const jobs = [];
   if (selected.has('js-ts') || selected.has('markdown')) {
     jobs.push(nodeToolingJob(selected));
+  } else if (selected.has('github-actions')) {
+    jobs.push(setupCiGeneratorTestJob());
   }
   if (selected.has('python')) {
     jobs.push(pythonJob());
@@ -655,6 +675,9 @@ function nodeToolingJob(selected) {
   if (selected.has('markdown')) {
     steps.push(step('Lint Markdown', 'pnpm run lint:markdown'));
   }
+  if (selected.has('github-actions')) {
+    steps.push(setupCiGeneratorTestStep());
+  }
   if (selected.has('js-ts')) {
     steps.push(step('Run JavaScript and TypeScript tests', 'pnpm test'));
   }
@@ -663,22 +686,21 @@ function nodeToolingJob(selected) {
     name: Node tooling
     runs-on: ubuntu-latest
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v6
+${checkoutStep()}
       - name: Set up pnpm
-        uses: pnpm/action-setup@v6
+        uses: ${PNPM_SETUP_ACTION}
         with:
           run_install: false
       - name: Set up Node
         if: \${{ hashFiles('pnpm-lock.yaml') == '' }}
-        uses: actions/setup-node@v6
+        uses: ${SETUP_NODE_ACTION}
         with:
-          node-version: 24
+          node-version: '${NODE_VERSION}'
       - name: Set up Node with pnpm cache
         if: \${{ hashFiles('pnpm-lock.yaml') != '' }}
-        uses: actions/setup-node@v6
+        uses: ${SETUP_NODE_ACTION}
         with:
-          node-version: 24
+          node-version: '${NODE_VERSION}'
           cache: pnpm
       - name: Install dependencies
         run: |
@@ -690,21 +712,63 @@ function nodeToolingJob(selected) {
 ${steps.join('\n')}`;
 }
 
+function setupCiGeneratorTestJob() {
+  return `  setup-ci-generator:
+    name: setup-ci generator
+    runs-on: ubuntu-latest
+    steps:
+${checkoutStep()}
+      - name: Set up Node
+        uses: ${SETUP_NODE_ACTION}
+        with:
+          node-version: '${NODE_VERSION}'
+${setupCiGeneratorTestStep()}`;
+}
+
+function setupCiGeneratorTestStep() {
+  return step(
+    'Run setup-ci generator tests',
+    `if [ ! -f test/setup-ci.node-test.mjs ]; then
+  echo "No test/setup-ci.node-test.mjs file found; skipping generator tests."
+  exit 0
+fi
+
+node --test test/setup-ci.node-test.mjs`,
+  );
+}
+
 function pythonJob() {
   return `  python:
     name: Python
     runs-on: ubuntu-latest
+    env:
+      UV_MANAGED_PYTHON: 'true'
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v6
-      - name: Set up Python
-        uses: actions/setup-python@v6
-        with:
-          python-version: '3.12'
+${checkoutStep()}
+      - name: Prepare trusted Python directory
+        env:
+          UV_PYTHON_INSTALL_DIR: \${{ runner.temp }}/uv-python-dir
+        run: install -d -m 0700 "$UV_PYTHON_INSTALL_DIR"
       - name: Set up uv
-        uses: astral-sh/setup-uv@v8.1.0
+        uses: ${SETUP_UV_ACTION}
+        env:
+          UV_PYTHON_INSTALL_DIR: \${{ runner.temp }}/uv-python-dir
+        with:
+          version: '${UV_VERSION}'
+          python-version: '${PYTHON_VERSION}'
+      - name: Install trusted Python
+        env:
+          UV_PYTHON_INSTALL_DIR: \${{ runner.temp }}/uv-python-dir
+        run: uv python install --managed-python '${PYTHON_VERSION}'
       - name: Install dependencies
-        run: uv sync --group dev
+        env:
+          UV_PYTHON_INSTALL_DIR: \${{ runner.temp }}/uv-python-dir
+        run: |
+          if [ -f uv.lock ]; then
+            uv sync --locked --group dev --managed-python --python '${PYTHON_VERSION}'
+          else
+            uv sync --group dev --managed-python --python '${PYTHON_VERSION}'
+          fi
       - name: Check Python formatting
         run: uv run ruff format --check .
       - name: Lint Python
@@ -734,8 +798,7 @@ function swiftJob() {
     name: Swift
     runs-on: macos-latest
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v6
+${checkoutStep()}
       - name: Install Swift tooling
         run: brew install swiftlint swift-format
       - name: Run Swift checks
@@ -760,12 +823,11 @@ function goJob() {
     name: Go
     runs-on: ubuntu-latest
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v6
+${checkoutStep()}
       - name: Set up Go
-        uses: actions/setup-go@v6
+        uses: ${SETUP_GO_ACTION}
         with:
-          go-version: stable
+          go-version: '${GO_VERSION}'
       - name: Run Go checks
         run: |
           if [ ! -f go.mod ]; then
@@ -794,11 +856,11 @@ function rustJob() {
     name: Rust
     runs-on: ubuntu-latest
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v6
+${checkoutStep()}
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: ${RUST_TOOLCHAIN_ACTION}
         with:
+          toolchain: '${RUST_TOOLCHAIN_VERSION}'
           components: rustfmt, clippy
       - name: Run Rust checks
         run: |
@@ -814,27 +876,60 @@ function rustJob() {
 
 function repoHygieneJob(selected) {
   const needsGoInstall = selected.has('github-actions') || selected.has('bash');
-  const steps = ['      - name: Check out repository\n        uses: actions/checkout@v6'];
+  const steps = [checkoutStep()];
 
   if (needsGoInstall) {
     steps.push(`      - name: Set up Go for lint tools
-        uses: actions/setup-go@v6
+        uses: ${SETUP_GO_ACTION}
         with:
-          go-version: stable`);
+          go-version: '${GO_VERSION}'`);
   }
 
   const installLines = [];
   if (selected.has('github-actions')) {
-    installLines.push('go install github.com/rhysd/actionlint/cmd/actionlint@latest');
+    installLines.push(
+      `go install github.com/rhysd/actionlint/cmd/actionlint@${ACTIONLINT_VERSION}`,
+    );
   }
   if (selected.has('bash')) {
-    installLines.push('sudo apt-get update');
-    installLines.push('sudo apt-get install -y shellcheck');
-    installLines.push('go install mvdan.cc/sh/v3/cmd/shfmt@latest');
+    const shellcheckArchive = `shellcheck-${SHELLCHECK_VERSION}.linux.x86_64.tar.gz`;
+    installLines.push('platform="$(uname -s):$(uname -m)"');
+    installLines.push('if [ "$platform" != Linux:x86_64 ]; then');
+    installLines.push(
+      '  printf \'Unsupported ShellCheck platform: %s; expected Linux:x86_64\\n\' "$platform" >&2',
+    );
+    installLines.push('  exit 1');
+    installLines.push('fi');
+    installLines.push('umask 077');
+    installLines.push('shellcheck_tmp="$(mktemp -d "${RUNNER_TEMP:?}/shellcheck.XXXXXX")"');
+    installLines.push('trap \'rm -rf -- "${shellcheck_tmp:?}"\' EXIT');
+    installLines.push(`archive="$shellcheck_tmp/${shellcheckArchive}"`);
+    installLines.push('extract="$shellcheck_tmp/extract"');
+    installLines.push('lint_bin="${RUNNER_TEMP:?}/repo-lint-bin"');
+    installLines.push(
+      `curl --disable --fail --location --silent --show-error --proto '=https' --proto-redir '=https' --tlsv1.2 --connect-timeout 15 --max-time 120 --retry 2 --retry-all-errors --retry-delay 1 --retry-max-time 180 --max-filesize ${SHELLCHECK_LINUX_X86_64_SIZE} --output "$archive" "https://github.com/koalaman/shellcheck/releases/download/${SHELLCHECK_VERSION}/${shellcheckArchive}"`,
+    );
+    installLines.push(
+      `printf '%s  %s\\n' '${SHELLCHECK_LINUX_X86_64_SHA256}' "$archive" | sha256sum --check --strict -`,
+    );
+    installLines.push('install -d -m 0700 "$extract" "$lint_bin"');
+    installLines.push(
+      `tar -xzf "$archive" --no-same-owner --no-same-permissions -C "$extract" -- shellcheck-${SHELLCHECK_VERSION}/shellcheck`,
+    );
+    installLines.push(
+      `install -m 0700 "$extract/shellcheck-${SHELLCHECK_VERSION}/shellcheck" "$lint_bin/shellcheck"`,
+    );
+    installLines.push(
+      `"$lint_bin/shellcheck" --version | grep -Fqx 'version: ${SHELLCHECK_VERSION.slice(1)}'`,
+    );
+    installLines.push('printf \'%s\\n\' "$lint_bin" >> "$GITHUB_PATH"');
+    installLines.push(`go install mvdan.cc/sh/v3/cmd/shfmt@${SHFMT_VERSION}`);
   }
   if (installLines.length > 0) {
     steps.push(`      - name: Install repository lint tools
+        timeout-minutes: 10
         run: |
+          set -euo pipefail
           ${installLines.join('\n          ')}
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"`);
   }
@@ -880,8 +975,24 @@ ${steps.join('\n')}`;
 }
 
 function step(name, run) {
+  if (run.includes('\n')) {
+    const block = run
+      .split('\n')
+      .map((line) => (line === '' ? '' : `          ${line}`))
+      .join('\n');
+    return `      - name: ${name}
+        run: |
+${block}`;
+  }
   return `      - name: ${name}
         run: ${run}`;
+}
+
+function checkoutStep() {
+  return `      - name: Check out repository
+        uses: ${CHECKOUT_ACTION}
+        with:
+          persist-credentials: false`;
 }
 
 function editorConfig() {
@@ -925,6 +1036,7 @@ out/
 target/
 coverage/
 .venv/
+tests/fixtures/ledger_authority/**
 `;
 }
 
@@ -992,8 +1104,9 @@ function markdownlintConfig() {
   "config": {
     "default": true,
     "MD013": false,
+    "MD025": false,
   },
-  "globs": ["**/*.md", "!node_modules", "!dist", "!build", "!out", "!target"],
+  "globs": ["**/*.md", "!.venv", "!node_modules", "!dist", "!build", "!out", "!target"],
 }
 `;
 }
@@ -1009,7 +1122,7 @@ benchmark = [
 
   return `# ${GENERATED_BY}
 [project]
-name = "replace-me"
+name = "codex-host-workflows"
 version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = []
@@ -1024,6 +1137,7 @@ ${benchmarkGroup}
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+extend-exclude = ["tests/fixtures/ledger_authority"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
@@ -1031,6 +1145,22 @@ select = ["E", "F", "I", "UP", "B"]
 [tool.pyright]
 pythonVersion = "3.12"
 typeCheckingMode = "standard"
+venvPath = "."
+venv = ".venv"
+exclude = [
+  ".cache",
+  ".pytest_cache",
+  ".pyright",
+  ".ruff_cache",
+  ".venv",
+  "build",
+  "coverage",
+  "dist",
+  "node_modules",
+  "out",
+  "target",
+  "tests/fixtures/ledger_authority",
+]
 
 [tool.pytest.ini_options]
 addopts = "-ra"
