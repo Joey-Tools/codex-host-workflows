@@ -22,7 +22,7 @@ superseded_by:
 
 - The default branch contains the canonical v2 verifier, controller, and CODEOWNERS after this installation change is merged.
 - The v2.1.3 controller additionally listens for completed first-attempt, failed verifier runs associated with exactly one pull request. Its automatic `begin-review` request path remains disabled unless `CODEX_REVIEW_GATE_AUTO_REQUEST` is set to `true`; the existing provider-comment and manual-dispatch paths remain available.
-- The controller binds an automatic request to `workflow_run.pull_requests[0].head.sha`, because `workflow_run.head_sha` identifies the synthetic merge commit for a pull-request verifier. The verifier has read-only `actions` permission so it can inspect the matching workflow run and check evidence.
+- The controller binds an automatic request explicitly to `workflow_run.pull_requests[0].head.sha`. In an observed pull-request verifier run, both this field and the REST run's `head_sha` matched the PR feature head; the workflow's `github.sha` represented the synthetic merge commit. The verifier has read-only `actions` permission so it can inspect the matching workflow run and check evidence.
 - This controller change does not enable the variable or modify the verifier or repository rulesets.
 - The existing `codex/review-gate` ruleset remains active during installation. Its removal is a separate post-canary operation, not part of this source change.
 - The v2 ruleset must be staged Disabled, validated against a fresh exact-head native `codex/github-review-gate` CheckRun, then activated and read back before the legacy requirement is removed.
@@ -39,4 +39,5 @@ superseded_by:
 - `.github/workflows/codex-review-gate.yml`
 - `.github/workflows/codex-review-gate-controller.yml`
 - `.github/CODEOWNERS`
+- `https://github.com/Joey-Tools/codex-host-workflows/actions/runs/36886987164`
 - `https://github.com/Joey-Tools/codex-review-gate/blob/master/docs/install/human.md`
