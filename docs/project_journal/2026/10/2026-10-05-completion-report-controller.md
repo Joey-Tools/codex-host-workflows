@@ -14,14 +14,17 @@ superseded_by:
 
 ## Summary
 
-- Install the canonical v2.1.7 review-gate controller so completed verifier runs report against the exact workflow-run head.
+- Install the canonical review-gate controller for the v2.1.7 action release so completed verifier runs report against the exact workflow-run head.
+- Align completion admission and empty-association concurrency with the source controller hardening snapshot.
 - Preserve the opt-in, first-attempt, failed-run, and single-pull-request association boundaries for automatic review requests.
 
 ## Current State
 
-- The controller matches the canonical v2.1.7 template byte-for-byte and routes ordinary verifier completion through `report-completion` using `workflow_run.head_sha`.
+- The controller matches canonical source commit `97268b8a83213300182e9f699eb5cb4dba627670` byte-for-byte (blob `c6290c800903303151cbfb34ca706463118b0d09`) and routes ordinary verifier completion through `report-completion` using `workflow_run.head_sha`.
+- Completion admission accepts only the exact canonical bare workflow path or a qualified `@refs/pull/.../merge` path. This is a pre-run shape filter, not numeric PR validation; the v2.1.7 runtime independently validates its fixed workflow identity and run binding.
+- Concurrency remains PR/issue/manual-association scoped when available, then falls back to `workflow_run.id` and `github.run_id` so unrelated empty-association completion runs do not share the empty group. `cancel-in-progress: false` remains in force.
 - Automatic `begin-review` and `request_review` remain gated by `CODEX_REVIEW_GATE_AUTO_REQUEST`, first attempt, failure, and the single-associated-pull-request check.
-- The verifier and `.github/CODEOWNERS` are unchanged and match the canonical template. This source update does not claim that live repository variables, rulesets, or required checks were changed or verified.
+- The verifier and `.github/CODEOWNERS` are unchanged. This controller-only source hardening does not modify the published Action payload, release manifest, version, or immutable tags, and does not claim that live repository variables, rulesets, or required checks were changed or verified.
 
 ## Next Steps
 
@@ -29,5 +32,5 @@ superseded_by:
 
 ## Evidence
 
-- Canonical source: `codex-review-gate-release-v2.1.7` at `7e1069c6a6f4c4b319b1c5f33da262ee97460242`, controller blob `04a91bb4a09c43b133cff3c1053892ae392ac795`.
-- Local validation: actionlint 1.7.12 on verifier/controller, exact controller comparison, the canonical bootstrap helper's prepare-worktree dry run, and direct execution of both focused test functions. `pytest` was unavailable (`No module named pytest`).
+- Canonical source hardening snapshot: `codex-review-gate` commit `97268b8a83213300182e9f699eb5cb4dba627670`, controller blob `c6290c800903303151cbfb34ca706463118b0d09`.
+- Local validation: actionlint 1.7.12 on verifier/controller, exact controller comparison, and the focused `tests/test_review_gate_workflows.py` contract test. The broader source controller suite hit its 120-second deadline with descendant cleanup unverified; it is not counted as passed.

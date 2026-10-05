@@ -12,6 +12,21 @@ def test_auto_request_binds_verifier_run_head_and_reports_completion() -> None:
     )
     assert "github.event_name == 'workflow_run' && 'report-completion'" in controller
     assert "github.event.workflow_run.pull_requests[0].head.sha" not in controller
+    assert (
+        "codex-review-gate-controller-${{ github.repository }}-"
+        "${{ github.event.workflow_run.pull_requests[0].number || github.event.issue.number || "
+        "inputs.pr_number || github.event.workflow_run.id || github.run_id }}" in controller
+    )
+    assert "cancel-in-progress: false" in controller
+    assert (
+        "startsWith(github.event.workflow_run.path, "
+        "'.github/workflows/codex-review-gate.yml@refs/pull/')" in controller
+    )
+    assert "endsWith(github.event.workflow_run.path, '/merge')" in controller
+    assert (
+        "startsWith(github.event.workflow_run.path, "
+        "'.github/workflows/codex-review-gate.yml@')" not in controller
+    )
 
     for guard in (
         "vars.CODEX_REVIEW_GATE_AUTO_REQUEST == 'true'",
