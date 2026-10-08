@@ -6,6 +6,7 @@ WORKFLOWS = Path(__file__).resolve().parents[1] / ".github" / "workflows"
 def test_auto_request_binds_verifier_run_head_and_reports_completion() -> None:
     controller = (WORKFLOWS / "codex-review-gate-controller.yml").read_text(encoding="utf-8")
 
+    assert "review_request_token: ${{ secrets.CODEX_REVIEW_GATE_REQUEST_TOKEN }}" in controller
     assert (
         "expected_head_sha: ${{ github.event_name == 'workflow_run' && "
         "github.event.workflow_run.head_sha ||" in controller
