@@ -3,6 +3,15 @@ from pathlib import Path
 WORKFLOWS = Path(__file__).resolve().parents[1] / ".github" / "workflows"
 
 
+def test_actionlint_ignores_only_the_unsupported_stacked_pull_request_type() -> None:
+    ci = (WORKFLOWS / "ci.yml").read_text(encoding="utf-8")
+
+    assert (
+        'run: actionlint -ignore \'^invalid activity type "stacked" for '
+        '"pull_request" Webhook event\\.\''
+    ) in ci
+
+
 def test_auto_request_binds_verifier_run_head_and_reports_completion() -> None:
     controller = (WORKFLOWS / "codex-review-gate-controller.yml").read_text(encoding="utf-8")
 
@@ -14,9 +23,14 @@ def test_auto_request_binds_verifier_run_head_and_reports_completion() -> None:
     assert "github.event_name == 'workflow_run' && 'report-completion'" in controller
     assert "github.event.workflow_run.pull_requests[0].head.sha" not in controller
     assert (
-        "codex-review-gate-controller-${{ github.repository }}-"
-        "${{ github.event.workflow_run.pull_requests[0].number || github.event.issue.number || "
-        "inputs.pr_number || github.event.workflow_run.id || github.run_id }}" in controller
+        "format('codex-review-gate-controller-{0}-{1}', github.repository, "
+        "github.event.workflow_run.pull_requests[0].number || github.event.issue.number || "
+        "inputs.pr_number || github.event.workflow_run.id || github.run_id)" in controller
+    )
+    assert "codex-review-gate-controller-ignored-{0}" in controller
+    assert (
+        "startsWith(github.event.workflow_run.display_title, 'codex-review-gate-verifier/')"
+        in controller
     )
     assert "cancel-in-progress: false" in controller
     assert (

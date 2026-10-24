@@ -935,7 +935,12 @@ function repoHygieneJob(selected) {
   }
 
   if (selected.has('github-actions')) {
-    steps.push(step('Lint GitHub Actions workflows', 'actionlint'));
+    steps.push(
+      step(
+        'Lint GitHub Actions workflows',
+        `actionlint -ignore '^invalid activity type "stacked" for "pull_request" Webhook event\\.'`,
+      ),
+    );
   }
   if (selected.has('bash')) {
     steps.push(`      - name: Check shell scripts

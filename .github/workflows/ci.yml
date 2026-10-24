@@ -154,7 +154,7 @@ jobs:
           go install mvdan.cc/sh/v3/cmd/shfmt@v3.13.1
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
       - name: Lint GitHub Actions workflows
-        run: actionlint
+        run: actionlint -ignore '^invalid activity type "stacked" for "pull_request" Webhook event\.'
       - name: Check shell scripts
         run: |
           mapfile -t shell_files < <(find . -type f \( -name '*.sh' -o -name '*.bash' \) -not -path './.git/*' -not -path './node_modules/*' -not -path './dist/*' -not -path './build/*' -not -path './out/*' -not -path './target/*')
