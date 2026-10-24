@@ -14,28 +14,22 @@ superseded_by:
 
 ## Summary
 
-- Upgrade the consumer verifier/controller pair to the canonical v2.2.12 workflows.
+- Synchronize the consumer verifier/controller pair with the canonical v2.2.13 workflows.
+- Canonical source: [codex-review-gate PR #146](https://github.com/Joey-Tools/codex-review-gate/pull/146), released as v2.2.13.
 
 ## Current State
 
-- The verifier accepts `stacked` and `edited`; non-base-ref edits use isolated ignored titles and concurrency, while the controller only processes verifier-titled workflow runs.
-- The workflow supports configurable runner labels while preserving the existing hosted-runner fallback. The `@v2` action pin, token wiring, auto-request behavior, and limits-profile behavior are unchanged; no repository settings were modified.
-- The repository's `actionlint` invocation ignores only its diagnostic for the `stacked` activity on `pull_request`; all other actionlint checks remain enabled.
-- The source pair matches the designated canonical files byte-for-byte. No repository settings were modified.
+- The verifier retains `opened`, `reopened`, `synchronize`, `ready_for_review`, `stacked`, and `edited`. All events use the standard verifier title, per-PR concurrency group, and job name; the ignored-edit title, isolated concurrency group, and job guard are absent.
+- The controller remains byte-identical to the canonical source and continues to process verifier-titled runs.
+- The `@v2` action, permission envelope, configurable runner labels and fallback, token wiring, auto-request behavior, and limits profile are preserved. No repository settings or CI generators were modified.
+- The repository's `actionlint` invocation suppresses only the known unsupported `stacked` activity diagnostic for `pull_request`; other diagnostics remain enabled.
 
 ## Next Steps
 
-- Use a separate live canary before making operational claims about deployed behavior.
+- No additional local consumer-file work is planned. Live behavior still requires a separate canary and is not inferred from this YAML sync.
 
 ## Evidence
 
-- Same-PR CI jobs `120886733192`, `120886733346`, and `120886733274` reported formatting of this note, formatting of `tests/test_review_gate_workflows.py`, and actionlint 1.7.12's unsupported `stacked` activity diagnostic, respectively.
-- Prettier 3.9.6 formatted and checked this note. The static workflow test's wrapping matches Ruff's formatter output; local Ruff 0.13.2 format-check passed, while `uv.lock` pins Ruff 0.16.3.
-- The exact actionlint ignore passed the repository-wide workflow check; the exception pattern is limited to `stacked` for `pull_request`. Journal validation and `git diff --check` passed.
-- Follow-up CI job `120890336079` caught the generator/checked-in workflow mismatch.
-- `scripts/setup-ci.mjs` now emits the same narrow actionlint invocation as the checked-in CI workflow. `node --test test/setup-ci.node-test.mjs` passed all 21 tests, including the workflow round-trip.
-- No full CI rerun, live canary, or runtime behavior is claimed.
-- `.github/workflows/codex-review-gate.yml`
-- `.github/workflows/codex-review-gate-controller.yml`
-- `.github/workflows/ci.yml`
-- `tests/test_review_gate_workflows.py`
+- Both workflow files match the canonical v2.2.13 bytes and passed the exported source validators.
+- Exported source-contract validation, the exact actionlint workaround, project-journal validation, and `git diff --check` passed. The focused pytest file was not run because the active Python 3.13.0 environment does not have `pytest` installed.
+- No live canary, production behavior, or full CI result is claimed.
